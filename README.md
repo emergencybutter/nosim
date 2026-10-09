@@ -17,6 +17,8 @@ src/
   geodesy.rs     WGS84 ⇄ ECEF ⇄ ENU, floating render origin          (spec §2)
   astro.rs       Julian date / DOY, solar declination, lapse rate,
                  GMST rotation, B−V → blackbody temperature          (spec §6, §8A)
+  scenery/       Package manifest + validator, GeoJSON exclusion
+                 masks, prioritised mount table (VFS)                 (spec §3)
   arinc424.rs    ARINC 424 PG record decoder, designators, threshold
                  bar counts, runway extrusion + grade fitting         (spec §4)
   procedural.rs  Spatial seed hash, Poisson building levels, bridge
@@ -25,10 +27,12 @@ src/
   traffic.rs     IDM longitudinal model, MOBIL lane change, VAT UVs   (spec §7)
   photometry.rs  Hapke regolith BRDF, Chapman function, limb shell    (spec §8B, §8C)
   lod.rs         Altitude-band LOD governor, ECI / MCI / ICRF choice  (spec §2, §8)
+fixtures/        The spec's KJFK example package, loaded by the scenery tests
 docs/            Architecture specification
 ```
 
-Each module carries its tests inline (`#[cfg(test)]`).
+Each module carries its tests inline (`#[cfg(test)]`). Dependencies: `serde` and
+`serde_json` for the manifest and GeoJSON formats; nothing else.
 
 ## Build and test
 
@@ -39,7 +43,7 @@ cargo fmt --check
 cargo doc --no-deps --open
 ```
 
-Requires a stable Rust toolchain (edition 2024, so 1.85 or newer). No crates beyond `std`.
+Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 
 ## What the tests prove
 
@@ -47,6 +51,9 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer). No crates bey
 |---|---|
 | Phase 1 §3 — sub-millimetre vertex stability at 45°N 120°W, 1 m AGL | `geodesy::floating_origin_stability` round-trips a render-space vertex through ECEF with < 0.1 mm error, and shows `f32` ECEF would already be off by > 1 mm |
 | §2 — rebase when \|ΔP\| > 10,000 m | `geodesy::floating_origin_rebase` (9,999 m: no rebase; 10,001 m: rebase) |
+| §3 — the spec's `manifest.json` loads, validates, and masks `procedural_buildings` inside the airport perimeter | `scenery::loads_fixture_package`, `vfs::exclusions_mask_the_baseline` |
+| §3 — tier → priority → id resolution; newer version replaces, older refused | `vfs::resolution_order_is_tier_then_priority_then_id`, `vfs::newer_version_replaces_older_only` |
+| §3 — validator catches path traversal, bad bounds, open rings | `scenery::validator_rejects_unsafe_paths`, `geojson::closure_and_shape_auditing` |
 | §4 — worked KJFK RW04R example (40.6331444°, −73.7701250°, 2560.32 m, 45.72 m, 3.6576 m, 137.16 m, 12 bars) | `arinc424::spec_example_record` decodes a synthetic 132-column PG record to those values |
 | Phase 2 §3 — KJFK RW31L centreline 14,511 ft ± 1 ft | `arinc424::runway_extrusion_kjfk_31l` extrudes along 313° true, fits grade, round-trips the ellipsoid |
 | §6 — declination extremes ±23.44°, 6.5 °C/km lapse | `astro` |
@@ -62,7 +69,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer). No crates bey
 | Spec section | Status |
 |---|---|
 | §2 Coordinate hierarchy, ENU, floating origin | Implemented |
-| §3 Scenery package manifest / VFS priorities | Not started (schema is in the spec) |
+| §3 Package manifest, validator, exclusion masks, mount table | Implemented; reading the referenced GeoParquet / glTF payloads is the consumer's job |
 | §4 ARINC 424 decode, extrusion, grade fit, markings data | Implemented; heightfield patching is engine-side |
 | §5 Seed hash, Poisson levels, pier spacing, flatten falloff | Implemented; WFC/PCG graphs and bridge detection are engine-side |
 | §6 Calendar, declination, lapse rate, phenology, snow mask | Implemented; GPU buffer plumbing is engine-side |

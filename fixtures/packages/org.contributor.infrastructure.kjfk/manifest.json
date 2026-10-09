@@ -1,0 +1,35 @@
+{
+  "package_id": "org.contributor.infrastructure.kjfk",
+  "version": "1.0.0",
+  "priority": 100,
+  "bounds": {
+    "min_lat": 40.6200, "max_lat": 40.6650,
+    "min_lon": -73.8200, "max_lon": -73.7400
+  },
+  "exclusions": [
+    {
+      "layer": "procedural_buildings",
+      "mask_polygon": "geometry/exclusions/airport_perimeter.geojson"
+    },
+    {
+      "layer": "vegetation",
+      "mask_polygon": "geometry/exclusions/runway_safety_area.geojson"
+    },
+    {
+      "layer": "osm_highways",
+      "filter_tags": { "highway": ["motorway", "primary"] }
+    }
+  ],
+  "content": {
+    "arinc_overrides": "data/arinc_runways.parquet",
+    "spline_networks": "data/taxiways_and_roads.geoparquet",
+    "models": [
+      {
+        "id": "twa_flight_center",
+        "mesh": "models/twa_terminal.glb",
+        "anchor_geodetic": [40.6458, -73.7778, 4.2],
+        "true_heading_deg": 134.2
+      }
+    ]
+  }
+}

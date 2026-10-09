@@ -98,6 +98,18 @@ Extensions use a non-destructive, layered virtual file system. High-priority pac
 - **Priority 1:** Authoritative GIS Records (FAA ARINC 424 Runways)
 - **Priority 0:** Base Procedural & Global GIS Layers (OSM, Cop-DEM, ESA LandCover)
 
+### Resolution Rules
+
+Tiers 0 and 1 are the engine's built-in sources. Contributor packages mount at tier 3 when they carry models, exclusions or ARINC overrides, and at tier 2 when they carry only spline networks; the engine may mount at an explicit tier. Within a tier the manifest `priority` orders packages (higher wins), with `package_id` as a deterministic tie-break. Mounting a newer version of an already-mounted `package_id` replaces it; the same or an older version is refused.
+
+Queries walk mounts from highest to lowest `(tier, priority)` and consider only packages whose `bounds` contain the query point:
+
+- **Exclusions are additive.** Any covering package may mask a baseline layer; the highest-priority rule that fires is reported. A `mask_polygon` rule fires when the point is inside the polygon; a `filter_tags` rule fires for a feature whose tags carry every listed key with one of the listed values, anywhere in the package bounds.
+- **Content resolves to one provider.** `arinc_overrides` and `spline_networks` come from the highest-priority covering package that supplies them.
+- **Models are unioned.** Every model whose anchor lies inside a requested tile, from every package intersecting it.
+
+The Package Validator rejects manifests with unknown fields, malformed `package_id` / `version`, negative `priority`, inverted or out-of-range `bounds` (packages crossing the antimeridian must be split), paths that are absolute or escape the package root, exclusions with neither or both of `mask_polygon` / `filter_tags`, duplicate model ids, anchors outside `bounds`, headings outside `[0, 360)`, referenced files that do not exist, and mask rings that are not closed. Implementation: `src/scenery/`.
+
 ### Package Manifest Specification (`manifest.json`)
 
 ```json

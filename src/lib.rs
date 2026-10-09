@@ -10,6 +10,7 @@
 //! |---|---|
 //! | [`geodesy`] | §2 WGS84 ⇄ ECEF ⇄ ENU, floating render origin |
 //! | [`astro`] | §6 calendar / declination / lapse rate, §8A sidereal rotation and star colour |
+//! | [`scenery`] | §3 package manifests, validator, exclusion masks, prioritised mount table |
 //! | [`arinc424`] | §4 runway record decoding and pavement extrusion |
 //! | [`procedural`] | §5 deterministic gap filling |
 //! | [`phenology`] | §6 four-season phase and snow mask |
@@ -24,4 +25,5 @@ pub mod lod;
 pub mod phenology;
 pub mod photometry;
 pub mod procedural;
+pub mod scenery;
 pub mod traffic;

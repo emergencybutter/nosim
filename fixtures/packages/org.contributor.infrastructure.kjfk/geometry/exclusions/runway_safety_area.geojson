@@ -1,0 +1,19 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "runway": "04R/22L", "note": "approximate RSA strip, test fixture" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [-73.7730, 40.6310],
+          [-73.7680, 40.6310],
+          [-73.7470, 40.6480],
+          [-73.7520, 40.6500],
+          [-73.7730, 40.6310]
+        ]]
+      }
+    }
+  ]
+}
