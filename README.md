@@ -20,6 +20,8 @@ src/
   ephem/         VSOP87D Sun–Earth and ELP 2000-82B Moon evaluators,
                  obliquity, nutation, GAST, apparent places,
                  topocentric vectors, phase, optical libration        (spec §8A)
+  starfield/     Yale Bright Star Catalogue (BSC5) loader, packed
+                 star buffer, Planckian-locus star colour              (spec §8A)
   scenery/       Package manifest + validator, GeoJSON exclusion
                  masks, prioritised mount table (VFS)                 (spec §3)
   arinc424.rs    ARINC 424 PG record decoder, designators, threshold
@@ -30,7 +32,9 @@ src/
   traffic.rs     IDM longitudinal model, MOBIL lane change, VAT UVs   (spec §7)
   photometry.rs  Hapke regolith BRDF, Chapman function, limb shell    (spec §8B, §8C)
   lod.rs         Altitude-band LOD governor, ECI / MCI / ICRF choice  (spec §2, §8)
-fixtures/        The spec's KJFK example package, loaded by the scenery tests
+fixtures/        The spec's KJFK example package (scenery tests); the BSC5 catalogue
+                 compiled to nosim's packed form plus a 22-line text excerpt (starfield tests)
+examples/        compile_bsc5: turns the CDS catalogue text into the packed star buffer
 tools/           ephem_tables.py: reference evaluator + generator for the ephemeris tables
 docs/            Architecture specification
 ```
@@ -62,6 +66,8 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §8A — ELP82B Moon matches JPL Horizons (DE441) J2000 ecliptic vectors to 0.35 km in 1969–2000, 1.2 km by 2047 | `ephem::elp82b_matches_jpl_horizons` |
 | §8A — apparent Sun / Moon RA–Dec, nutation, phase angle, illuminated fraction, optical libration against Meeus's worked examples | `ephem::apparent_sun_ra_dec`, `apparent_moon_ra_dec`, `obliquity_and_nutation`, `phase_and_illumination`, `libration` |
 | §8A — lunar horizontal parallax ≈ 57′, solar 8.79″/R from the sub-point | `ephem::topocentric_parallax` |
+| §8A — BSC5: 9,110 entries, 9,096 with positions, 310 without B−V, Sirius at V = −1.46; Sirius/Vega/Polaris decode to their catalogue positions; a century of Arcturus's proper motion is 228″ | `starfield::full_catalogue_statistics`, `parses_named_stars_from_excerpt`, `proper_motion_moves_barnards_star_direction` |
+| §8A — B−V → temperature → Planckian locus → sRGB: 3000 K red, 6500 K ≈ D65 white, 20,000 K blue | `starfield::planckian_colours_order_sensibly` |
 | §4 — worked KJFK RW04R example (40.6331444°, −73.7701250°, 2560.32 m, 45.72 m, 3.6576 m, 137.16 m, 12 bars) | `arinc424::spec_example_record` decodes a synthetic 132-column PG record to those values |
 | Phase 2 §3 — KJFK RW31L centreline 14,511 ft ± 1 ft | `arinc424::runway_extrusion_kjfk_31l` extrudes along 313° true, fits grade, round-trips the ellipsoid |
 | §6 — declination extremes ±23.44°, 6.5 °C/km lapse | `astro` |
@@ -82,13 +88,29 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §5 Seed hash, Poisson levels, pier spacing, flatten falloff | Implemented; WFC/PCG graphs and bridge detection are engine-side |
 | §6 Calendar, declination, lapse rate, phenology, snow mask | Implemented; GPU buffer plumbing is engine-side |
 | §7 IDM, MOBIL, VAT addressing | Implemented; ECS, ORCA, CTM far-field not started |
-| §8A VSOP87D / ELP 2000-82B evaluators, nutation, apparent places, topocentric vectors, phase, libration | Implemented (see below); BS5 catalogue loader and physical libration not started |
+| §8A VSOP87D / ELP 2000-82B evaluators, nutation, apparent places, topocentric vectors, phase, libration | Implemented (see below); physical libration (≤ 0.04°) not modelled |
+| §8A Yale Bright Star Catalogue loader, packed buffer, Planckian colour | Implemented; the catalogue itself goes to V ≈ 7.96, deeper than the spec's "to 6.5" |
 | §8B/§8C Hapke BRDF, Chapman limb | Implemented as CPU reference for the shaders |
 | §8 LOD band policy, parent-frame selection | Implemented |
 | C ABI for the UE5 client | Not started |
 
 Anything that needs Unreal (Nanite, PCG, virtual heightfield, decals, raymarcher) lives in
 the client project and is out of scope here.
+
+## Star catalogue
+
+`src/starfield` parses the CDS V/50 `catalog` text (Hoffleit & Warren 1991,
+<https://cdsarc.cds.unistra.fr/ftp/V/50/>) by its ReadMe byte layout. `fixtures/bsc5/bsc5.bin`
+is that file compiled to the packed form by
+
+```sh
+cargo run --example compile_bsc5 -- catalog fixtures/bsc5/bsc5.bin
+```
+
+and is what an engine would `include_bytes!`: 28 bytes per star (HR, RA, Dec, V, B−V, proper
+motion), 255 KB for the 9,096 positioned stars. `Catalog::records()` derives the 16-byte
+RA / Dec / V / B−V structured buffer the spec's celestial sphere binds, substituting
+`DEFAULT_BV` (0.6, a solar-type white) for the 310 stars without a measured colour.
 
 ## Ephemeris tables
 

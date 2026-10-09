@@ -336,6 +336,8 @@ Scaling smoothly from runway pavement to translunar orbit requires an analytical
   - Compiled into a static structured buffer containing: Right Ascension (α), Declination (δ), Visual Magnitude (V), and Color Index (B - V).
   - Rendered via an instanced celestial sphere drawn at infinite depth. Blackbody color temperatures (2,000 K to 30,000 K) map directly from the (B - V) values using Planckian locus approximations.
 
+  **Implementation (`src/starfield/`).** The loader reads the CDS V/50 text by its byte layout; 14 of the 9,110 entries are removed objects with no position and are reported separately, and 310 positioned stars have no B−V (rendered with a solar-type default). The catalogue actually reaches V ≈ 7.96, so "to magnitude 6.5" is a cut the renderer may apply, not a property of the data. Positions are J2000 with proper motion available for epoch propagation. Colour goes B−V → Ballesteros temperature → Kang et al. (2002) Planckian-locus chromaticity → linear sRGB, with the fit's 1,667–25,000 K validity range clamped (the hottest catalogue stars are blue-white either way). `examples/compile_bsc5.rs` packs the catalogue into the static buffer checked in under `fixtures/bsc5/`.
+
 ### B. The Atmospheric Transition (Bruneton to Analytical Limb)
 
 - **Altitudes < 100 km:** Evaluates a 4-dimensional precomputed atmospheric scattering model (Bruneton framework). Raymarches Rayleigh scattering (molecular air, proportional to 1 / λ⁴) and Mie scattering (aerosols/haze) along the view ray.

@@ -12,6 +12,7 @@
 //! | [`astro`] | §6 calendar / declination / lapse rate, §8A sidereal rotation and star colour |
 //! | [`scenery`] | §3 package manifests, validator, exclusion masks, prioritised mount table |
 //! | [`ephem`] | §8A VSOP87D Sun–Earth, ELP 2000-82B Moon, nutation, topocentric vectors, phase, libration |
+//! | [`starfield`] | §8A Yale Bright Star Catalogue loader, packed star buffer, Planckian colour |
 //! | [`arinc424`] | §4 runway record decoding and pavement extrusion |
 //! | [`procedural`] | §5 deterministic gap filling |
 //! | [`phenology`] | §6 four-season phase and snow mask |
@@ -28,4 +29,5 @@ pub mod phenology;
 pub mod photometry;
 pub mod procedural;
 pub mod scenery;
+pub mod starfield;
 pub mod traffic;
