@@ -17,6 +17,9 @@ src/
   geodesy.rs     WGS84 ⇄ ECEF ⇄ ENU, floating render origin          (spec §2)
   astro.rs       Julian date / DOY, solar declination, lapse rate,
                  GMST rotation, B−V → blackbody temperature          (spec §6, §8A)
+  ephem/         VSOP87D Sun–Earth and ELP 2000-82B Moon evaluators,
+                 obliquity, nutation, GAST, apparent places,
+                 topocentric vectors, phase, optical libration        (spec §8A)
   scenery/       Package manifest + validator, GeoJSON exclusion
                  masks, prioritised mount table (VFS)                 (spec §3)
   arinc424.rs    ARINC 424 PG record decoder, designators, threshold
@@ -28,6 +31,7 @@ src/
   photometry.rs  Hapke regolith BRDF, Chapman function, limb shell    (spec §8B, §8C)
   lod.rs         Altitude-band LOD governor, ECI / MCI / ICRF choice  (spec §2, §8)
 fixtures/        The spec's KJFK example package, loaded by the scenery tests
+tools/           ephem_tables.py: reference evaluator + generator for the ephemeris tables
 docs/            Architecture specification
 ```
 
@@ -54,6 +58,10 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §3 — the spec's `manifest.json` loads, validates, and masks `procedural_buildings` inside the airport perimeter | `scenery::loads_fixture_package`, `vfs::exclusions_mask_the_baseline` |
 | §3 — tier → priority → id resolution; newer version replaces, older refused | `vfs::resolution_order_is_tier_then_priority_then_id`, `vfs::newer_version_replaces_older_only` |
 | §3 — validator catches path traversal, bad bounds, open rings | `scenery::validator_rejects_unsafe_paths`, `geojson::closure_and_shape_auditing` |
+| §8A — VSOP87D Earth reproduces IMCCE's own `vsop87.chk` values to 10 decimals (1700–2000) | `ephem::vsop87d_matches_imcce_check_values` |
+| §8A — ELP82B Moon matches JPL Horizons (DE441) J2000 ecliptic vectors to 0.35 km in 1969–2000, 1.2 km by 2047 | `ephem::elp82b_matches_jpl_horizons` |
+| §8A — apparent Sun / Moon RA–Dec, nutation, phase angle, illuminated fraction, optical libration against Meeus's worked examples | `ephem::apparent_sun_ra_dec`, `apparent_moon_ra_dec`, `obliquity_and_nutation`, `phase_and_illumination`, `libration` |
+| §8A — lunar horizontal parallax ≈ 57′, solar 8.79″/R from the sub-point | `ephem::topocentric_parallax` |
 | §4 — worked KJFK RW04R example (40.6331444°, −73.7701250°, 2560.32 m, 45.72 m, 3.6576 m, 137.16 m, 12 bars) | `arinc424::spec_example_record` decodes a synthetic 132-column PG record to those values |
 | Phase 2 §3 — KJFK RW31L centreline 14,511 ft ± 1 ft | `arinc424::runway_extrusion_kjfk_31l` extrudes along 313° true, fits grade, round-trips the ellipsoid |
 | §6 — declination extremes ±23.44°, 6.5 °C/km lapse | `astro` |
@@ -74,10 +82,31 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §5 Seed hash, Poisson levels, pier spacing, flatten falloff | Implemented; WFC/PCG graphs and bridge detection are engine-side |
 | §6 Calendar, declination, lapse rate, phenology, snow mask | Implemented; GPU buffer plumbing is engine-side |
 | §7 IDM, MOBIL, VAT addressing | Implemented; ECS, ORCA, CTM far-field not started |
-| §8A GMST rotation, B−V colour | Implemented; VSOP87 / ELP 2000-82 series and BS5 loader not started |
+| §8A VSOP87D / ELP 2000-82B evaluators, nutation, apparent places, topocentric vectors, phase, libration | Implemented (see below); BS5 catalogue loader and physical libration not started |
 | §8B/§8C Hapke BRDF, Chapman limb | Implemented as CPU reference for the shaders |
 | §8 LOD band policy, parent-frame selection | Implemented |
 | C ABI for the UE5 client | Not started |
 
 Anything that needs Unreal (Nanite, PCG, virtual heightfield, decals, raymarcher) lives in
 the client project and is out of scope here.
+
+## Ephemeris tables
+
+`src/ephem/vsop87d_earth.rs` and `src/ephem/elp82b_moon.rs` are generated — do not edit —
+by `tools/ephem_tables.py` from the IMCCE distribution files (`VSOP87D.ear`, `ELP1`–`ELP36`,
+from <https://ftp.imcce.fr/pub/ephem/> or the CDS mirror VI/81 and VI/79). The script is a
+line-for-line port of IMCCE's `elp82b_2` Fortran and of the VSOP87 substitution rule, and it
+has three subcommands:
+
+```sh
+python3 -I tools/ephem_tables.py --vsop <dir> --elp <dir> check --horizons <horizons.txt>
+python3 -I tools/ephem_tables.py --vsop <dir> --elp <dir> trunc
+python3 -I tools/ephem_tables.py --vsop <dir> --elp <dir> emit --out src/ephem --threshold 0.001
+```
+
+`check` proves the port against `vsop87.chk` and JPL Horizons before anything is emitted;
+`trunc` measures what dropping small ELP perturbation terms costs; `emit` writes the tables.
+What is checked in: the full VSOP87D Earth series (2,425 terms) and the complete ELP main
+problem (2,645 terms) plus the 2,162 perturbation terms at or above 0.001″ — a measured
+worst case of 0.04″ in longitude and latitude and 45 m in distance over 1900–2100 versus
+the full 35,227-term series. Time arguments are TDB (TT is indistinguishable at this level).
