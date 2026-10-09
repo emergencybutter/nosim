@@ -1,7 +1,9 @@
 //! Traffic (spec §7): microscopic kinematics and crowd VAT addressing here, the far-field
-//! Cell Transmission Model and the near-field handoff in [`ctm`].
+//! Cell Transmission Model and the near-field handoff in [`ctm`], and ORCA pedestrian
+//! avoidance in [`orca`].
 
 pub mod ctm;
+pub mod orca;
 
 /// Inside this radius agents are simulated individually.
 pub const NEAR_FIELD_RADIUS_M: f64 = 1_500.0;

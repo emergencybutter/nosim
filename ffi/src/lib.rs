@@ -2007,3 +2007,246 @@ pub unsafe extern "C" fn nosim_ctm_link_cells(
     }
     l.inner.cell_count()
 }
+
+// ---- Pedestrian crowds (ORCA) ----------------------------------------------------------
+
+use nosim::traffic::orca;
+
+/// A 2D vector, metres or m/s.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimVec2 {
+    /// X.
+    pub x: f64,
+    /// Y.
+    pub y: f64,
+}
+
+impl From<NosimVec2> for orca::Vec2 {
+    fn from(v: NosimVec2) -> Self {
+        orca::Vec2::new(v.x, v.y)
+    }
+}
+
+impl From<orca::Vec2> for NosimVec2 {
+    fn from(v: orca::Vec2) -> Self {
+        NosimVec2 { x: v.x, y: v.y }
+    }
+}
+
+/// Per-agent ORCA tuning; see `nosim_orca_agent_params_default`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NosimOrcaAgentParams {
+    /// Body radius, m.
+    pub radius: f64,
+    /// Speed limit, m/s.
+    pub max_speed: f64,
+    /// Look-ahead for other agents, s.
+    pub time_horizon: f64,
+    /// Look-ahead for obstacles, s.
+    pub time_horizon_obstacle: f64,
+    /// Neighbour search radius, m.
+    pub neighbor_distance: f64,
+    /// Nearest-neighbour cap.
+    pub max_neighbors: usize,
+}
+
+impl From<NosimOrcaAgentParams> for orca::AgentParams {
+    fn from(p: NosimOrcaAgentParams) -> Self {
+        orca::AgentParams {
+            radius: p.radius,
+            max_speed: p.max_speed,
+            time_horizon: p.time_horizon,
+            time_horizon_obstacle: p.time_horizon_obstacle,
+            neighbor_distance: p.neighbor_distance,
+            max_neighbors: p.max_neighbors,
+        }
+    }
+}
+
+/// Defaults for a walking adult: 0.3 m, 1.4 m/s, 5 s / 2 s horizons, 10 m, 10 neighbours.
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_orca_agent_params_default() -> NosimOrcaAgentParams {
+    let p = orca::AgentParams::default();
+    NosimOrcaAgentParams {
+        radius: p.radius,
+        max_speed: p.max_speed,
+        time_horizon: p.time_horizon,
+        time_horizon_obstacle: p.time_horizon_obstacle,
+        neighbor_distance: p.neighbor_distance,
+        max_neighbors: p.max_neighbors,
+    }
+}
+
+/// Position and velocity of one agent.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimOrcaAgentState {
+    /// Position, m.
+    pub position: NosimVec2,
+    /// Velocity, m/s.
+    pub velocity: NosimVec2,
+    /// Radius, m.
+    pub radius: f64,
+}
+
+/// A crowd simulation (opaque).
+pub struct NosimOrcaSim {
+    inner: orca::Simulator,
+}
+
+/// Creates a crowd simulation stepping by `time_step` seconds (non-positive → 0.1).
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_orca_new(time_step: f64) -> *mut NosimOrcaSim {
+    Box::into_raw(Box::new(NosimOrcaSim { inner: orca::Simulator::new(time_step) }))
+}
+
+/// Releases a simulation. NULL is ignored.
+///
+/// # Safety
+/// `h` must be NULL or a live handle, freed once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_orca_free(h: *mut NosimOrcaSim) {
+    if !h.is_null() {
+        // SAFETY: handle came from Box::into_raw.
+        drop(unsafe { Box::from_raw(h) });
+    }
+}
+
+/// Adds an agent at rest; returns its id, or -1 with `nosim_last_error` set.
+///
+/// # Safety
+/// `h` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_orca_add_agent(
+    h: *mut NosimOrcaSim,
+    position: NosimVec2,
+    params: NosimOrcaAgentParams,
+) -> isize {
+    // SAFETY: documented contract.
+    let Some(s) = (unsafe { opt_mut(h) }) else {
+        fail(NosimStatus::NullPointer, "orca sim is NULL");
+        return -1;
+    };
+    match s.inner.add_agent(position.into(), params.into()) {
+        Ok(id) => id as isize,
+        Err(_) => {
+            fail(NosimStatus::InvalidArgument, "orca agent params must be positive and finite");
+            -1
+        }
+    }
+}
+
+/// Removes an agent; returns whether it existed.
+///
+/// # Safety
+/// `h` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_orca_remove_agent(h: *mut NosimOrcaSim, id: usize) -> bool {
+    // SAFETY: documented contract.
+    unsafe { opt_mut(h) }.is_some_and(|s| s.inner.remove_agent(id))
+}
+
+/// Live agent count.
+///
+/// # Safety
+/// `h` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_orca_agent_count(h: *const NosimOrcaSim) -> usize {
+    // SAFETY: documented contract.
+    unsafe { opt_ref(h) }.map_or(0, |s| s.inner.agent_count())
+}
+
+/// Sets the velocity an agent wants (from the host's navigation).
+///
+/// # Safety
+/// `h` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_orca_set_preferred_velocity(
+    h: *mut NosimOrcaSim,
+    id: usize,
+    velocity: NosimVec2,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let Some(s) = (unsafe { opt_mut(h) }) else { return fail(NosimStatus::NullPointer, "orca sim is NULL") };
+    match s.inner.set_preferred_velocity(id, velocity.into()) {
+        Ok(()) => NosimStatus::Ok,
+        Err(_) => fail(NosimStatus::NotFound, format!("no agent {id}")),
+    }
+}
+
+/// Points an agent at a goal at `speed`, easing inside `slow_radius`.
+///
+/// # Safety
+/// `h` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_orca_set_goal(
+    h: *mut NosimOrcaSim,
+    id: usize,
+    goal: NosimVec2,
+    speed: f64,
+    slow_radius: f64,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let Some(s) = (unsafe { opt_mut(h) }) else { return fail(NosimStatus::NullPointer, "orca sim is NULL") };
+    match s.inner.set_goal(id, goal.into(), speed, slow_radius) {
+        Ok(()) => NosimStatus::Ok,
+        Err(_) => fail(NosimStatus::NotFound, format!("no agent {id}")),
+    }
+}
+
+/// Adds a polygonal obstacle: counter-clockwise vertices keep agents outside; two
+/// vertices make a wall blocking both sides.
+///
+/// # Safety
+/// `h` must be NULL or live; `vertices` must point to `count` elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_orca_add_obstacle(
+    h: *mut NosimOrcaSim,
+    vertices: *const NosimVec2,
+    count: usize,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let Some(s) = (unsafe { opt_mut(h) }) else { return fail(NosimStatus::NullPointer, "orca sim is NULL") };
+    // SAFETY: documented contract.
+    let Some(v) = (unsafe { slice_in(vertices, count) }) else {
+        return fail(NosimStatus::NullPointer, "vertices is NULL");
+    };
+    let pts: Vec<orca::Vec2> = v.iter().map(|p| (*p).into()).collect();
+    match s.inner.add_obstacle(&pts) {
+        Ok(()) => NosimStatus::Ok,
+        Err(_) => fail(NosimStatus::InvalidArgument, "an obstacle needs at least two vertices"),
+    }
+}
+
+/// Advances the crowd one time step.
+///
+/// # Safety
+/// `h` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_orca_step(h: *mut NosimOrcaSim) -> NosimStatus {
+    // SAFETY: documented contract.
+    let Some(s) = (unsafe { opt_mut(h) }) else { return fail(NosimStatus::NullPointer, "orca sim is NULL") };
+    s.inner.step();
+    NosimStatus::Ok
+}
+
+/// Reads an agent's state.
+///
+/// # Safety
+/// `h` must be NULL or live; `out` must be valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_orca_agent_state(
+    h: *const NosimOrcaSim,
+    id: usize,
+    out: *mut NosimOrcaAgentState,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let (Some(s), Some(out)) = (unsafe { opt_ref(h) }, unsafe { opt_mut(out) }) else {
+        return fail(NosimStatus::NullPointer, "orca sim or output is NULL");
+    };
+    let Some(a) = s.inner.agent(id) else { return fail(NosimStatus::NotFound, format!("no agent {id}")) };
+    *out = NosimOrcaAgentState { position: a.position.into(), velocity: a.velocity.into(), radius: a.params.radius };
+    NosimStatus::Ok
+}

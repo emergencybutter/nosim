@@ -38,6 +38,8 @@ src/
   traffic.rs     IDM longitudinal model, MOBIL lane change, VAT UVs   (spec §7)
   traffic/ctm.rs Far-field Cell Transmission Model: links, priority
                  merge / FIFO diverge network, near-field handoff     (spec §7)
+  traffic/orca.rs ORCA pedestrian avoidance (RVO2 port): agents,
+                 polygon obstacles, 2D LP with safest-velocity fallback (spec §7B)
   photometry.rs  Hapke regolith BRDF, Chapman function, limb shell    (spec §8B, §8C)
   lod.rs         Altitude-band LOD governor, ECI / MCI / ICRF choice  (spec §2, §8)
 ffi/
@@ -88,6 +90,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §6 — declination extremes ±23.44°, 6.5 °C/km lapse | `astro` |
 | §6 — phenology table rows | `phenology::spec_table_rows` |
 | §7 — IDM equilibrium gap `s₀ + vT`, MOBIL safety/etiquette | `traffic` |
+| §7B — ORCA: a head-on pair and six agents in opposing corridor streams pass with zero overlap; a block is never penetrated (stops at the face alone, routes around with waypoints); walls hold from both sides; a 24-agent circle crossing arrives with overlap bounded by the infeasible-crush fallback; results are deterministic and independent of insertion order | `traffic::orca` |
 | §7 — CTM: vehicles conserved and bounded, free-flow platoon moves exactly one cell per step, steady demand gives density `q / v_f` in every cell, a closed exit sends a shockwave upstream at the wave speed, merges split capacity by priority, a blocked diverge branch holds the whole node (FIFO), spawn count at the near-field boundary equals the exited flow | `traffic::ctm` |
 | §8C — opposition surge and full-moon limb flattening vs Lambert | `photometry::hapke_opposition_and_limb_flattening` |
 | §8B — limb is the *brightest* part of the atmosphere, finite airmass (~35) at the horizon | `photometry::limb_is_brightest`, `photometry::chapman_function` |
@@ -103,7 +106,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §4 ARINC 424 decode, extrusion, grade fit, markings data | Implemented; heightfield patching is engine-side |
 | §5 Seed hash, Poisson levels, pier spacing, flatten falloff | Implemented; WFC/PCG graphs and bridge detection are engine-side |
 | §6 Calendar, declination, lapse rate, phenology, snow mask | Implemented; GPU buffer plumbing is engine-side |
-| §7 IDM, MOBIL, VAT addressing, CTM far-field with near-field handoff | Implemented; ECS and ORCA not started |
+| §7 IDM, MOBIL, VAT addressing, CTM far-field with near-field handoff, ORCA crowds | Implemented; the ECS and the navigation graph that feeds ORCA its preferred velocities are engine-side |
 | §8A VSOP87D / ELP 2000-82B evaluators, nutation, apparent places, topocentric vectors, phase, libration | Implemented (see below); physical libration (≤ 0.04°) not modelled |
 | §8A Yale Bright Star Catalogue loader, packed buffer, Planckian colour | Implemented; the catalogue itself goes to V ≈ 7.96, deeper than the spec's "to 6.5" |
 | §6/§8A Time scales (UTC → UT1 / TT / TDB, ΔT) | Implemented; DUT1 is an input (IERS Bulletin A), leap-second table valid through 2026-12-28 |

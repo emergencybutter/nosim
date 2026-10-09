@@ -396,3 +396,46 @@ fn ctm_link_handle() {
         nosim_ctm_link_free(ptr::null_mut());
     }
 }
+
+#[test]
+fn orca_sim_handle() {
+    let h = nosim_orca_new(0.1);
+    assert!(!h.is_null());
+    let p = nosim_orca_agent_params_default();
+    assert_eq!(p.radius, 0.3);
+    // SAFETY: live handle and sized buffers.
+    unsafe {
+        let a = nosim_orca_add_agent(h, NosimVec2 { x: -5.0, y: 0.0 }, p);
+        let b = nosim_orca_add_agent(h, NosimVec2 { x: 5.0, y: 0.05 }, p);
+        assert_eq!((a, b), (0, 1));
+        assert_eq!(nosim_orca_add_agent(h, NosimVec2::default(), NosimOrcaAgentParams { radius: -1.0, ..p }), -1);
+        assert!(last_error().contains("params"));
+        let wall = [NosimVec2 { x: -20.0, y: 2.0 }, NosimVec2 { x: 20.0, y: 2.0 }];
+        assert_eq!(nosim_orca_add_obstacle(h, wall.as_ptr(), 2), NosimStatus::Ok);
+        assert_eq!(nosim_orca_add_obstacle(h, wall.as_ptr(), 1), NosimStatus::InvalidArgument);
+        let mut min_gap = f64::INFINITY;
+        for _ in 0..300 {
+            assert_eq!(nosim_orca_set_goal(h, a as usize, NosimVec2 { x: 5.0, y: 0.0 }, 1.4, 1.0), NosimStatus::Ok);
+            assert_eq!(nosim_orca_set_goal(h, b as usize, NosimVec2 { x: -5.0, y: 0.05 }, 1.4, 1.0), NosimStatus::Ok);
+            assert_eq!(nosim_orca_step(h), NosimStatus::Ok);
+            let (mut sa, mut sb) = (NosimOrcaAgentState::default(), NosimOrcaAgentState::default());
+            assert_eq!(nosim_orca_agent_state(h, a as usize, &mut sa), NosimStatus::Ok);
+            assert_eq!(nosim_orca_agent_state(h, b as usize, &mut sb), NosimStatus::Ok);
+            let gap = ((sa.position.x - sb.position.x).powi(2) + (sa.position.y - sb.position.y).powi(2)).sqrt() - 0.6;
+            min_gap = min_gap.min(gap);
+        }
+        assert!(min_gap > -1e-3, "{min_gap}");
+        let mut sa = NosimOrcaAgentState::default();
+        nosim_orca_agent_state(h, a as usize, &mut sa);
+        assert!((sa.position.x - 5.0).abs() < 0.5, "{:?}", sa.position);
+        assert_eq!(nosim_orca_agent_count(h), 2);
+        assert!(nosim_orca_remove_agent(h, b as usize));
+        assert!(!nosim_orca_remove_agent(h, b as usize));
+        assert_eq!(nosim_orca_agent_state(h, b as usize, &mut sa), NosimStatus::NotFound);
+        assert_eq!(nosim_orca_set_preferred_velocity(h, 7, NosimVec2::default()), NosimStatus::NotFound);
+        nosim_orca_free(h);
+        assert_eq!(nosim_orca_step(ptr::null_mut()), NosimStatus::NullPointer);
+        assert_eq!(nosim_orca_agent_count(ptr::null()), 0);
+        nosim_orca_free(ptr::null_mut());
+    }
+}

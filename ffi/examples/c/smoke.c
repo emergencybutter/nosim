@@ -121,6 +121,28 @@ int main(int argc, char **argv) {
     CHECK(spawned > 300);
     nosim_ctm_link_free(link);
 
+    /* Pedestrians: two agents swap places head-on without touching. */
+    NosimOrcaSim *crowd = nosim_orca_new(0.1);
+    CHECK(crowd != NULL);
+    NosimOrcaAgentParams ped = nosim_orca_agent_params_default();
+    NosimVec2 pa = {-5.0, 0.0}, pb = {5.0, 0.05};
+    intptr_t ida = nosim_orca_add_agent(crowd, pa, ped), idb = nosim_orca_add_agent(crowd, pb, ped);
+    CHECK(ida == 0 && idb == 1);
+    double min_gap = 1e9;
+    for (int i = 0; i < 300; i++) {
+        nosim_orca_set_goal(crowd, (size_t)ida, pb, 1.4, 1.0);
+        nosim_orca_set_goal(crowd, (size_t)idb, pa, 1.4, 1.0);
+        CHECK(nosim_orca_step(crowd) == NOSIM_STATUS_OK);
+        NosimOrcaAgentState sa, sb;
+        nosim_orca_agent_state(crowd, (size_t)ida, &sa);
+        nosim_orca_agent_state(crowd, (size_t)idb, &sb);
+        double dx = sa.position.x - sb.position.x, dy = sa.position.y - sb.position.y;
+        double gap = sqrt(dx * dx + dy * dy) - sa.radius - sb.radius;
+        if (gap < min_gap) min_gap = gap;
+    }
+    CHECK(min_gap > -1e-3);
+    nosim_orca_free(crowd);
+
     /* Pure value APIs and NULL contracts. */
     NosimIdmParams idm = nosim_idm_params_default(30.0);
     CHECK(nosim_idm_free_acceleration(idm, 30.0) == 0.0);

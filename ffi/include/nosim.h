@@ -142,6 +142,11 @@ typedef struct NosimCtmLink NosimCtmLink;
 typedef struct NosimFloatingOrigin NosimFloatingOrigin;
 
 /**
+ * A crowd simulation (opaque).
+ */
+typedef struct NosimOrcaSim NosimOrcaSim;
+
+/**
  * Loaded scenery package (opaque). Mounting clones a reference; the handle stays valid
  * and must still be freed.
  */
@@ -738,6 +743,68 @@ typedef struct NosimCtmCell {
    */
   double inflow_veh_per_s;
 } NosimCtmCell;
+
+/**
+ * Per-agent ORCA tuning; see `nosim_orca_agent_params_default`.
+ */
+typedef struct NosimOrcaAgentParams {
+  /**
+   * Body radius, m.
+   */
+  double radius;
+  /**
+   * Speed limit, m/s.
+   */
+  double max_speed;
+  /**
+   * Look-ahead for other agents, s.
+   */
+  double time_horizon;
+  /**
+   * Look-ahead for obstacles, s.
+   */
+  double time_horizon_obstacle;
+  /**
+   * Neighbour search radius, m.
+   */
+  double neighbor_distance;
+  /**
+   * Nearest-neighbour cap.
+   */
+  size_t max_neighbors;
+} NosimOrcaAgentParams;
+
+/**
+ * A 2D vector, metres or m/s.
+ */
+typedef struct NosimVec2 {
+  /**
+   * X.
+   */
+  double x;
+  /**
+   * Y.
+   */
+  double y;
+} NosimVec2;
+
+/**
+ * Position and velocity of one agent.
+ */
+typedef struct NosimOrcaAgentState {
+  /**
+   * Position, m.
+   */
+  struct NosimVec2 position;
+  /**
+   * Velocity, m/s.
+   */
+  struct NosimVec2 velocity;
+  /**
+   * Radius, m.
+   */
+  double radius;
+} NosimOrcaAgentState;
 
 #ifdef __cplusplus
 extern "C" {
@@ -1501,6 +1568,101 @@ double nosim_ctm_link_remove(struct NosimCtmLink *h, size_t cell, double vehicle
 size_t nosim_ctm_link_cells(const struct NosimCtmLink *h,
                             struct NosimCtmCell *out,
                             size_t capacity);
+
+/**
+ * Defaults for a walking adult: 0.3 m, 1.4 m/s, 5 s / 2 s horizons, 10 m, 10 neighbours.
+ */
+struct NosimOrcaAgentParams nosim_orca_agent_params_default(void);
+
+/**
+ * Creates a crowd simulation stepping by `time_step` seconds (non-positive → 0.1).
+ */
+struct NosimOrcaSim *nosim_orca_new(double time_step);
+
+/**
+ * Releases a simulation. NULL is ignored.
+ *
+ * # Safety
+ * `h` must be NULL or a live handle, freed once.
+ */
+void nosim_orca_free(struct NosimOrcaSim *h);
+
+/**
+ * Adds an agent at rest; returns its id, or -1 with `nosim_last_error` set.
+ *
+ * # Safety
+ * `h` must be NULL or live.
+ */
+ptrdiff_t nosim_orca_add_agent(struct NosimOrcaSim *h,
+                               struct NosimVec2 position,
+                               struct NosimOrcaAgentParams params);
+
+/**
+ * Removes an agent; returns whether it existed.
+ *
+ * # Safety
+ * `h` must be NULL or live.
+ */
+bool nosim_orca_remove_agent(struct NosimOrcaSim *h, size_t id);
+
+/**
+ * Live agent count.
+ *
+ * # Safety
+ * `h` must be NULL or live.
+ */
+size_t nosim_orca_agent_count(const struct NosimOrcaSim *h);
+
+/**
+ * Sets the velocity an agent wants (from the host's navigation).
+ *
+ * # Safety
+ * `h` must be NULL or live.
+ */
+enum NosimStatus nosim_orca_set_preferred_velocity(struct NosimOrcaSim *h,
+                                                   size_t id,
+                                                   struct NosimVec2 velocity);
+
+/**
+ * Points an agent at a goal at `speed`, easing inside `slow_radius`.
+ *
+ * # Safety
+ * `h` must be NULL or live.
+ */
+enum NosimStatus nosim_orca_set_goal(struct NosimOrcaSim *h,
+                                     size_t id,
+                                     struct NosimVec2 goal,
+                                     double speed,
+                                     double slow_radius);
+
+/**
+ * Adds a polygonal obstacle: counter-clockwise vertices keep agents outside; two
+ * vertices make a wall blocking both sides.
+ *
+ * # Safety
+ * `h` must be NULL or live; `vertices` must point to `count` elements.
+ */
+enum NosimStatus nosim_orca_add_obstacle(struct NosimOrcaSim *h,
+                                         const struct NosimVec2 *vertices,
+                                         size_t count);
+
+/**
+ * Advances the crowd one time step.
+ *
+ * # Safety
+ * `h` must be NULL or live.
+ */
+enum NosimStatus nosim_orca_step(struct NosimOrcaSim *h);
+
+/**
+ * Reads an agent's state.
+ *
+ * # Safety
+ * `h` must be NULL or live; `out` must be valid for writes.
+ */
+enum NosimStatus nosim_orca_agent_state(const struct NosimOrcaSim *h,
+                                        size_t id,
+                                        struct NosimOrcaAgentState *out);
 
 #ifdef __cplusplus
 }  // extern "C"
