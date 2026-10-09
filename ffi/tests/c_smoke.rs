@@ -29,15 +29,14 @@ fn c_program_links_and_runs() {
     let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
     let lib_dir = target_dir(&manifest).join(profile);
     let staticlib = lib_dir.join("libnosim_ffi.a");
-    if !staticlib.exists() {
-        // Integration tests do not always force the staticlib artifact; build it explicitly.
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "nosim-ffi", "--lib"])
-            .args(if profile == "release" { &["--release"][..] } else { &[][..] })
-            .status()
-            .expect("cargo build");
-        assert!(status.success(), "cargo build -p nosim-ffi failed");
-    }
+    // Integration tests link the rlib, not the staticlib, so the .a on disk can be stale or
+    // missing. Always build it; cargo makes this a no-op when it is already current.
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "-p", "nosim-ffi", "--lib"])
+        .args(if profile == "release" { &["--release"][..] } else { &[][..] })
+        .status()
+        .expect("cargo build");
+    assert!(status.success(), "cargo build -p nosim-ffi failed");
     assert!(staticlib.exists(), "{} missing", staticlib.display());
 
     let out_dir = std::env::temp_dir().join(format!("nosim-c-smoke-{}", std::process::id()));
