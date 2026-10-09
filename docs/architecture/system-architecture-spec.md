@@ -384,6 +384,10 @@ Scaling smoothly from runway pavement to translunar orbit requires an analytical
 
   Typical lunar highland parameters: `ω ≈ 0.3, B₀ ≈ 1.0, h ≈ 0.05, b ≈ 0.25, c ≈ 0.3`. The CPU reference lives in `src/photometry.rs`.
 
+### Phase 2 Harness (`compiler/`)
+
+`world-compiler arinc` is the first concrete piece of the §1 ingestion pipeline: FAA CIFP text in, GeoParquet out. Primary `PG` records are decoded by `nosim::arinc424`, paired with their reciprocal end for grade fitting, and extruded along the true heading obtained from the airport `PA` record's magnetic variation (`true = magnetic + variation_east`). Each runway end becomes a row with a WKB pavement polygon (counter-clockwise, WGS84) and centreline, and the file carries GeoParquet 1.0 `geo` metadata so standard GIS tools read it. Scenery packages mounted through the §3 VFS replace the authoritative rows for airports they cover with `arinc_overrides`, which use the same table, so compiled output can be edited and fed back as a package. The Phase 2 acceptance test (KJFK RW31L centreline 14,511 ft ± 1 ft) runs against a synthetic CIFP fixture in the real column layout.
+
 ## 9. Implementation Status
 
 The engine-independent core of this specification is implemented as a dependency-free Rust crate under `src/`, with inline tests that assert the numbers and acceptance criteria quoted above (the KJFK RW04R decode, the 14,511 ft RW31L centreline, the sub-millimetre floating-origin check at 45°N 120°W, the LOD collapse past 100 km, and so on). See the [README](../../README.md) for the module map and a section-by-section status table. Everything that needs Unreal Engine (Nanite, PCG graphs, the virtual heightfield, decals, the Bruneton raymarcher) belongs to the client project, which consumes the crate through the `nosim-ffi` C ABI (`ffi/include/nosim.h`, generated from the Rust signatures on every build and verified by a compiled C smoke test).

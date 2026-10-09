@@ -1,0 +1,30 @@
+[package]
+name = "nosim-compiler"
+version = "0.1.0"
+edition = "2024"
+description = "world-compiler: offline ingestion from authoritative sources into engine-ready GeoParquet"
+repository = "https://github.com/emergencybutter/nosim"
+publish = false
+
+[[bin]]
+name = "world-compiler"
+path = "src/main.rs"
+
+[lib]
+name = "nosim_compiler"
+path = "src/lib.rs"
+
+[dependencies]
+arrow = "60.0.0"
+nosim = { path = ".." }
+parquet = "60.0.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
+
+[dev-dependencies]
+serde_json = "1.0.151"
