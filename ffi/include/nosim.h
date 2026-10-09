@@ -132,6 +132,11 @@ typedef enum NosimParentFrame {
 } NosimParentFrame;
 
 /**
+ * A far-field road segment (opaque).
+ */
+typedef struct NosimCtmLink NosimCtmLink;
+
+/**
  * Floating render origin (opaque).
  */
 typedef struct NosimFloatingOrigin NosimFloatingOrigin;
@@ -675,6 +680,64 @@ typedef struct NosimEpoch {
    */
   double delta_t_seconds;
 } NosimEpoch;
+
+/**
+ * Triangular fundamental diagram, per lane.
+ */
+typedef struct NosimFundamentalDiagram {
+  /**
+   * Free-flow speed, m/s.
+   */
+  double free_flow_speed;
+  /**
+   * Capacity, veh/s/lane.
+   */
+  double capacity_per_lane;
+  /**
+   * Jam density, veh/m/lane.
+   */
+  double jam_density_per_lane;
+} NosimFundamentalDiagram;
+
+/**
+ * Microscopic agents to create at the near-field boundary this step.
+ */
+typedef struct NosimSpawnBatch {
+  /**
+   * Vehicles to create.
+   */
+  uint32_t count;
+  /**
+   * Initial speed, m/s.
+   */
+  double speed_m_s;
+  /**
+   * Spacing between them, metres (`INFINITY` when the boundary cell is empty).
+   */
+  double spacing_m;
+} NosimSpawnBatch;
+
+/**
+ * Per-cell state for rendering density impostors.
+ */
+typedef struct NosimCtmCell {
+  /**
+   * Vehicles in the cell, all lanes.
+   */
+  double vehicles;
+  /**
+   * Vehicles per metre, all lanes.
+   */
+  double density;
+  /**
+   * Equilibrium speed, m/s.
+   */
+  double speed_m_s;
+  /**
+   * Flow into the cell during the last step, veh/s.
+   */
+  double inflow_veh_per_s;
+} NosimCtmCell;
 
 #ifdef __cplusplus
 extern "C" {
@@ -1332,6 +1395,112 @@ double nosim_jd_from_unix(double unix_seconds);
  * TT → TDB.
  */
 double nosim_tt_to_tdb(double jd_tt);
+
+/**
+ * Motorway diagram: 108 km/h, 1,800 veh/h/lane, 7.5 m jam spacing.
+ */
+struct NosimFundamentalDiagram nosim_ctm_diagram_motorway(void);
+
+/**
+ * Urban diagram: 50 km/h, 1,200 veh/h/lane, 7 m jam spacing.
+ */
+struct NosimFundamentalDiagram nosim_ctm_diagram_urban(void);
+
+/**
+ * Equilibrium speed at a per-lane density, m/s.
+ */
+double nosim_ctm_speed_at_density(struct NosimFundamentalDiagram diagram, double density_per_lane);
+
+/**
+ * Creates a link; NULL (with `nosim_last_error`) for non-positive length / step, zero
+ * lanes, or an inconsistent diagram.
+ */
+struct NosimCtmLink *nosim_ctm_link_new(struct NosimFundamentalDiagram diagram,
+                                        uint32_t lanes,
+                                        double length_m,
+                                        double dt_s);
+
+/**
+ * Releases a link. NULL is ignored.
+ *
+ * # Safety
+ * `h` must be NULL or a live handle, freed once.
+ */
+void nosim_ctm_link_free(struct NosimCtmLink *h);
+
+/**
+ * Number of cells (0 for NULL).
+ *
+ * # Safety
+ * `h` must be NULL or live.
+ */
+size_t nosim_ctm_link_cell_count(const struct NosimCtmLink *h);
+
+/**
+ * Cell length, metres (0 for NULL).
+ *
+ * # Safety
+ * `h` must be NULL or live.
+ */
+double nosim_ctm_link_cell_length(const struct NosimCtmLink *h);
+
+/**
+ * Index of the cell containing a station along the link, clamped.
+ *
+ * # Safety
+ * `h` must be NULL or live.
+ */
+size_t nosim_ctm_link_cell_at(const struct NosimCtmLink *h, double station_m);
+
+/**
+ * Advances one step. `demand` is upstream inflow in veh/s; `supply` is what the downstream
+ * side (typically the near field) can accept, veh/s (`INFINITY` for free exit). Either
+ * output may be NULL.
+ *
+ * # Safety
+ * `h` must be NULL or live; outputs NULL or valid for writes.
+ */
+enum NosimStatus nosim_ctm_link_step(struct NosimCtmLink *h,
+                                     double demand_veh_per_s,
+                                     double supply_veh_per_s,
+                                     double *entered,
+                                     double *exited);
+
+/**
+ * Converts the vehicles that exited in the last `nosim_ctm_link_step` into whole agents to
+ * spawn at the near-field boundary, carrying the fraction forward.
+ *
+ * # Safety
+ * `h` must be NULL or live.
+ */
+struct NosimSpawnBatch nosim_ctm_link_take_spawns(struct NosimCtmLink *h, double exited_vehicles);
+
+/**
+ * Adds vehicles to a cell (agents leaving the near field); returns the overflow that did
+ * not fit under the jam capacity.
+ *
+ * # Safety
+ * `h` must be NULL or live.
+ */
+double nosim_ctm_link_inject(struct NosimCtmLink *h, size_t cell, double vehicles);
+
+/**
+ * Removes up to `vehicles` from a cell; returns how many were removed.
+ *
+ * # Safety
+ * `h` must be NULL or live.
+ */
+double nosim_ctm_link_remove(struct NosimCtmLink *h, size_t cell, double vehicles);
+
+/**
+ * Fills up to `capacity` cell states; returns the cell count.
+ *
+ * # Safety
+ * `h` must be NULL or live; `out` must point to `capacity` elements.
+ */
+size_t nosim_ctm_link_cells(const struct NosimCtmLink *h,
+                            struct NosimCtmCell *out,
+                            size_t capacity);
 
 #ifdef __cplusplus
 }  // extern "C"

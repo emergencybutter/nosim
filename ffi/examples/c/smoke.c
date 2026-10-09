@@ -107,6 +107,20 @@ int main(int argc, char **argv) {
     nosim_star_catalog_free(cat);
     free(bytes);
 
+    /* Far-field traffic: a motorway link fed at 0.6 veh/s reaches that flux and hands
+     * whole vehicles to the near field. */
+    NosimCtmLink *link = nosim_ctm_link_new(nosim_ctm_diagram_motorway(), 2, 1500.0, 1.0);
+    CHECK(link != NULL);
+    double exited = 0.0;
+    unsigned spawned = 0;
+    for (int i = 0; i < 600; i++) {
+        CHECK(nosim_ctm_link_step(link, 0.6, INFINITY, NULL, &exited) == NOSIM_STATUS_OK);
+        spawned += nosim_ctm_link_take_spawns(link, exited).count;
+    }
+    CHECK(fabs(exited - 0.6) < 1e-6);
+    CHECK(spawned > 300);
+    nosim_ctm_link_free(link);
+
     /* Pure value APIs and NULL contracts. */
     NosimIdmParams idm = nosim_idm_params_default(30.0);
     CHECK(nosim_idm_free_acceleration(idm, 30.0) == 0.0);

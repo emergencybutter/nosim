@@ -353,3 +353,46 @@ fn time_scales() {
     assert!((nosim_jd_from_unix(0.0) - 2440587.5).abs() < 1e-9);
     assert!((nosim_tt_to_tdb(e.jd_tt) - e.jd_tdb).abs() < 1e-12);
 }
+
+#[test]
+fn ctm_link_handle() {
+    let d = nosim_ctm_diagram_motorway();
+    assert_eq!(d.free_flow_speed, 30.0);
+    assert!((nosim_ctm_speed_at_density(d, 0.0) - 30.0).abs() < 1e-12);
+    let h = nosim_ctm_link_new(d, 2, 1500.0, 1.0);
+    assert!(!h.is_null());
+    assert!(nosim_ctm_link_new(d, 0, 1500.0, 1.0).is_null());
+    assert!(last_error().contains("lanes"));
+    // SAFETY: live handle.
+    unsafe {
+        assert_eq!(nosim_ctm_link_cell_count(h), 50);
+        assert!((nosim_ctm_link_cell_length(h) - 30.0).abs() < 1e-9);
+        assert_eq!(nosim_ctm_link_cell_at(h, 1499.0), 49);
+        let (mut entered, mut exited) = (0.0, 0.0);
+        let mut spawned = 0u32;
+        let mut total_exited = 0.0;
+        for _ in 0..600 {
+            assert_eq!(nosim_ctm_link_step(h, 0.6, f64::INFINITY, &mut entered, &mut exited), NosimStatus::Ok);
+            total_exited += exited;
+            spawned += nosim_ctm_link_take_spawns(h, exited).count;
+        }
+        assert!((entered - 0.6).abs() < 1e-9 && (exited - 0.6).abs() < 1e-6);
+        assert!((f64::from(spawned) - total_exited).abs() < 1.0 + 1e-6);
+        let mut cells = vec![NosimCtmCell::default(); 50];
+        assert_eq!(nosim_ctm_link_cells(h, cells.as_mut_ptr(), cells.len()), 50);
+        assert!((cells[10].density - 0.02).abs() < 1e-6 && (cells[10].speed_m_s - 30.0).abs() < 1e-6);
+        assert!((cells[10].inflow_veh_per_s - 0.6).abs() < 1e-6);
+        let overflow = nosim_ctm_link_inject(h, 0, 1e6);
+        assert!(overflow > 0.0);
+        assert!(nosim_ctm_link_remove(h, 0, 1.0) == 1.0);
+        assert_eq!(nosim_ctm_link_inject(h, 999, 1.0), 1.0); // bad cell: nothing taken
+        assert_eq!(nosim_ctm_link_step(h, 0.0, 0.0, ptr::null_mut(), ptr::null_mut()), NosimStatus::Ok);
+        nosim_ctm_link_free(h);
+        assert_eq!(
+            nosim_ctm_link_step(ptr::null_mut(), 0.0, 0.0, ptr::null_mut(), ptr::null_mut()),
+            NosimStatus::NullPointer
+        );
+        assert_eq!(nosim_ctm_link_cell_count(ptr::null()), 0);
+        nosim_ctm_link_free(ptr::null_mut());
+    }
+}

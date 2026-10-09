@@ -269,6 +269,8 @@ The engine separates macroscopic population density from microscopic physical si
  └── Rendering: GPU Instancing + VAT Character Meshes      └── Instantiate microscopic agent
 ```
 
+**Far-field implementation (`src/traffic/ctm.rs`).** Links are discretised into cells at least `v_f · Δt` long (so the CFL condition always holds) and updated with Daganzo's sending/receiving rule on a triangular fundamental diagram: `S = min(n · v_f Δt / L, Q)`, `R = min(Q, (w Δt / L)(N − n))`, face flow `min(S_up, R_down)`. Vehicle counts are conserved and bounded by construction. Nodes are sources (demand), sinks (supply), Daganzo priority merges and FIFO diverges; the near field is simply the downstream supply of the links that reach it. The flux across that boundary is fractional, so a `NearFieldBoundary` accumulator converts it into whole spawn requests that preserve the rate exactly on average, each carrying the boundary cell's equilibrium speed and spacing; agents leaving the near field are injected back as counts. Default diagrams: motorway 108 km/h / 1,800 veh/h/lane / 7.5 m jam spacing, urban 50 km/h / 1,200 veh/h/lane / 7 m.
+
 ### A. Microscopic Traffic Kinematics
 
 Vehicles run as data-oriented structs inside an ECS framework without individual Actor overhead.

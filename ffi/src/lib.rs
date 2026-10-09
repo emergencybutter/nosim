@@ -1766,3 +1766,244 @@ pub extern "C" fn nosim_jd_from_unix(unix_seconds: f64) -> f64 {
 pub extern "C" fn nosim_tt_to_tdb(jd_tt: f64) -> f64 {
     nosim::timescale::tt_to_tdb(jd_tt)
 }
+
+// ---- Far-field traffic (CTM) -----------------------------------------------------------
+
+use nosim::traffic::ctm;
+
+/// Triangular fundamental diagram, per lane.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NosimFundamentalDiagram {
+    /// Free-flow speed, m/s.
+    pub free_flow_speed: f64,
+    /// Capacity, veh/s/lane.
+    pub capacity_per_lane: f64,
+    /// Jam density, veh/m/lane.
+    pub jam_density_per_lane: f64,
+}
+
+impl From<NosimFundamentalDiagram> for ctm::FundamentalDiagram {
+    fn from(d: NosimFundamentalDiagram) -> Self {
+        ctm::FundamentalDiagram {
+            free_flow_speed: d.free_flow_speed,
+            capacity_per_lane: d.capacity_per_lane,
+            jam_density_per_lane: d.jam_density_per_lane,
+        }
+    }
+}
+
+fn diagram_to_ffi(d: ctm::FundamentalDiagram) -> NosimFundamentalDiagram {
+    NosimFundamentalDiagram {
+        free_flow_speed: d.free_flow_speed,
+        capacity_per_lane: d.capacity_per_lane,
+        jam_density_per_lane: d.jam_density_per_lane,
+    }
+}
+
+/// Motorway diagram: 108 km/h, 1,800 veh/h/lane, 7.5 m jam spacing.
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_ctm_diagram_motorway() -> NosimFundamentalDiagram {
+    diagram_to_ffi(ctm::FundamentalDiagram::MOTORWAY)
+}
+
+/// Urban diagram: 50 km/h, 1,200 veh/h/lane, 7 m jam spacing.
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_ctm_diagram_urban() -> NosimFundamentalDiagram {
+    diagram_to_ffi(ctm::FundamentalDiagram::URBAN)
+}
+
+/// Equilibrium speed at a per-lane density, m/s.
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_ctm_speed_at_density(diagram: NosimFundamentalDiagram, density_per_lane: f64) -> f64 {
+    ctm::FundamentalDiagram::from(diagram).speed_at_density(density_per_lane)
+}
+
+/// A far-field road segment (opaque).
+pub struct NosimCtmLink {
+    inner: ctm::Link,
+    boundary: ctm::NearFieldBoundary,
+}
+
+/// Per-cell state for rendering density impostors.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimCtmCell {
+    /// Vehicles in the cell, all lanes.
+    pub vehicles: f64,
+    /// Vehicles per metre, all lanes.
+    pub density: f64,
+    /// Equilibrium speed, m/s.
+    pub speed_m_s: f64,
+    /// Flow into the cell during the last step, veh/s.
+    pub inflow_veh_per_s: f64,
+}
+
+/// Microscopic agents to create at the near-field boundary this step.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimSpawnBatch {
+    /// Vehicles to create.
+    pub count: u32,
+    /// Initial speed, m/s.
+    pub speed_m_s: f64,
+    /// Spacing between them, metres (`INFINITY` when the boundary cell is empty).
+    pub spacing_m: f64,
+}
+
+/// Creates a link; NULL (with `nosim_last_error`) for non-positive length / step, zero
+/// lanes, or an inconsistent diagram.
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_ctm_link_new(
+    diagram: NosimFundamentalDiagram,
+    lanes: u32,
+    length_m: f64,
+    dt_s: f64,
+) -> *mut NosimCtmLink {
+    match ctm::Link::new(diagram.into(), lanes, length_m, dt_s) {
+        Some(inner) => Box::into_raw(Box::new(NosimCtmLink { inner, boundary: ctm::NearFieldBoundary::new() })),
+        None => {
+            fail(
+                NosimStatus::InvalidArgument,
+                "ctm link: length, dt and lanes must be positive and the diagram consistent",
+            );
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Releases a link. NULL is ignored.
+///
+/// # Safety
+/// `h` must be NULL or a live handle, freed once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_ctm_link_free(h: *mut NosimCtmLink) {
+    if !h.is_null() {
+        // SAFETY: handle came from Box::into_raw.
+        drop(unsafe { Box::from_raw(h) });
+    }
+}
+
+/// Number of cells (0 for NULL).
+///
+/// # Safety
+/// `h` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_ctm_link_cell_count(h: *const NosimCtmLink) -> usize {
+    // SAFETY: documented contract.
+    unsafe { opt_ref(h) }.map_or(0, |l| l.inner.cell_count())
+}
+
+/// Cell length, metres (0 for NULL).
+///
+/// # Safety
+/// `h` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_ctm_link_cell_length(h: *const NosimCtmLink) -> f64 {
+    // SAFETY: documented contract.
+    unsafe { opt_ref(h) }.map_or(0.0, |l| l.inner.cell_length_m())
+}
+
+/// Index of the cell containing a station along the link, clamped.
+///
+/// # Safety
+/// `h` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_ctm_link_cell_at(h: *const NosimCtmLink, station_m: f64) -> usize {
+    // SAFETY: documented contract.
+    unsafe { opt_ref(h) }.map_or(0, |l| l.inner.cell_at(station_m))
+}
+
+/// Advances one step. `demand` is upstream inflow in veh/s; `supply` is what the downstream
+/// side (typically the near field) can accept, veh/s (`INFINITY` for free exit). Either
+/// output may be NULL.
+///
+/// # Safety
+/// `h` must be NULL or live; outputs NULL or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_ctm_link_step(
+    h: *mut NosimCtmLink,
+    demand_veh_per_s: f64,
+    supply_veh_per_s: f64,
+    entered: *mut f64,
+    exited: *mut f64,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let Some(l) = (unsafe { opt_mut(h) }) else { return fail(NosimStatus::NullPointer, "ctm link is NULL") };
+    let flows = l.inner.step(demand_veh_per_s, supply_veh_per_s);
+    // SAFETY: documented contract.
+    if let Some(e) = unsafe { opt_mut(entered) } {
+        *e = flows.entered;
+    }
+    // SAFETY: documented contract.
+    if let Some(x) = unsafe { opt_mut(exited) } {
+        *x = flows.exited;
+    }
+    NosimStatus::Ok
+}
+
+/// Converts the vehicles that exited in the last `nosim_ctm_link_step` into whole agents to
+/// spawn at the near-field boundary, carrying the fraction forward.
+///
+/// # Safety
+/// `h` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_ctm_link_take_spawns(h: *mut NosimCtmLink, exited_vehicles: f64) -> NosimSpawnBatch {
+    // SAFETY: documented contract.
+    let Some(l) = (unsafe { opt_mut(h) }) else { return NosimSpawnBatch::default() };
+    let b = l.boundary.take_spawns(&l.inner, exited_vehicles);
+    NosimSpawnBatch { count: b.count, speed_m_s: b.speed_m_s, spacing_m: b.spacing_m }
+}
+
+/// Adds vehicles to a cell (agents leaving the near field); returns the overflow that did
+/// not fit under the jam capacity.
+///
+/// # Safety
+/// `h` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_ctm_link_inject(h: *mut NosimCtmLink, cell: usize, vehicles: f64) -> f64 {
+    // SAFETY: documented contract.
+    match unsafe { opt_mut(h) } {
+        Some(l) if cell < l.inner.cell_count() => l.inner.inject(cell, vehicles),
+        _ => vehicles.max(0.0),
+    }
+}
+
+/// Removes up to `vehicles` from a cell; returns how many were removed.
+///
+/// # Safety
+/// `h` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_ctm_link_remove(h: *mut NosimCtmLink, cell: usize, vehicles: f64) -> f64 {
+    // SAFETY: documented contract.
+    match unsafe { opt_mut(h) } {
+        Some(l) if cell < l.inner.cell_count() => l.inner.remove(cell, vehicles),
+        _ => 0.0,
+    }
+}
+
+/// Fills up to `capacity` cell states; returns the cell count.
+///
+/// # Safety
+/// `h` must be NULL or live; `out` must point to `capacity` elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_ctm_link_cells(
+    h: *const NosimCtmLink,
+    out: *mut NosimCtmCell,
+    capacity: usize,
+) -> usize {
+    // SAFETY: documented contract.
+    let Some(l) = (unsafe { opt_ref(h) }) else { return 0 };
+    // SAFETY: documented contract.
+    if let Some(dst) = unsafe { slice_out(out, capacity) } {
+        for (i, d) in dst.iter_mut().enumerate().take(l.inner.cell_count()) {
+            *d = NosimCtmCell {
+                vehicles: l.inner.vehicles()[i],
+                density: l.inner.density(i),
+                speed_m_s: l.inner.speed(i),
+                inflow_veh_per_s: l.inner.flux(i),
+            };
+        }
+    }
+    l.inner.cell_count()
+}

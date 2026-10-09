@@ -1,4 +1,7 @@
-//! Microscopic traffic kinematics and crowd VAT addressing (spec §7).
+//! Traffic (spec §7): microscopic kinematics and crowd VAT addressing here, the far-field
+//! Cell Transmission Model and the near-field handoff in [`ctm`].
+
+pub mod ctm;
 
 /// Inside this radius agents are simulated individually.
 pub const NEAR_FIELD_RADIUS_M: f64 = 1_500.0;
