@@ -338,7 +338,7 @@ Scaling smoothly from runway pavement to translunar orbit requires an analytical
     θ   = Angle between local zenith and view ray
   ```
 
-  > **Review note.** An earlier draft wrote `I_limb = I₀ · exp(-k·Δr / (H_R · cos θ))`. That expression goes to zero as `cos θ → 0`, i.e. it is darkest exactly at the limb, where the real atmosphere is brightest (longest scattering path). The Chapman form above is the one implemented in `include/nosim/photometry.hpp`; at the horizon it gives ≈ 35 airmasses, matching observation.
+  > **Review note.** An earlier draft wrote `I_limb = I₀ · exp(-k·Δr / (H_R · cos θ))`. That expression goes to zero as `cos θ → 0`, i.e. it is darkest exactly at the limb, where the real atmosphere is brightest (longest scattering path). The Chapman form above is the one implemented in `src/photometry.rs`; at the horizon it gives ≈ 35 airmasses, matching observation.
 
 ### C. Lunar Geodesy & Hapke Photometric Regolith
 
@@ -360,11 +360,11 @@ Scaling smoothly from runway pavement to translunar orbit requires an analytical
     H(x)   ≈ (1 + 2x) / (1 + 2γx),  γ = √(1 - ω)             Chandrasekhar isotropic scattering
   ```
 
-  Typical lunar highland parameters: `ω ≈ 0.3, B₀ ≈ 1.0, h ≈ 0.05, b ≈ 0.25, c ≈ 0.3`. The CPU reference lives in `include/nosim/photometry.hpp`.
+  Typical lunar highland parameters: `ω ≈ 0.3, B₀ ≈ 1.0, h ≈ 0.05, b ≈ 0.25, c ≈ 0.3`. The CPU reference lives in `src/photometry.rs`.
 
 ## 9. Implementation Status
 
-The engine-independent core of this specification is implemented as a header-only C++20 library under `include/nosim/`, with CTest coverage that asserts the numbers and acceptance criteria quoted above (the KJFK RW04R decode, the 14,511 ft RW31L centreline, the sub-millimetre floating-origin check at 45°N 120°W, the LOD collapse past 100 km, and so on). See the [README](../../README.md) for the module map and a section-by-section status table. Everything that needs Unreal Engine (Nanite, PCG graphs, the virtual heightfield, decals, the Bruneton raymarcher) belongs to the client project.
+The engine-independent core of this specification is implemented as a dependency-free Rust crate under `src/`, with inline tests that assert the numbers and acceptance criteria quoted above (the KJFK RW04R decode, the 14,511 ft RW31L centreline, the sub-millimetre floating-origin check at 45°N 120°W, the LOD collapse past 100 km, and so on). See the [README](../../README.md) for the module map and a section-by-section status table. Everything that needs Unreal Engine (Nanite, PCG graphs, the virtual heightfield, decals, the Bruneton raymarcher) belongs to the client project, which will consume the crate through a C-ABI layer.
 
 ## 10. End-to-End Implementation & Verification Blueprint
 

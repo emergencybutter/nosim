@@ -1,0 +1,16 @@
+[package]
+name = "nosim"
+version = "0.1.0"
+edition = "2024"
+description = "Engine-independent core for the planetary-to-translunar world simulator"
+repository = "https://github.com/emergencybutter/nosim"
+publish = false
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"

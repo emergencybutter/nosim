@@ -1,8 +1,2 @@
-build/
-build-*/
-cmake-build-*/
-CMakeFiles/
-CMakeCache.txt
-compile_commands.json
-*.o
-*.a
+/target/
+Cargo.lock.orig
