@@ -237,6 +237,8 @@ Simulation Clock (Julian Date / Day-of-Year [DOY 1 to 365])
 | Snow Accumulation | T_local < 0°C + Precipitation Flag | Upward-facing surface projection: `Saturate((Normal · Up - SlopeThresh) · Depth)`. Cavity fill via AO masks. |
 | Road Melting / Wear | High-Traffic Road Buffers | Dynamic render-target mask driven by agent tire tracks clears snow down to bare, wet asphalt (increased specular, low roughness). |
 
+The table leaves three cases open; the implementation closes them as follows. Before DOY 60 trees are dormant (winter state). A cold spring (`T_local ≤ 5 °C` inside the spring window) keeps buds closed. A warm autumn (`T_local ≥ 10 °C` inside the autumn window) keeps the summer canopy. The DOY windows are northern-hemisphere; the southern hemisphere shifts the calendar by 182 days.
+
 ## 7. Procedural Traffic & Crowd Simulation Pipeline
 
 The engine separates macroscopic population density from microscopic physical simulation to maintain high frame rates across large viewing distances.
@@ -265,7 +267,7 @@ Vehicles run as data-oriented structs inside an ECS framework without individual
   dv/dt = a · [ 1 - (v / v₀)⁴ - ( s*(v, Δv) / s )² ]
 
   where:
-    s*(v, Δv) = s₀ + v·T + (v·Δv) / (2·√(a·b))
+    s*(v, Δv) = s₀ + max(0, v·T + (v·Δv) / (2·√(a·b)))
     v₀      = Target speed limit (OSM maxspeed)
     s       = Net distance gap to lead vehicle
     Δv      = Velocity difference (v - v_lead)
@@ -274,6 +276,8 @@ Vehicles run as data-oriented structs inside an ECS framework without individual
     a       = Maximum acceleration (e.g., 1.5 m/s²)
     b       = Comfortable braking deceleration (e.g., 2.0 m/s²)
   ```
+
+  The `max(0, …)` is Treiber's standard guard: when the leader pulls away (`Δv < 0`) the desired gap never drops below `s₀`. Implementations must also clamp `s` away from zero.
 
 - **Lateral Transitions (MOBIL):** Lane switches trigger only when an adjacent lane provides an acceleration advantage exceeding an etiquette threshold, without forcing target-lane vehicles to exceed safe braking limits (`b_safe = 2.0 m/s²`).
 - **Wheels & Chassis Orientation:** Vehicle instances cast rays against the runtime heightfield texture and road mesh, pitching and rolling the chassis smoothly over road crown and grade transitions.
@@ -286,9 +290,11 @@ Vehicles run as data-oriented structs inside an ECS framework without individual
   - Zero CPU skeletal evaluation or skinning occurs at runtime. The GPU vertex shader indexes animation rows based on instance velocity and elapsed time:
 
     ```text
-    U_coord = VertexID / TotalVertices
-    V_coord = ((Time · Speed · PlaybackRate) mod FrameCount) / FrameCount
+    U_coord = (VertexID + 0.5) / TotalVertices
+    V_coord = (floor((Time · Speed · PlaybackRate) mod FrameCount) + 0.5) / FrameCount
     ```
+
+    The `+ 0.5` lands each lookup on a texel centre so point sampling is exact; a negative modulo result wraps back into `[0, FrameCount)`.
 
 ## 8. Astrodynamics, Deep Sky & Multi-Scale Planetary LOD
 
@@ -319,15 +325,20 @@ Scaling smoothly from runway pavement to translunar orbit requires an analytical
 ### B. The Atmospheric Transition (Bruneton to Analytical Limb)
 
 - **Altitudes < 100 km:** Evaluates a 4-dimensional precomputed atmospheric scattering model (Bruneton framework). Raymarches Rayleigh scattering (molecular air, proportional to 1 / λ⁴) and Mie scattering (aerosols/haze) along the view ray.
-- **Altitudes ≥ 100 km:** Flushes the volumetric raymarcher to conserve frame budget. Renders the atmosphere as an analytical inverted shell clamped to the planet's limb:
+- **Altitudes ≥ 100 km:** Flushes the volumetric raymarcher to conserve frame budget. Renders the atmosphere as an analytical inverted shell clamped to the planet's limb. The slant optical depth comes from the Chapman grazing-incidence function, which equals `1 / cos θ` overhead but stays finite at the limb; single-scatter inscatter then saturates with that depth:
 
   ```text
-  I_limb(θ) = I₀ · exp( -k · (r_top - r_surface) / (H_R · cos(θ)) )
+  τ(θ)      = τ_zenith · Ch(X, θ)
+  Ch(X, θ)  ≈ √(πX/2) · exp(y²) · erfc(y),   y = √(X/2) · cos θ     (Smith & Smith 1972)
+  I_limb(θ) = I₀ · (1 - exp(-τ(θ)))
 
   where:
     H_R = 8.0 km (Rayleigh scale height)
-    θ   = Angle between surface normal and view ray
+    X   = R_planet / H_R  (≈ 796 for Earth)
+    θ   = Angle between local zenith and view ray
   ```
+
+  > **Review note.** An earlier draft wrote `I_limb = I₀ · exp(-k·Δr / (H_R · cos θ))`. That expression goes to zero as `cos θ → 0`, i.e. it is darkest exactly at the limb, where the real atmosphere is brightest (longest scattering path). The Chapman form above is the one implemented in `include/nosim/photometry.hpp`; at the horizon it gives ≈ 35 airmasses, matching observation.
 
 ### C. Lunar Geodesy & Hapke Photometric Regolith
 
@@ -340,13 +351,22 @@ Scaling smoothly from runway pavement to translunar orbit requires an analytical
   where:
     μ₀     = cos(θᵢ)   (Incident solar angle)
     μ      = cos(θₑ)   (Emission/viewer angle)
-    α      = Phase angle between sun and viewer
-    B(α)   = Opposition surge backscatter spike
-    P(α)   = Double Henyey-Greenstein particle phase function
-    H(x)   = Chandrasekhar isotropic scattering function
+    α      = Phase angle between sun and viewer (0 = opposition)
+    ω      = Single-scattering albedo
+
+    B(α)   = B₀ / (1 + tan(α/2) / h)                         Shadow-hiding opposition surge
+    P(α)   = (1+c)/2 · (1-b²) / (1 - 2b·cos α + b²)^(3/2)     Double Henyey-Greenstein:
+           + (1-c)/2 · (1-b²) / (1 + 2b·cos α + b²)^(3/2)     backscatter lobe + forward lobe
+    H(x)   ≈ (1 + 2x) / (1 + 2γx),  γ = √(1 - ω)             Chandrasekhar isotropic scattering
   ```
 
-## 9. End-to-End Implementation & Verification Blueprint
+  Typical lunar highland parameters: `ω ≈ 0.3, B₀ ≈ 1.0, h ≈ 0.05, b ≈ 0.25, c ≈ 0.3`. The CPU reference lives in `include/nosim/photometry.hpp`.
+
+## 9. Implementation Status
+
+The engine-independent core of this specification is implemented as a header-only C++20 library under `include/nosim/`, with CTest coverage that asserts the numbers and acceptance criteria quoted above (the KJFK RW04R decode, the 14,511 ft RW31L centreline, the sub-millimetre floating-origin check at 45°N 120°W, the LOD collapse past 100 km, and so on). See the [README](../../README.md) for the module map and a section-by-section status table. Everything that needs Unreal Engine (Nanite, PCG graphs, the virtual heightfield, decals, the Bruneton raymarcher) belongs to the client project.
+
+## 10. End-to-End Implementation & Verification Blueprint
 
 ### Phase 1: Coordinate & Terrain Spine
 
