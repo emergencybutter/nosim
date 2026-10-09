@@ -57,7 +57,9 @@ compiler/
   src/wkb.rs     Well-Known Binary polygon / linestring
   src/lib.rs     Override application through the VFS; CLI parsing; run_arinc
   tests/         The Phase 2 pipeline end to end, including the §3 override loop
-fixtures/        The spec's KJFK example package (scenery tests); the BSC5 catalogue
+fixtures/        The spec's KJFK example package (scenery tests) — its arinc_runways.parquet
+                 is a real table compiled from the CIFP sample, so the package overrides work
+                 end to end; the BSC5 catalogue
                  compiled to nosim's packed form plus a 22-line text excerpt (starfield tests)
 examples/        compile_bsc5: turns the CDS catalogue text into the packed star buffer
 tools/           ephem_tables.py: reference evaluator + generator for the ephemeris tables
