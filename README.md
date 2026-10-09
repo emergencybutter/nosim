@@ -54,10 +54,15 @@ ffi/
 compiler/
   src/arinc.rs   CIFP reading, reciprocal pairing, magnetic variation, extrusion
   src/geoparquet.rs  GeoParquet 1.0 writer / reader for the runway table
-  src/wkb.rs     Well-Known Binary polygon / linestring
+  src/wkb.rs     Well-Known Binary: polygon / linestring writers, any 2D geometry reader
   src/validate.rs  Package Validator: core audit plus override-table integrity checks
-  src/lib.rs     Override application through the VFS; CLI parsing; run_arinc / run_validate
-  tests/         The Phase 2 pipeline end to end, including the §3 override loop
+  src/tiler/     Vector Tiler: Web-Mercator XYZ addressing and Morton keys (mod.rs),
+                 Sutherland–Hodgman / Liang–Barsky clipping (clip.rs), Douglas–Peucker
+                 (simplify.rs), a Mapbox Vector Tile 2.1 encoder and decoder (mvt.rs),
+                 GeoParquet feature source (source.rs)
+  src/lib.rs     Override application through the VFS; CLI parsing; run_arinc / run_validate / run_tiles
+  tests/         The Phase 2 pipeline end to end, including the §3 override loop; the tiler
+                 from the KJFK runway table to decoded tiles on disk
 fixtures/        The spec's KJFK example package (scenery tests) — its arinc_runways.parquet
                  is a real table compiled from the CIFP sample, so the package overrides work
                  end to end; the BSC5 catalogue
@@ -92,6 +97,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §3 — tier → priority → id resolution; newer version replaces, older refused | `vfs::resolution_order_is_tier_then_priority_then_id`, `vfs::newer_version_replaces_older_only` |
 | §3 — validator catches path traversal, bad bounds, open rings | `scenery::validator_rejects_unsafe_paths`, `geojson::closure_and_shape_auditing` |
 | Phase 2 end to end — CIFP text → eight paired KJFK runway ends → GeoParquet with `geo` metadata → read back identical; RW31L centreline 14,511 ft ± 1 ft; true heading = magnetic + variation; a scenery package's `arinc_overrides` replaces the authoritative rows for its airport | `compiler/tests/pipeline.rs` |
+| §1 vector tiler — KJFK reference point lands in XYZ tile 302/385 at z 10 and 4834/6164 at z 14; the runway GeoParquet tiles into a single z 10 tile holding all eight ends, every deeper tile descends from it, a runway straddling a tile edge appears clipped in both, and the `z/x/y.pbf` files decode as MVT v2 with the attributes intact; Morton keys interleave bits so a tile's four children are consecutive | `tiler::tile_addressing`, `tiler::morton_keys`, `mvt::encode_then_decode_round_trip`, `compiler/tests/tiles.rs` |
 | §8A — VSOP87D Earth reproduces IMCCE's own `vsop87.chk` values to 10 decimals (1700–2000) | `ephem::vsop87d_matches_imcce_check_values` |
 | §8A — ELP82B Moon matches JPL Horizons (DE441) J2000 ecliptic vectors to 0.35 km in 1969–2000, 1.2 km by 2047 | `ephem::elp82b_matches_jpl_horizons` |
 | §8A — apparent Sun / Moon RA–Dec, nutation, phase angle, illuminated fraction, optical libration against Meeus's worked examples | `ephem::apparent_sun_ra_dec`, `apparent_moon_ra_dec`, `obliquity_and_nutation`, `phase_and_illumination`, `libration` |
@@ -127,7 +133,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §8B/§8C Hapke BRDF, Chapman limb | Implemented as CPU reference for the shaders |
 | §8 LOD band policy, parent-frame selection | Implemented |
 | C ABI for the UE5 client | Implemented: every module above is reachable from C; proven by a compiled C smoke test |
-| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator) | Implemented for runways and packages; vector tiling and raster processing not started |
+| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler) | Implemented for runways, packages and GeoParquet → MVT tiling with Morton ordering; OSM PBF / FlatGeobuf input, H3 indexing and raster processing not started |
 
 Anything that needs Unreal (Nanite, PCG, virtual heightfield, decals, raymarcher) lives in
 the client project and is out of scope here.
@@ -174,6 +180,23 @@ cargo run -p nosim-compiler --release -- arinc --input FAACIFP18 --output runway
 ```sh
 cargo run -p nosim-compiler --release -- validate [--strict] [--json] <package-or-directory>...
 ```
+
+```sh
+cargo run -p nosim-compiler --release -- tiles --input features.parquet --output tiles/ [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]
+```
+
+`tiles` is the §1 Vector Tiler. It reads any GeoParquet file (the geometry column named by
+the `geo` metadata, WKB point / line / polygon and their multi forms; every scalar column
+becomes a property, non-scalar columns are skipped with a warning), projects to Web
+Mercator, and for every zoom in the range cuts each feature into the XYZ tiles its bounding
+box touches: clipped to the tile plus `--buffer` extent units, simplified with
+Douglas–Peucker at `--tolerance` extent units, quantised to the integer tile grid, and
+encoded as a Mapbox Vector Tile v2 layer. Output is `<dir>/<z>/<x>/<y>.pbf`, written in
+Morton (Z-order) sequence within each zoom so a packed archive built from it keeps spatial
+locality, plus a TileJSON-style `metadata.json`. The encoder is hand-written (no protobuf
+dependency) and is paired with a decoder used by the tests to prove the round trip. The
+compiled runway table tiles directly, so `arinc` → `tiles` is a complete path from CIFP text
+to client-ready vector tiles.
 
 `validate` is the §1 Package Validator: for each package (or every package directly inside a
 directory) it reports *all* problems at once — manifest schema and validation errors, missing

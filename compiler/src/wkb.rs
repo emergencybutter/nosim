@@ -129,3 +129,133 @@ mod tests {
         assert_eq!(parse_polygon(&[]), Err(WkbError::Truncated));
     }
 }
+
+// ---- General geometry ------------------------------------------------------------------
+
+/// Any 2D WKB geometry, flattened: multi-types and collections become lists of parts.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Geometry {
+    /// One or more points.
+    Points(Vec<(f64, f64)>),
+    /// One or more linestrings.
+    Lines(Vec<Vec<(f64, f64)>>),
+    /// One or more polygons, each an outer ring followed by holes (rings unclosed).
+    Polygons(Vec<Vec<Vec<(f64, f64)>>>),
+}
+
+const POINT: u32 = 1;
+const MULTIPOINT: u32 = 4;
+const MULTILINESTRING: u32 = 5;
+const MULTIPOLYGON: u32 = 6;
+const GEOMETRYCOLLECTION: u32 = 7;
+
+/// Parses any 2D WKB geometry (ISO or EWKB type codes with Z/M are refused).
+pub fn parse_geometry(bytes: &[u8]) -> Result<Geometry, WkbError> {
+    let mut c = Cursor { bytes, pos: 0 };
+    let mut points = Vec::new();
+    let mut lines = Vec::new();
+    let mut polygons = Vec::new();
+    parse_into(&mut c, &mut points, &mut lines, &mut polygons)?;
+    match (points.is_empty(), lines.is_empty(), polygons.is_empty()) {
+        (false, true, true) => Ok(Geometry::Points(points)),
+        (true, false, true) => Ok(Geometry::Lines(lines)),
+        (true, true, false) => Ok(Geometry::Polygons(polygons)),
+        (true, true, true) => Err(WkbError::Truncated),
+        _ => Err(WkbError::WrongType), // mixed collections are not representable as one feature
+    }
+}
+
+fn parse_into(
+    c: &mut Cursor<'_>,
+    points: &mut Vec<(f64, f64)>,
+    lines: &mut Vec<Vec<(f64, f64)>>,
+    polygons: &mut Vec<Vec<Vec<(f64, f64)>>>,
+) -> Result<(), WkbError> {
+    match c.bytes.get(c.pos) {
+        None => return Err(WkbError::Truncated),
+        Some(0) => return Err(WkbError::BigEndian),
+        Some(_) => c.pos += 1,
+    }
+    let raw = c.u32()?;
+    if raw & 0xE000_0000 != 0 || raw >= 1000 {
+        return Err(WkbError::WrongType); // Z / M / SRID variants
+    }
+    match raw {
+        POINT => points.push((c.f64()?, c.f64()?)),
+        LINESTRING => {
+            let n = c.u32()?;
+            lines.push(c.points(n)?);
+        }
+        POLYGON => {
+            let rings = c.u32()?;
+            let mut poly = Vec::with_capacity(rings as usize);
+            for _ in 0..rings {
+                let n = c.u32()?;
+                let mut ring = c.points(n)?;
+                if ring.len() > 1 && ring.first() == ring.last() {
+                    ring.pop();
+                }
+                poly.push(ring);
+            }
+            polygons.push(poly);
+        }
+        MULTIPOINT | MULTILINESTRING | MULTIPOLYGON | GEOMETRYCOLLECTION => {
+            let n = c.u32()?;
+            for _ in 0..n {
+                parse_into(c, points, lines, polygons)?;
+            }
+        }
+        _ => return Err(WkbError::WrongType),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    fn point(x: f64, y: f64) -> Vec<u8> {
+        let mut out = vec![1u8];
+        out.extend_from_slice(&POINT.to_le_bytes());
+        out.extend_from_slice(&x.to_le_bytes());
+        out.extend_from_slice(&y.to_le_bytes());
+        out
+    }
+
+    fn multi(code: u32, parts: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = vec![1u8];
+        out.extend_from_slice(&code.to_le_bytes());
+        out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+        for p in parts {
+            out.extend_from_slice(p);
+        }
+        out
+    }
+
+    #[test]
+    fn parses_every_type() {
+        assert_eq!(parse_geometry(&point(1.0, 2.0)).unwrap(), Geometry::Points(vec![(1.0, 2.0)]));
+        let mp = multi(MULTIPOINT, &[point(1.0, 2.0), point(3.0, 4.0)]);
+        assert_eq!(parse_geometry(&mp).unwrap(), Geometry::Points(vec![(1.0, 2.0), (3.0, 4.0)]));
+        let line = linestring(&[(0.0, 0.0), (1.0, 1.0)]);
+        assert_eq!(parse_geometry(&line).unwrap(), Geometry::Lines(vec![vec![(0.0, 0.0), (1.0, 1.0)]]));
+        let ml = multi(MULTILINESTRING, &[line.clone(), line.clone()]);
+        assert!(matches!(parse_geometry(&ml).unwrap(), Geometry::Lines(l) if l.len() == 2));
+        let square = polygon(&[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]);
+        assert_eq!(
+            parse_geometry(&square).unwrap(),
+            Geometry::Polygons(vec![vec![vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]]])
+        );
+        let mpoly = multi(MULTIPOLYGON, &[square.clone(), square.clone()]);
+        assert!(matches!(parse_geometry(&mpoly).unwrap(), Geometry::Polygons(p) if p.len() == 2));
+        let gc = multi(GEOMETRYCOLLECTION, &[square.clone(), square]);
+        assert!(matches!(parse_geometry(&gc).unwrap(), Geometry::Polygons(p) if p.len() == 2));
+        // Mixed collections, Z geometries and empties are refused.
+        let mixed = multi(GEOMETRYCOLLECTION, &[point(0.0, 0.0), line]);
+        assert_eq!(parse_geometry(&mixed), Err(WkbError::WrongType));
+        let mut z = point(0.0, 0.0);
+        z[1..5].copy_from_slice(&1001u32.to_le_bytes());
+        assert_eq!(parse_geometry(&z), Err(WkbError::WrongType));
+        assert_eq!(parse_geometry(&multi(MULTIPOINT, &[])), Err(WkbError::Truncated));
+    }
+}

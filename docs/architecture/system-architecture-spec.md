@@ -29,6 +29,8 @@ This specification defines the architecture for a real-time world simulator that
  └── Kinematic Simulation Layer (IDM Multi-Lane Traffic, ORCA Pedestrian VAT)
 ```
 
+> **Implementation note (world-compiler).** The Vector Tiler is implemented as `world-compiler tiles`: GeoParquet in, Web-Mercator XYZ quadtree out as Mapbox Vector Tiles (`z/x/y.pbf`), written in Morton order. FlatGeobuf output, OSM PBF input and H3 indexing are not implemented; the Raster Processor is not started.
+
 ## 2. Spatial Hierarchy & Coordinate Transformations
 
 To prevent floating-point precision collapse across orbital scales (> 384,400 km) while maintaining sub-millimeter precision on runway thresholds and road curbs, the engine uses a 4-tier coordinate frame hierarchy.

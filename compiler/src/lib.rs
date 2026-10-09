@@ -7,6 +7,7 @@
 
 pub mod arinc;
 pub mod geoparquet;
+pub mod tiler;
 pub mod validate;
 pub mod wkb;
 
@@ -166,17 +167,31 @@ pub struct ValidateArgs {
 }
 
 /// A parsed command line.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// Compile ARINC 424 runways.
     Arinc(ArincArgs),
     /// Audit scenery packages.
     Validate(ValidateArgs),
+    /// Cut vector tiles from a GeoParquet file.
+    Tiles(TilesArgs),
+}
+
+/// `tiles` subcommand options.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TilesArgs {
+    /// GeoParquet to read.
+    pub input: PathBuf,
+    /// Directory to write `z/x/y.pbf` into.
+    pub output: PathBuf,
+    /// Tiling parameters.
+    pub options: tiler::TilingOptions,
 }
 
 /// Usage text.
 pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runways.parquet> [--packages <dir>] [--airport <ICAO>]\n\
-                         world-compiler validate [--strict] [--json] <package-or-directory>...";
+                         world-compiler validate [--strict] [--json] <package-or-directory>...\n\
+                         world-compiler tiles --input <features.parquet> --output <dir> [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]";
 
 /// Parses the command line (everything after the program name).
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, CompileError> {
@@ -184,7 +199,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Co
     match it.next().as_deref() {
         Some("arinc") => parse_arinc(it).map(Command::Arinc),
         Some("validate") => parse_validate(it).map(Command::Validate),
-        other => Err(CompileError::Usage(format!("expected subcommand `arinc` or `validate`, got {other:?}\n{USAGE}"))),
+        Some("tiles") => parse_tiles(it).map(Command::Tiles),
+        other => Err(CompileError::Usage(format!(
+            "expected subcommand `arinc`, `validate` or `tiles`, got {other:?}\n{USAGE}"
+        ))),
     }
 }
 
@@ -241,4 +259,45 @@ pub fn run_arinc(args: &ArincArgs) -> Result<(Vec<RunwayRow>, arinc::Summary, Ov
     };
     geoparquet::write_runways(&args.output, &rows)?;
     Ok((rows, summary, overrides))
+}
+
+fn parse_tiles<I: Iterator<Item = String>>(mut it: I) -> Result<TilesArgs, CompileError> {
+    let (mut input, mut output) = (None, None);
+    let mut options = tiler::TilingOptions::default();
+    let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
+    while let Some(flag) = it.next() {
+        let value = it.next().ok_or_else(|| CompileError::Usage(format!("{flag} needs a value\n{USAGE}")))?;
+        match flag.as_str() {
+            "--input" => input = Some(PathBuf::from(value)),
+            "--output" => output = Some(PathBuf::from(value)),
+            "--layer" => options.layer = value,
+            "--min-zoom" => options.min_zoom = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--max-zoom" => options.max_zoom = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--extent" => options.extent = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--buffer" => options.buffer = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--tolerance" => options.tolerance = value.parse().map_err(|_| bad(&flag, &value))?,
+            _ => return Err(CompileError::Usage(format!("unknown flag {flag}\n{USAGE}"))),
+        }
+    }
+    if options.min_zoom > options.max_zoom || options.max_zoom > 30 {
+        return Err(CompileError::Usage(format!("zoom range must satisfy min ≤ max ≤ 30\n{USAGE}")));
+    }
+    if options.extent == 0 || options.layer.is_empty() || options.tolerance.is_nan() || options.tolerance < 0.0 {
+        return Err(CompileError::Usage(format!("extent must be positive, layer non-empty, tolerance ≥ 0\n{USAGE}")));
+    }
+    Ok(TilesArgs {
+        input: input.ok_or_else(|| CompileError::Usage(format!("--input is required\n{USAGE}")))?,
+        output: output.ok_or_else(|| CompileError::Usage(format!("--output is required\n{USAGE}")))?,
+        options,
+    })
+}
+
+/// Runs `tiles`: reads the GeoParquet, cuts the zoom range and writes `z/x/y.pbf` plus
+/// `metadata.json`; returns what was read and what was written.
+pub fn run_tiles(args: &TilesArgs) -> Result<(tiler::source::SourceSummary, tiler::TilingSummary), CompileError> {
+    let (features, source) = tiler::source::read_features(&args.input)?;
+    let (tiles, summary) = tiler::tile_features(&features, &args.options);
+    let bounds = tiler::features_bbox(&features);
+    tiler::write_tiles(&args.output, &tiles, &args.options, bounds)?;
+    Ok((source, summary))
 }

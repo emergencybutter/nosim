@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use nosim_compiler::{Command, USAGE, parse_args, run_arinc, run_validate, validate};
+use nosim_compiler::{Command, USAGE, parse_args, run_arinc, run_tiles, run_validate, validate};
 
 fn main() -> ExitCode {
     let command = match parse_args(std::env::args().skip(1)) {
@@ -26,6 +26,40 @@ fn main() -> ExitCode {
             }
             if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
+        Command::Tiles(args) => match run_tiles(&args) {
+            Ok((source, summary)) => {
+                println!(
+                    "{}: {} tile(s) at z{}..={} from {} feature(s) ({} instance(s) written, {} dropped as degenerate)",
+                    args.output.display(),
+                    summary.tiles,
+                    args.options.min_zoom,
+                    args.options.max_zoom,
+                    summary.features,
+                    summary.feature_instances,
+                    summary.dropped_instances
+                );
+                println!(
+                    "geometry column {:?}; properties: {}",
+                    source.geometry_column,
+                    if source.property_columns.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        source.property_columns.join(", ")
+                    }
+                );
+                if !source.skipped_columns.is_empty() {
+                    eprintln!("warning: non-scalar column(s) skipped: {}", source.skipped_columns.join(", "));
+                }
+                if source.rows_without_geometry > 0 {
+                    eprintln!("warning: {} row(s) without a decodable geometry", source.rows_without_geometry);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Command::Arinc(args) => match run_arinc(&args) {
             Ok((rows, summary, overrides)) => {
                 println!(
