@@ -1684,3 +1684,85 @@ pub extern "C" fn nosim_parent_frame_for(dist_to_earth_center_m: f64, dist_to_mo
         lod::ParentFrame::Mci => NosimParentFrame::Mci,
     }
 }
+
+// ---- Time scales -----------------------------------------------------------------------
+
+/// One instant on every scale the simulator needs.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimEpoch {
+    /// Civil time.
+    pub jd_utc: f64,
+    /// Earth-rotation time; feed to `nosim_gast_deg`.
+    pub jd_ut1: f64,
+    /// Terrestrial Time.
+    pub jd_tt: f64,
+    /// Barycentric Dynamical Time; feed to the ephemeris functions.
+    pub jd_tdb: f64,
+    /// ΔT = TT − UT1 used, seconds.
+    pub delta_t_seconds: f64,
+}
+
+fn time_scale(dut1_seconds: f64) -> nosim::timescale::TimeScale {
+    nosim::timescale::TimeScale { dut1_seconds, ..Default::default() }
+}
+
+fn epoch_to_ffi(e: nosim::timescale::Epoch) -> NosimEpoch {
+    NosimEpoch {
+        jd_utc: e.jd_utc,
+        jd_ut1: e.jd_ut1,
+        jd_tt: e.jd_tt,
+        jd_tdb: e.jd_tdb,
+        delta_t_seconds: e.delta_t_seconds,
+    }
+}
+
+/// ΔT = TT − UT1, seconds, at a UTC instant. `dut1_seconds` is UT1 − UTC from IERS
+/// Bulletin A, or 0 if unknown (then the error is below 0.9 s from 1972 onward).
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_delta_t_seconds(jd_utc: f64, dut1_seconds: f64) -> f64 {
+    time_scale(dut1_seconds).delta_t_seconds(jd_utc)
+}
+
+/// TAI − UTC at a UTC instant; returns false (and leaves `out` untouched) outside the
+/// built-in leap-second table (before 1972 or past its validity date).
+///
+/// # Safety
+/// `out` must be NULL or valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_tai_minus_utc(jd_utc: f64, out: *mut f64) -> bool {
+    match time_scale(0.0).tai_minus_utc(jd_utc) {
+        Some(v) => {
+            // SAFETY: documented contract.
+            if let Some(o) = unsafe { opt_mut(out) } {
+                *o = v;
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+/// Every time scale for a UTC Julian Date.
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_epoch_from_utc(jd_utc: f64, dut1_seconds: f64) -> NosimEpoch {
+    epoch_to_ffi(time_scale(dut1_seconds).epoch_from_utc(jd_utc))
+}
+
+/// Every time scale for a POSIX timestamp (seconds since 1970-01-01T00:00:00 UTC).
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_epoch_from_unix(unix_seconds: f64, dut1_seconds: f64) -> NosimEpoch {
+    epoch_to_ffi(time_scale(dut1_seconds).epoch_from_unix(unix_seconds))
+}
+
+/// POSIX seconds → JD UTC.
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_jd_from_unix(unix_seconds: f64) -> f64 {
+    nosim::timescale::jd_from_unix(unix_seconds)
+}
+
+/// TT → TDB.
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_tt_to_tdb(jd_tt: f64) -> f64 {
+    nosim::timescale::tt_to_tdb(jd_tt)
+}

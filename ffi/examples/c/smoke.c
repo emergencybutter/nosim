@@ -50,6 +50,12 @@ int main(int argc, char **argv) {
     CHECK(fabs(rt.x - 0.5) < 1e-4 && fabs(rt.y - 0.3) < 1e-4 && fabs(rt.z + 1.0) < 1e-4);
     nosim_floating_origin_free(origin);
 
+    /* Time scales: a Unix clock reading becomes TDB for the ephemerides and UT1 for GAST. */
+    NosimEpoch epoch = nosim_epoch_from_unix(946728000.0, 0.0); /* 2000-01-01T12:00:00Z */
+    CHECK(fabs(epoch.jd_utc - 2451545.0) < 1e-9);
+    CHECK(epoch.delta_t_seconds > 63.0 && epoch.delta_t_seconds < 65.0);
+    CHECK(epoch.jd_tdb > epoch.jd_utc);
+
     /* Ephemerides: full Moon of 1992-04-12 example, Sun about 1 AU away. */
     double jd = 2448724.5;
     NosimSpherical sun = nosim_sun_geocentric(jd);

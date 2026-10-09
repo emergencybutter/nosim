@@ -26,6 +26,8 @@ src/
                  topocentric vectors, phase, optical libration        (spec §8A)
   starfield/     Yale Bright Star Catalogue (BSC5) loader, packed
                  star buffer, Planckian-locus star colour              (spec §8A)
+  timescale.rs   UTC / UT1 / TT / TDB, ΔT from leap seconds (1972–)
+                 and Espenak–Meeus polynomials, Unix-time entry point  (spec §6, §8A)
   scenery/       Package manifest + validator, GeoJSON exclusion
                  masks, prioritised mount table (VFS)                 (spec §3)
   arinc424.rs    ARINC 424 PG record decoder, designators, threshold
@@ -78,6 +80,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §8A — lunar horizontal parallax ≈ 57′, solar 8.79″/R from the sub-point | `ephem::topocentric_parallax` |
 | §8A — BSC5: 9,110 entries, 9,096 with positions, 310 without B−V, Sirius at V = −1.46; Sirius/Vega/Polaris decode to their catalogue positions; a century of Arcturus's proper motion is 228″ | `starfield::full_catalogue_statistics`, `parses_named_stars_from_excerpt`, `proper_motion_moves_barnards_star_direction` |
 | §8A — B−V → temperature → Planckian locus → sRGB: 3000 K red, 6500 K ≈ D65 white, 20,000 K blue | `starfield::planckian_colours_order_sensibly` |
+| §8A — ΔT: 63.83 s at 2000.0 given DUT1, published values 1900–2010 within the stated bounds, no jump where the leap-second and polynomial regimes meet | `timescale::delta_t_against_published_values`, `regimes_join_without_jumps` |
 | §4 — worked KJFK RW04R example (40.6331444°, −73.7701250°, 2560.32 m, 45.72 m, 3.6576 m, 137.16 m, 12 bars) | `arinc424::spec_example_record` decodes a synthetic 132-column PG record to those values |
 | Phase 2 §3 — KJFK RW31L centreline 14,511 ft ± 1 ft | `arinc424::runway_extrusion_kjfk_31l` extrudes along 313° true, fits grade, round-trips the ellipsoid |
 | §6 — declination extremes ±23.44°, 6.5 °C/km lapse | `astro` |
@@ -100,6 +103,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §7 IDM, MOBIL, VAT addressing | Implemented; ECS, ORCA, CTM far-field not started |
 | §8A VSOP87D / ELP 2000-82B evaluators, nutation, apparent places, topocentric vectors, phase, libration | Implemented (see below); physical libration (≤ 0.04°) not modelled |
 | §8A Yale Bright Star Catalogue loader, packed buffer, Planckian colour | Implemented; the catalogue itself goes to V ≈ 7.96, deeper than the spec's "to 6.5" |
+| §6/§8A Time scales (UTC → UT1 / TT / TDB, ΔT) | Implemented; DUT1 is an input (IERS Bulletin A), leap-second table valid through 2026-12-28 |
 | §8B/§8C Hapke BRDF, Chapman limb | Implemented as CPU reference for the shaders |
 | §8 LOD band policy, parent-frame selection | Implemented |
 | C ABI for the UE5 client | Implemented: every module above is reachable from C; proven by a compiled C smoke test |

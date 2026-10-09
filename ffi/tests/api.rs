@@ -334,3 +334,22 @@ fn pure_value_apis() {
     assert!(!nosim_policy_for(NosimAltitudeBand::LowEarthOrbit).stream_terrain_quadtree);
     assert_eq!(nosim_parent_frame_for(384_400e3, 1_800e3), NosimParentFrame::Mci);
 }
+
+#[test]
+fn time_scales() {
+    let e = nosim_epoch_from_unix(946_728_000.0, 0.355);
+    assert!((e.jd_utc - 2451545.0).abs() < 1e-9);
+    assert!((e.delta_t_seconds - 63.83).abs() < 0.01);
+    assert!((e.jd_tt - e.jd_utc) * 86400.0 > 64.0 && (e.jd_tt - e.jd_utc) * 86400.0 < 64.3);
+    assert!(((e.jd_tdb - e.jd_tt) * 86400.0).abs() < 0.002);
+    assert_eq!(nosim_epoch_from_utc(e.jd_utc, 0.355), e);
+    assert!((nosim_delta_t_seconds(nosim_julian_date(1950, 1, 1, 0.0), 0.0) - 29.1).abs() < 0.6);
+    let mut tai = 0.0;
+    // SAFETY: valid output.
+    assert!(unsafe { nosim_tai_minus_utc(nosim_julian_date(2020, 1, 1, 0.0), &mut tai) });
+    assert_eq!(tai, 37.0);
+    // SAFETY: NULL output is allowed.
+    assert!(!unsafe { nosim_tai_minus_utc(nosim_julian_date(1960, 1, 1, 0.0), ptr::null_mut()) });
+    assert!((nosim_jd_from_unix(0.0) - 2440587.5).abs() < 1e-9);
+    assert!((nosim_tt_to_tdb(e.jd_tt) - e.jd_tdb).abs() < 1e-12);
+}

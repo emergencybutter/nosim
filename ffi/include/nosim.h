@@ -650,6 +650,32 @@ typedef struct NosimBandPolicy {
   double dem_resolution_m;
 } NosimBandPolicy;
 
+/**
+ * One instant on every scale the simulator needs.
+ */
+typedef struct NosimEpoch {
+  /**
+   * Civil time.
+   */
+  double jd_utc;
+  /**
+   * Earth-rotation time; feed to `nosim_gast_deg`.
+   */
+  double jd_ut1;
+  /**
+   * Terrestrial Time.
+   */
+  double jd_tt;
+  /**
+   * Barycentric Dynamical Time; feed to the ephemeris functions.
+   */
+  double jd_tdb;
+  /**
+   * ΔT = TT − UT1 used, seconds.
+   */
+  double delta_t_seconds;
+} NosimEpoch;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -1271,6 +1297,41 @@ struct NosimBandPolicy nosim_policy_for(enum NosimAltitudeBand band);
  */
 enum NosimParentFrame nosim_parent_frame_for(double dist_to_earth_center_m,
                                              double dist_to_moon_center_m);
+
+/**
+ * ΔT = TT − UT1, seconds, at a UTC instant. `dut1_seconds` is UT1 − UTC from IERS
+ * Bulletin A, or 0 if unknown (then the error is below 0.9 s from 1972 onward).
+ */
+double nosim_delta_t_seconds(double jd_utc, double dut1_seconds);
+
+/**
+ * TAI − UTC at a UTC instant; returns false (and leaves `out` untouched) outside the
+ * built-in leap-second table (before 1972 or past its validity date).
+ *
+ * # Safety
+ * `out` must be NULL or valid for writes.
+ */
+bool nosim_tai_minus_utc(double jd_utc, double *out);
+
+/**
+ * Every time scale for a UTC Julian Date.
+ */
+struct NosimEpoch nosim_epoch_from_utc(double jd_utc, double dut1_seconds);
+
+/**
+ * Every time scale for a POSIX timestamp (seconds since 1970-01-01T00:00:00 UTC).
+ */
+struct NosimEpoch nosim_epoch_from_unix(double unix_seconds, double dut1_seconds);
+
+/**
+ * POSIX seconds → JD UTC.
+ */
+double nosim_jd_from_unix(double unix_seconds);
+
+/**
+ * TT → TDB.
+ */
+double nosim_tt_to_tdb(double jd_tt);
 
 #ifdef __cplusplus
 }  // extern "C"
