@@ -1,0 +1,25 @@
+[package]
+name = "nosim-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "C ABI for the nosim core, for the Unreal Engine 5 client and any other C/C++ host"
+repository = "https://github.com/emergencybutter/nosim"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "nosim_ffi"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+nosim = { path = ".." }
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "warn"

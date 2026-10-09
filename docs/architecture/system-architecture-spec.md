@@ -380,7 +380,7 @@ Scaling smoothly from runway pavement to translunar orbit requires an analytical
 
 ## 9. Implementation Status
 
-The engine-independent core of this specification is implemented as a dependency-free Rust crate under `src/`, with inline tests that assert the numbers and acceptance criteria quoted above (the KJFK RW04R decode, the 14,511 ft RW31L centreline, the sub-millimetre floating-origin check at 45°N 120°W, the LOD collapse past 100 km, and so on). See the [README](../../README.md) for the module map and a section-by-section status table. Everything that needs Unreal Engine (Nanite, PCG graphs, the virtual heightfield, decals, the Bruneton raymarcher) belongs to the client project, which will consume the crate through a C-ABI layer.
+The engine-independent core of this specification is implemented as a dependency-free Rust crate under `src/`, with inline tests that assert the numbers and acceptance criteria quoted above (the KJFK RW04R decode, the 14,511 ft RW31L centreline, the sub-millimetre floating-origin check at 45°N 120°W, the LOD collapse past 100 km, and so on). See the [README](../../README.md) for the module map and a section-by-section status table. Everything that needs Unreal Engine (Nanite, PCG graphs, the virtual heightfield, decals, the Bruneton raymarcher) belongs to the client project, which consumes the crate through the `nosim-ffi` C ABI (`ffi/include/nosim.h`, generated from the Rust signatures on every build and verified by a compiled C smoke test).
 
 ## 10. End-to-End Implementation & Verification Blueprint
 

@@ -16,3 +16,6 @@ missing_docs = "warn"
 
 [lints.clippy]
 all = "warn"
+
+[workspace]
+members = ["ffi"]
