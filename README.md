@@ -55,7 +55,8 @@ compiler/
   src/arinc.rs   CIFP reading, reciprocal pairing, magnetic variation, extrusion
   src/geoparquet.rs  GeoParquet 1.0 writer / reader for the runway table
   src/wkb.rs     Well-Known Binary polygon / linestring
-  src/lib.rs     Override application through the VFS; CLI parsing; run_arinc
+  src/validate.rs  Package Validator: core audit plus override-table integrity checks
+  src/lib.rs     Override application through the VFS; CLI parsing; run_arinc / run_validate
   tests/         The Phase 2 pipeline end to end, including the §3 override loop
 fixtures/        The spec's KJFK example package (scenery tests) — its arinc_runways.parquet
                  is a real table compiled from the CIFP sample, so the package overrides work
@@ -126,7 +127,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §8B/§8C Hapke BRDF, Chapman limb | Implemented as CPU reference for the shaders |
 | §8 LOD band policy, parent-frame selection | Implemented |
 | C ABI for the UE5 client | Implemented: every module above is reachable from C; proven by a compiled C smoke test |
-| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides) | Implemented for runways; vector tiling, raster processing and the package validator CLI not started |
+| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator) | Implemented for runways and packages; vector tiling and raster processing not started |
 
 Anything that needs Unreal (Nanite, PCG, virtual heightfield, decals, raymarcher) lives in
 the client project and is out of scope here.
@@ -169,6 +170,18 @@ is C11 and `extern "C"`-wrapped for C++.
 ```sh
 cargo run -p nosim-compiler --release -- arinc --input FAACIFP18 --output runways.parquet [--packages <dir>] [--airport KJFK]
 ```
+
+```sh
+cargo run -p nosim-compiler --release -- validate [--strict] [--json] <package-or-directory>...
+```
+
+`validate` is the §1 Package Validator: for each package (or every package directly inside a
+directory) it reports *all* problems at once — manifest schema and validation errors, missing
+referenced files, unclosed mask rings — plus warnings for content that loads but can never
+act (a mask entirely outside the package bounds, a non-glTF mesh, an empty package), and it
+reads any `arinc_overrides` table to check it parses, that its rows fall inside the bounds,
+and that each centreline agrees with its declared length. Exit status is non-zero on any
+error, or on any warning with `--strict`; `--json` emits the reports for tooling.
 
 Reads an FAA CIFP file (ARINC 424 text, 132-column records), keeps primary `PG` runway
 records, pairs each end with its reciprocal for grade fitting, converts magnetic bearings to

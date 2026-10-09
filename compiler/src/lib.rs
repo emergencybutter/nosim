@@ -7,6 +7,7 @@
 
 pub mod arinc;
 pub mod geoparquet;
+pub mod validate;
 pub mod wkb;
 
 use std::fmt;
@@ -153,17 +154,64 @@ pub struct ArincArgs {
     pub airport: Option<String>,
 }
 
-/// Usage text.
-pub const USAGE: &str =
-    "world-compiler arinc --input <cifp.txt> --output <runways.parquet> [--packages <dir>] [--airport <ICAO>]";
+/// `validate` subcommand options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidateArgs {
+    /// Package directories, or directories of packages.
+    pub paths: Vec<PathBuf>,
+    /// Treat warnings as failures.
+    pub strict: bool,
+    /// Emit JSON instead of text.
+    pub json: bool,
+}
 
-/// Parses `arinc` subcommand arguments (everything after the program name).
-pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<ArincArgs, CompileError> {
+/// A parsed command line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// Compile ARINC 424 runways.
+    Arinc(ArincArgs),
+    /// Audit scenery packages.
+    Validate(ValidateArgs),
+}
+
+/// Usage text.
+pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runways.parquet> [--packages <dir>] [--airport <ICAO>]\n\
+                         world-compiler validate [--strict] [--json] <package-or-directory>...";
+
+/// Parses the command line (everything after the program name).
+pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, CompileError> {
     let mut it = args.into_iter();
     match it.next().as_deref() {
-        Some("arinc") => {}
-        other => return Err(CompileError::Usage(format!("expected subcommand `arinc`, got {other:?}\n{USAGE}"))),
+        Some("arinc") => parse_arinc(it).map(Command::Arinc),
+        Some("validate") => parse_validate(it).map(Command::Validate),
+        other => Err(CompileError::Usage(format!("expected subcommand `arinc` or `validate`, got {other:?}\n{USAGE}"))),
     }
+}
+
+fn parse_validate<I: Iterator<Item = String>>(it: I) -> Result<ValidateArgs, CompileError> {
+    let mut args = ValidateArgs { paths: Vec::new(), strict: false, json: false };
+    for a in it {
+        match a.as_str() {
+            "--strict" => args.strict = true,
+            "--json" => args.json = true,
+            flag if flag.starts_with("--") => return Err(CompileError::Usage(format!("unknown flag {flag}\n{USAGE}"))),
+            path => args.paths.push(PathBuf::from(path)),
+        }
+    }
+    if args.paths.is_empty() {
+        return Err(CompileError::Usage(format!("validate needs at least one path\n{USAGE}")));
+    }
+    Ok(args)
+}
+
+/// Runs `validate`; returns the reports and whether every package passed.
+pub fn run_validate(args: &ValidateArgs) -> (Vec<nosim::scenery::audit::AuditReport>, bool) {
+    let reports: Vec<_> = validate::expand_targets(&args.paths).iter().map(|p| validate::validate_package(p)).collect();
+    let ok = !reports.is_empty() && reports.iter().all(|r| r.is_ok() && !(args.strict && !r.warnings.is_empty()));
+    (reports, ok)
+}
+
+fn parse_arinc<I: Iterator<Item = String>>(mut it: I) -> Result<ArincArgs, CompileError> {
     let (mut input, mut output, mut packages, mut airport) = (None, None, None, None);
     while let Some(flag) = it.next() {
         let value = it.next().ok_or_else(|| CompileError::Usage(format!("{flag} needs a value\n{USAGE}")))?;

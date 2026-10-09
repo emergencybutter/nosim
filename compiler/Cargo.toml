@@ -18,6 +18,7 @@ path = "src/lib.rs"
 arrow = "60.0.0"
 nosim = { path = ".." }
 parquet = "60.0.0"
+serde_json = "1.0.151"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -26,5 +27,3 @@ missing_docs = "warn"
 [lints.clippy]
 all = "warn"
 
-[dev-dependencies]
-serde_json = "1.0.151"

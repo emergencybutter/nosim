@@ -7,6 +7,7 @@
 //! then mounted into a [`vfs::Vfs`], which answers the engine's questions: *is this layer
 //! excluded here?*, *whose ARINC overrides apply here?*, *which models anchor in this tile?*
 
+pub mod audit;
 pub mod geojson;
 pub mod vfs;
 

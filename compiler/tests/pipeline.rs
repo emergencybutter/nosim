@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use nosim::arinc424::FEET_TO_METERS;
-use nosim_compiler::{ArincArgs, arinc, geoparquet, parse_args, run_arinc, wkb};
+use nosim_compiler::{
+    ArincArgs, Command, ValidateArgs, arinc, geoparquet, parse_args, run_arinc, run_validate, validate, wkb,
+};
 
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/cifp/kjfk_sample.txt")
@@ -212,9 +214,12 @@ fn scenery_package_overrides_authoritative_runways() {
 
 #[test]
 fn command_line_parsing() {
-    let a =
+    let Command::Arinc(a) =
         parse_args(["arinc", "--input", "in.txt", "--output", "out.parquet", "--airport", "kjfk"].map(String::from))
-            .unwrap();
+            .unwrap()
+    else {
+        panic!("expected arinc")
+    };
     assert_eq!(a.input, PathBuf::from("in.txt"));
     assert_eq!(a.airport.as_deref(), Some("KJFK"));
     assert!(a.packages.is_none());
@@ -233,5 +238,84 @@ fn command_line_parsing() {
     assert!(args.output.is_file());
     let missing = ArincArgs { input: dir.join("nope.txt"), ..args };
     assert!(matches!(run_arinc(&missing), Err(nosim_compiler::CompileError::Io(..))));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn validate_subcommand() {
+    let Command::Validate(v) = parse_args(["validate", "--strict", "a", "--json", "b"].map(String::from)).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(v, ValidateArgs { paths: vec![PathBuf::from("a"), PathBuf::from("b")], strict: true, json: true });
+    assert!(matches!(parse_args(["validate"].map(String::from)), Err(nosim_compiler::CompileError::Usage(_))));
+    assert!(matches!(
+        parse_args(["validate", "--nope", "x"].map(String::from)),
+        Err(nosim_compiler::CompileError::Usage(_))
+    ));
+
+    // The fixture package passes, including its real ARINC override table.
+    let packages = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/packages");
+    let (reports, ok) = run_validate(&ValidateArgs { paths: vec![packages.clone()], strict: true, json: false });
+    assert!(ok, "{reports:#?}");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].package_id.as_deref(), Some("org.contributor.infrastructure.kjfk"));
+    assert!(validate::render(&reports[0], true).starts_with("OK  org.contributor.infrastructure.kjfk"));
+    let json: serde_json::Value = serde_json::from_str(&validate::render_json(&reports, true)).unwrap();
+    assert_eq!(json[0]["ok"], true);
+    // A directory of packages and a single package expand the same way.
+    assert_eq!(
+        validate::expand_targets(std::slice::from_ref(&packages)),
+        validate::expand_targets(&[packages.join("org.contributor.infrastructure.kjfk")])
+    );
+
+    // A package whose override table is not Parquet, has rows outside its bounds, or has a
+    // centreline that contradicts its declared length.
+    let dir = scratch("validate");
+    let bad = dir.join("org.example.bad");
+    std::fs::create_dir_all(bad.join("data")).unwrap();
+    std::fs::write(bad.join("data/rw.parquet"), "placeholder").unwrap();
+    let manifest = |bounds: &str| {
+        format!(
+            r#"{{"package_id":"org.example.bad","version":"1.0.0","priority":1,"bounds":{bounds},"content":{{"arinc_overrides":"data/rw.parquet"}}}}"#
+        )
+    };
+    std::fs::write(
+        bad.join("manifest.json"),
+        manifest(r#"{"min_lat":40.60,"max_lat":40.70,"min_lon":-73.85,"max_lon":-73.70}"#),
+    )
+    .unwrap();
+    let r = validate::validate_package(&bad);
+    assert!(!r.is_ok());
+    assert!(r.errors.iter().any(|e| e.contains("not a readable runway table")), "{:?}", r.errors);
+
+    let text = std::fs::read_to_string(fixture()).unwrap();
+    let (mut rows, _) = arinc::compile(&text, None);
+    rows[0].centerline_length_m += 5.0;
+    geoparquet::write_runways(&bad.join("data/rw.parquet"), &rows).unwrap();
+    let r = validate::validate_package(&bad);
+    assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+    assert!(r.errors[0].contains("centreline"));
+    assert!(r.warnings.is_empty());
+
+    std::fs::write(
+        bad.join("manifest.json"),
+        manifest(r#"{"min_lat":33.9,"max_lat":34.0,"min_lon":-118.5,"max_lon":-118.3}"#),
+    )
+    .unwrap();
+    rows[0].centerline_length_m -= 5.0;
+    geoparquet::write_runways(&bad.join("data/rw.parquet"), &rows).unwrap();
+    let r = validate::validate_package(&bad);
+    assert!(r.is_ok());
+    assert!(r.warnings.iter().any(|w| w.contains("8 runway end(s) lie outside")), "{:?}", r.warnings);
+    let (_, ok_strict) = run_validate(&ValidateArgs { paths: vec![bad.clone()], strict: true, json: false });
+    let (_, ok_lax) = run_validate(&ValidateArgs { paths: vec![bad.clone()], strict: false, json: false });
+    assert!(!ok_strict && ok_lax);
+    assert!(validate::render(&r, true).starts_with("FAIL"));
+    assert!(validate::render(&r, false).starts_with("OK"));
+
+    // Nothing to audit is a failure, not a vacuous pass.
+    let (reports, ok) = run_validate(&ValidateArgs { paths: vec![dir.join("empty")], strict: false, json: false });
+    assert!(!ok && reports.len() == 1 && !reports[0].is_ok());
     std::fs::remove_dir_all(dir).unwrap();
 }
