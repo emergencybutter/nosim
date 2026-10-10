@@ -14,7 +14,7 @@ pub fn encode_rgb(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
             filtered.push(if i >= 3 { b.wrapping_sub(row[i - 3]) } else { b });
         }
     }
-    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     z.write_all(&filtered).expect("in-memory write");
     let idat = z.finish().expect("in-memory finish");
 

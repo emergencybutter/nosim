@@ -196,7 +196,7 @@ cargo run -p nosim-compiler --release -- tiles --input features.parquet --output
 ```
 
 ```sh
-cargo run -p nosim-compiler --release -- raster --input dem.tif --output terrain/ [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--only terrain-rgb,normals,mesh]
+cargo run -p nosim-compiler --release -- raster --input dem.tif --output terrain/ [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]
 ```
 
 `raster` is the §1 Raster Processor. It reads a single-band GeoTIFF DEM in a geographic
@@ -217,6 +217,23 @@ Heights are bilinear samples of the DEM; no-data neighbours drop out of the weig
 so holes do not bleed. `--body moon` places meshes on the 1737.4 km lunar sphere for LOLA
 grids. Projected rasters, BigTIFF and JPEG / ZSTD / WebP compression are refused with a
 message rather than misread; reproject to geographic coordinates with GDAL first.
+Tiles are spread over every core by default (`--threads` overrides); the files written
+are byte-identical whatever the thread count.
+
+Verified on real data with the Copernicus GLO-30 tile `N40_00_W074_00` (3600 × 3600
+float32, DEFLATE with the floating-point predictor, PixelIsPoint), which covers KJFK:
+
+- 408 pixels spread over the tile, corners and tile seams included, are bit-identical to
+  libtiff's decode, and the full tile loads in 0.3 s.
+- KJFK reads 2.5 m against a published field elevation of 4 m, within GLO-30's stated
+  vertical accuracy; open water reads 0 m.
+- A Terrain-RGB tile over KJFK, decoded by Pillow, is within 0.05 m of an independent
+  bilinear sample of the DEM, which is the format's half-step.
+- Zooms 8 to 13 give 992 Terrain-RGB, 992 normal-map and 2856 mesh tiles with 1.7 million
+  vertices, in 15 s on 4 cores (59 s on one).
+
+`cargo run --release -p nosim-compiler --example probe_dem -- dem.tif [col row]...` prints
+what the reader found and the height at given pixels, for checks like these.
 
 `tiles` is the §1 Vector Tiler. It reads any GeoParquet file (the geometry column named by
 the `geo` metadata, WKB point / line / polygon and their multi forms; every scalar column

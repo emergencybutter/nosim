@@ -95,6 +95,8 @@ pub struct RasterOptions {
     pub mesh_grid: u32,
     /// Vertical tolerance of the mesh, metres.
     pub mesh_error_m: f32,
+    /// Worker threads; 0 uses every available core. Output does not depend on it.
+    pub threads: usize,
 }
 
 impl Default for RasterOptions {
@@ -109,6 +111,7 @@ impl Default for RasterOptions {
             mesh: true,
             mesh_grid: 65,
             mesh_error_m: 1.0,
+            threads: 0,
         }
     }
 }
@@ -183,25 +186,29 @@ pub fn process(dem: &Dem, out: &Path, opts: &RasterOptions) -> Result<RasterSumm
         ..Default::default()
     };
 
+    let threads =
+        if opts.threads == 0 { std::thread::available_parallelism().map_or(1, usize::from) } else { opts.threads };
+
     if opts.terrain_rgb || opts.normals {
-        for z in opts.min_zoom..=opts.max_zoom {
-            for tile in mercator_tiles(bounds, z) {
-                let heights = TileHeights::sample(dem, tile, opts.tile_size, opts.body);
-                if heights.covered == 0 {
-                    summary.empty_tiles_skipped += 1;
-                    continue;
-                }
-                let rel = format!("{}/{}/{}.png", tile.z, tile.x, tile.y);
-                if opts.terrain_rgb {
-                    write(&out.join("terrain-rgb").join(&rel), &heights.terrain_rgb_png())?;
-                    summary.terrain_rgb_tiles += 1;
-                }
-                if opts.normals {
-                    write(&out.join("normals").join(&rel), &heights.normal_png())?;
-                    summary.normal_tiles += 1;
-                }
+        let tiles: Vec<TileId> = (opts.min_zoom..=opts.max_zoom).flat_map(|z| mercator_tiles(bounds, z)).collect();
+        let written = parallel_map(&tiles, threads, |&tile| {
+            let heights = TileHeights::sample(dem, tile, opts.tile_size, opts.body);
+            if heights.covered == 0 {
+                return Ok(false);
             }
-        }
+            let rel = format!("{}/{}/{}.png", tile.z, tile.x, tile.y);
+            if opts.terrain_rgb {
+                write(&out.join("terrain-rgb").join(&rel), &heights.terrain_rgb_png())?;
+            }
+            if opts.normals {
+                write(&out.join("normals").join(&rel), &heights.normal_png())?;
+            }
+            Ok(true)
+        })?;
+        let n = written.iter().filter(|&&w| w).count();
+        summary.empty_tiles_skipped += written.len() - n;
+        summary.terrain_rgb_tiles = if opts.terrain_rgb { n } else { 0 };
+        summary.normal_tiles = if opts.normals { n } else { 0 };
         let meta = |name: &str, encoding: &str| {
             serde_json::to_string_pretty(&serde_json::json!({
                 "name": name,
@@ -227,41 +234,43 @@ pub fn process(dem: &Dem, out: &Path, opts: &RasterOptions) -> Result<RasterSumm
 
     if opts.mesh {
         let g = opts.mesh_grid as usize;
+        let tiles: Vec<GeoTile> = (opts.min_zoom..=opts.max_zoom).flat_map(|z| GeoTile::covering(bounds, z)).collect();
+        let results = parallel_map(&tiles, threads, |&tile| {
+            let (w, s, e, n) = tile.bounds();
+            let mut grid = Vec::with_capacity(g * g);
+            let mut covered = 0usize;
+            for j in 0..g {
+                let lat = s + (n - s) * j as f64 / (g - 1) as f64;
+                for i in 0..g {
+                    let lon = w + (e - w) * i as f64 / (g - 1) as f64;
+                    let h = dem.sample(lon, lat);
+                    covered += usize::from(h.is_some());
+                    grid.push(h);
+                }
+            }
+            if covered == 0 {
+                return Ok(None);
+            }
+            // Past the DEM edge and in no-data holes, extend the surface outward rather
+            // than dropping it to 0 m, which would put cliffs in the mesh and its normals.
+            let grid = tin::fill_gaps(&grid, g, g);
+            let tin = tin::triangulate(&grid, g, g, opts.mesh_error_m, 1 << 20);
+            let bytes = quantized_mesh::encode(tile, &tin, opts.mesh_grid, opts.body);
+            write(&out.join("mesh").join(format!("{}/{}/{}.terrain", tile.z, tile.x, tile.y)), &bytes)?;
+            Ok(Some((tin.vertices.len(), tin.triangles.len(), tin.max_error)))
+        })?;
         let mut available = Vec::new();
         for z in opts.min_zoom..=opts.max_zoom {
-            let tiles = GeoTile::covering(bounds, z);
             let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
-            for tile in tiles {
-                let (w, s, e, n) = tile.bounds();
-                let mut grid = Vec::with_capacity(g * g);
-                let mut covered = 0usize;
-                for j in 0..g {
-                    let lat = s + (n - s) * j as f64 / (g - 1) as f64;
-                    for i in 0..g {
-                        let lon = w + (e - w) * i as f64 / (g - 1) as f64;
-                        match dem.sample(lon, lat) {
-                            Some(h) => {
-                                covered += 1;
-                                grid.push(Some(h));
-                            }
-                            None => grid.push(None),
-                        }
-                    }
-                }
-                if covered == 0 {
+            for (tile, result) in tiles.iter().zip(&results).filter(|(t, _)| t.z == z) {
+                let Some((vertices, triangles, error)) = *result else {
                     summary.empty_tiles_skipped += 1;
                     continue;
-                }
-                // Past the DEM edge and in no-data holes, extend the surface outward rather
-                // than dropping it to 0 m, which would put cliffs in the mesh and its normals.
-                let grid = tin::fill_gaps(&grid, g, g);
-                let tin = tin::triangulate(&grid, g, g, opts.mesh_error_m, 1 << 20);
-                let bytes = quantized_mesh::encode(tile, &tin, opts.mesh_grid, opts.body);
-                write(&out.join("mesh").join(format!("{}/{}/{}.terrain", tile.z, tile.x, tile.y)), &bytes)?;
+                };
                 summary.mesh_tiles += 1;
-                summary.mesh_vertices += tin.vertices.len();
-                summary.mesh_triangles += tin.triangles.len();
-                summary.mesh_max_error_m = summary.mesh_max_error_m.max(tin.max_error);
+                summary.mesh_vertices += vertices;
+                summary.mesh_triangles += triangles;
+                summary.mesh_max_error_m = summary.mesh_max_error_m.max(error);
                 x0 = x0.min(tile.x);
                 y0 = y0.min(tile.y);
                 x1 = x1.max(tile.x);
@@ -294,6 +303,45 @@ pub fn process(dem: &Dem, out: &Path, opts: &RasterOptions) -> Result<RasterSumm
     Ok(summary)
 }
 
+/// Applies `f` to every item on `threads` scoped workers that take the next unclaimed item,
+/// returning results in input order. Stops handing out work after the first error and
+/// returns the error from the earliest failing item.
+fn parallel_map<T: Sync, R: Send>(
+    items: &[T],
+    threads: usize,
+    f: impl Fn(&T) -> Result<R, CompileError> + Sync,
+) -> Result<Vec<R>, CompileError> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let slots: Vec<Mutex<Option<Result<R, CompileError>>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads.clamp(1, items.len().max(1)) {
+            scope.spawn(|| {
+                while !failed.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    let r = f(item);
+                    if r.is_err() {
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                    *slots[i].lock().expect("no panics while holding the slot") = Some(r);
+                }
+            });
+        }
+    });
+    let mut out = Vec::with_capacity(items.len());
+    for slot in slots {
+        match slot.into_inner().expect("workers joined") {
+            Some(Ok(r)) => out.push(r),
+            Some(Err(e)) => return Err(e),
+            None => {} // never claimed because an earlier item failed; that error follows
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +356,18 @@ mod tests {
         assert!((m[1] - (MOON_RADIUS_M + 100.0)).abs() < 1e-6);
         assert_eq!(Body::parse("Moon"), Some(Body::Moon));
         assert_eq!(Body::parse("mars"), None);
+    }
+
+    #[test]
+    fn parallel_map_keeps_order_and_reports_errors() {
+        let items: Vec<u32> = (0..1000).collect();
+        for threads in [1, 3, 8] {
+            let out = parallel_map(&items, threads, |&i| Ok(i * 2)).unwrap();
+            assert_eq!(out, items.iter().map(|i| i * 2).collect::<Vec<_>>());
+        }
+        let err = parallel_map(&items, 4, |&i| if i == 500 { Err(CompileError::Raster("boom".into())) } else { Ok(i) });
+        assert!(matches!(err, Err(CompileError::Raster(m)) if m == "boom"));
+        assert_eq!(parallel_map(&[] as &[u32], 4, |&i| Ok(i)).unwrap(), Vec::<u32>::new());
     }
 
     #[test]

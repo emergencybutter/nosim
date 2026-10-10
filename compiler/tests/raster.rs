@@ -225,6 +225,39 @@ fn pyramids_match_the_surface() {
     let _ = std::fs::remove_dir_all(&out);
 }
 
+/// Every file under `dir`, relative path → bytes.
+fn tree(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.insert(p.strip_prefix(dir).unwrap().to_path_buf(), std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn output_does_not_depend_on_thread_count() {
+    let dem = Dem::load(&fixture("kjfk_f32_deflate_tiled.tif")).unwrap();
+    let base = RasterOptions { min_zoom: 11, max_zoom: 13, mesh_grid: 17, ..RasterOptions::default() };
+    let (one, many) = (scratch("threads-1"), scratch("threads-4"));
+    let s1 = process(&dem, &one, &RasterOptions { threads: 1, ..base.clone() }).unwrap();
+    let s4 = process(&dem, &many, &RasterOptions { threads: 4, ..base }).unwrap();
+    assert_eq!(s1, s4);
+    let (a, b) = (tree(&one), tree(&many));
+    assert!(a.len() > 20, "{} files", a.len());
+    assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
+    assert!(a == b, "file contents differ between 1 and 4 threads");
+    let _ = std::fs::remove_dir_all(&one);
+    let _ = std::fs::remove_dir_all(&many);
+}
+
 #[test]
 fn moon_dem_uses_the_lunar_sphere() {
     // The same grid declared as lunar: mesh tile centres must sit on the 1737.4 km sphere.
@@ -252,12 +285,13 @@ fn moon_dem_uses_the_lunar_sphere() {
 #[test]
 fn cli() {
     let args = |s: &str| parse_args(s.split_whitespace().map(str::to_owned));
-    match args("raster --input dem.tif --output out --body moon --min-zoom 3 --max-zoom 9 --tile-size 512 --mesh-grid 129 --mesh-error 2 --only mesh,normals").unwrap() {
+    match args("raster --input dem.tif --output out --body moon --min-zoom 3 --max-zoom 9 --tile-size 512 --mesh-grid 129 --mesh-error 2 --threads 3 --only mesh,normals").unwrap() {
         Command::Raster(r) => {
             assert_eq!(r.input, PathBuf::from("dem.tif"));
             assert_eq!(r.options.body, Body::Moon);
             assert_eq!((r.options.min_zoom, r.options.max_zoom, r.options.tile_size, r.options.mesh_grid), (3, 9, 512, 129));
             assert_eq!(r.options.mesh_error_m, 2.0);
+            assert_eq!(r.options.threads, 3);
             assert_eq!((r.options.terrain_rgb, r.options.normals, r.options.mesh), (false, true, true));
         }
         other => panic!("{other:?}"),
@@ -265,6 +299,7 @@ fn cli() {
     assert!(args("raster --input a --output b --body mars").is_err());
     assert!(args("raster --input a --output b --only png").is_err());
     assert!(args("raster --input a --output b --mesh-grid 1").is_err());
+    assert!(args("raster --input a --output b --threads many").is_err());
     assert!(args("raster --output b").is_err());
 
     // Real run through the library entry point, plus the error path for a non-TIFF input.

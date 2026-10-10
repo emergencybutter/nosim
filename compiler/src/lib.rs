@@ -209,7 +209,7 @@ pub struct TilesArgs {
 pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runways.parquet> [--packages <dir>] [--airport <ICAO>]\n\
                          world-compiler validate [--strict] [--json] <package-or-directory>...\n\
                          world-compiler tiles --input <features.parquet> --output <dir> [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]\n\
-                         world-compiler raster --input <dem.tif> --output <dir> [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--only terrain-rgb,normals,mesh]";
+                         world-compiler raster --input <dem.tif> --output <dir> [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]";
 
 /// Parses the command line (everything after the program name).
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, CompileError> {
@@ -336,6 +336,7 @@ fn parse_raster<I: Iterator<Item = String>>(mut it: I) -> Result<RasterArgs, Com
             "--tile-size" => options.tile_size = value.parse().map_err(|_| bad(&flag, &value))?,
             "--mesh-grid" => options.mesh_grid = value.parse().map_err(|_| bad(&flag, &value))?,
             "--mesh-error" => options.mesh_error_m = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--threads" => options.threads = value.parse().map_err(|_| bad(&flag, &value))?,
             "--only" => {
                 (options.terrain_rgb, options.normals, options.mesh) = (false, false, false);
                 for part in value.split(',') {
