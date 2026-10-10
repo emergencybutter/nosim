@@ -63,12 +63,21 @@ class Builder:
 def network():
     b = Builder()
     # --- aeroways ---------------------------------------------------------------------
-    b.way(1, b.pts(parallel(RW04L, RW22R, 180.0, 5)), aeroway="taxiway", ref="A", width="75 ft", surface="asphalt")
-    b.way(2, b.pts(parallel(RW04R, RW22L, -180.0, 4)), aeroway="taxiway", ref="B", width="23", maxspeed="20 knots")
-    b.way(3, b.pts([RW04R, RW22L]), aeroway="runway", ref="04R/22L", width="45.7", surface="concrete")
-    stand = offset(along(RW04R, RW22L, 0.5), -400.0, -150.0)
-    b.way(4, b.pts([stand, offset(stand, 120.0, 60.0)]), aeroway="taxilane", ref="KA")
-    b.way(5, b.pts([offset(stand, 120.0, 60.0), offset(stand, 150.0, 40.0)]), aeroway="parking_position", ref="G1")
+    a_ids = b.pts(parallel(RW04L, RW22R, 180.0, 5))
+    b.way(1, a_ids, aeroway="taxiway", ref="A", width="75 ft", surface="asphalt")
+    b_pts = parallel(RW04R, RW22L, -180.0, 4)
+    b_ids = b.pts(b_pts)
+    b.way(2, b_ids, aeroway="taxiway", ref="B", width="23", maxspeed="20 knots")
+    rw_ids = b.pts([RW04R, RW22L])
+    b.way(3, rw_ids, aeroway="runway", ref="04R/22L", width="45.7", surface="concrete")
+    stand = offset(b_pts[1], 150.0, -120.0)
+    lane_end = b.pts([stand])
+    b.way(4, [b_ids[1]] + lane_end, aeroway="taxilane", ref="KA")
+    b.way(5, lane_end + b.pts([offset(stand, 30.0, -20.0)]), aeroway="parking_position", ref="G1")
+    # Connectors: B to both runway ends, and K across from A to B.
+    b.way(28, [b_ids[0], rw_ids[0]], aeroway="taxiway", ref="B1")
+    b.way(29, [b_ids[3], rw_ids[1]], aeroway="taxiway", ref="B4")
+    b.way(31, [a_ids[2], b_ids[2]], aeroway="taxiway", ref="K")
     apron = [offset(stand, dx, dy) for dx, dy in [(0, 0), (200, 0), (200, 150), (0, 150)]]
     ids = b.pts(apron)
     b.way(6, ids + [ids[0]], aeroway="apron", surface="concrete")  # an area: not a spline
@@ -76,19 +85,24 @@ def network():
     b.pts([offset(RW04L, -60.0, 40.0)], tags_at={0: {"aeroway": "holding_position", "ref": "A-HP1"}})
 
     # --- roads ------------------------------------------------------------------------
-    jfk_expwy = [(40.6615, -73.8150 + i * 0.012) for i in range(6)]
-    b.way(10, b.pts(jfk_expwy), highway="motorway", name="JFK Expressway", maxspeed="45 mph", lanes="3")
-    b.way(11, b.pts([(40.6640, -73.8010), (40.6900, -73.8000), (40.7050, -73.7990)]),
+    jfk = b.pts([(40.6615, -73.8150 + i * 0.012) for i in range(6)])
+    b.way(10, jfk, highway="motorway", name="JFK Expressway", maxspeed="45 mph", lanes="3")
+    b.way(11, [jfk[1]] + b.pts([(40.6900, -73.8000), (40.7050, -73.7990)]),
           highway="motorway", name="Van Wyck Expressway", ref="I 678", oneway="yes", lanes="3", maxspeed="50 mph")
     b.way(12, b.pts([(40.7100, -73.7950), (40.7200, -73.7940)]),  # entirely north of the package
           highway="motorway", name="Van Wyck Expressway", ref="I 678", oneway="yes", maxspeed="50 mph")
-    b.way(13, b.pts([(40.6250, -73.7450), (40.6300, -73.7600), (40.6330, -73.7700)]),
-          highway="trunk", name="Nassau Expressway", oneway="-1", maxspeed="none")
-    b.way(14, b.pts([(40.6440, -73.7830), (40.6450, -73.7800), (40.6460, -73.7770)]),
-          highway="service", name="Terminal 4 Departures", bridge="yes", layer="1", surface="concrete")
+    nassau = b.pts([(40.6250, -73.7450), (40.6300, -73.7600), (40.6330, -73.7700)])
+    b.way(13, nassau, highway="trunk", name="Nassau Expressway", oneway="-1", maxspeed="none")
+    t4 = b.pts([(40.6440, -73.7830), (40.6450, -73.7800), (40.6460, -73.7770)])
+    b.way(14, t4, highway="service", name="Terminal 4 Departures", bridge="yes", layer="1", surface="concrete")
     b.way(15, b.pts([(40.6440, -73.7835), (40.6455, -73.7790)]), highway="service", tunnel="yes", layer="-1")
-    b.way(16, b.pts([(40.6630, -73.7600), (40.6640, -73.7500), (40.6645, -73.7420)]),
-          highway="primary", name="Rockaway Boulevard", maxspeed="30 mph", lanes="2;3")
+    rockaway = b.pts([(40.6630, -73.7600), (40.6640, -73.7500), (40.6645, -73.7420)])
+    b.way(16, rockaway, highway="primary", name="Rockaway Boulevard", maxspeed="30 mph", lanes="2;3")
+    # Connections that make the roads a network.
+    b.way(24, [jfk[5], rockaway[0]], highway="motorway_link")  # one-way by implication
+    b.way(25, [jfk[3]] + b.pts([(40.6530, -73.7810)]) + [t4[0]], highway="service", name="Terminal Access Road")
+    b.way(26, [nassau[2], t4[2]], highway="service", name="Lefferts Boulevard")
+    b.way(30, [jfk[4], rockaway[1]], highway="tertiary", motor_vehicle="no", name="Bus Lane")  # closed to cars
     b.way(17, b.pts([(40.6450, -73.7790), (40.6452, -73.7786)]), highway="footway")
     ped = b.pts([(40.6460, -73.7760), (40.6460, -73.7750), (40.6466, -73.7750)])
     b.way(18, ped + [ped[0]], highway="pedestrian", area="yes")
@@ -98,6 +112,7 @@ def network():
     c = (40.6530, -73.7950)
     ring = b.pts([offset(c, 30 * math.cos(a), 30 * math.sin(a)) for a in [k * math.pi / 3 for k in range(6)]])
     b.way(21, ring + [ring[0]], highway="tertiary", junction="roundabout", name="Cargo Área Circle")
+    b.way(27, [jfk[0], ring[0]], highway="tertiary", name="Cargo Road")
     # A way an extract cut: node 999999 is referenced but absent, so the way becomes two rows.
     left = b.pts([(40.6560, -73.8100), (40.6565, -73.8080)])
     right = b.pts([(40.6575, -73.8040), (40.6580, -73.8020), (40.6585, -73.8000)])

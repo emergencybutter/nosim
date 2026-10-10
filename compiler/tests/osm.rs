@@ -46,8 +46,8 @@ fn both_encodings_decode_identically() {
     assert_eq!(dense, plain);
     assert_eq!(ds, ps);
     assert_eq!(ds.writing_program.as_deref(), Some("nosim make_osm_fixture.py"));
-    assert_eq!((ds.nodes, ds.ways, ds.relations_skipped), (64, 20, 1));
-    assert_eq!((ds.ways_matched, ds.rows, ds.road_rows, ds.aeroway_rows), (16, 16, 11, 5));
+    assert_eq!((ds.nodes, ds.ways, ds.relations_skipped), (62, 28, 1));
+    assert_eq!((ds.ways_matched, ds.rows, ds.road_rows, ds.aeroway_rows), (24, 24, 16, 8));
     assert_eq!((ds.missing_nodes, ds.ways_split, ds.ways_unresolved, ds.outside_bbox), (2, 1, 1, 0));
     assert_eq!(ds.tagged_speeds, 7);
     // Areas, construction, buildings and the one-node way are not splines.
@@ -120,6 +120,13 @@ fn roads_are_normalised() {
     assert_eq!((circle.oneway, circle.name.as_deref()), (1, Some("Cargo Área Circle")));
     assert_eq!(circle.points.first(), circle.points.last()); // closed ring kept as a loop
     assert!(near(circle.length_m, 6.0 * 30.0, 1.0)); // hexagon of 30 m circumradius has 30 m sides
+
+    // Node ids survive so a graph can join splines: the Van Wyck leaves the JFK Expressway at
+    // its second node. Access is carried for the drive graph.
+    assert_eq!(way(&r, 11).node_ids.as_ref().unwrap()[0], way(&r, 10).node_ids.as_ref().unwrap()[1]);
+    assert_eq!(way(&r, 30).access.as_deref(), Some("no"));
+    assert_eq!(jfk.access, None);
+    assert!(r.iter().all(|x| x.node_ids.as_ref().is_some_and(|ids| ids.len() == x.points.len())));
 
     // The way cut by a missing node becomes two pieces carrying the same attributes.
     let pieces: Vec<&SplineRow> = r.iter().filter(|x| x.osm_id == 22).collect();

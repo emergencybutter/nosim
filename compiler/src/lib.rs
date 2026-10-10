@@ -7,6 +7,7 @@
 
 pub mod arinc;
 pub mod geoparquet;
+pub mod graph;
 pub mod osm;
 pub(crate) mod par;
 pub mod raster;
@@ -81,6 +82,8 @@ pub enum CompileError {
     Raster(String),
     /// OpenStreetMap PBF decoding.
     Osm(String),
+    /// Road graph construction.
+    Graph(String),
 }
 
 impl fmt::Display for CompileError {
@@ -93,6 +96,7 @@ impl fmt::Display for CompileError {
             CompileError::Usage(m) => write!(f, "usage: {m}"),
             CompileError::Raster(m) => write!(f, "raster: {m}"),
             CompileError::Osm(m) => write!(f, "osm: {m}"),
+            CompileError::Graph(m) => write!(f, "graph: {m}"),
         }
     }
 }
@@ -188,6 +192,27 @@ pub enum Command {
     Raster(RasterArgs),
     /// Extract roads and aeroways from an OpenStreetMap PBF.
     Osm(OsmArgs),
+    /// Build a directed road graph from a spline table.
+    Graph(GraphArgs),
+}
+
+/// `graph` subcommand options.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphArgs {
+    /// Spline table to read.
+    pub input: PathBuf,
+    /// Directory for `edges.geoparquet` and `nodes.geoparquet`.
+    pub output: PathBuf,
+    /// Drive or taxi network.
+    pub mode: graph::Mode,
+    /// Keep only the largest strongly connected component.
+    pub largest_component: bool,
+    /// Run the CTM for this many seconds after building.
+    pub simulate_s: Option<f64>,
+    /// Demand at every source for the simulation, vehicles per hour.
+    pub demand_veh_per_h: f64,
+    /// CTM time step, seconds.
+    pub dt_s: f64,
 }
 
 /// `osm` subcommand options.
@@ -228,7 +253,8 @@ pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runwa
                          world-compiler validate [--strict] [--json] <package-or-directory>...\n\
                          world-compiler tiles --input <features.parquet> --output <dir> [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]\n\
                          world-compiler raster --input <dem.tif> --output <dir> [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]\n\
-                         world-compiler osm --input <extract.osm.pbf> --output <splines.geoparquet> [--bbox <west,south,east,north>] [--threads <n>]";
+                         world-compiler osm --input <extract.osm.pbf> --output <splines.geoparquet> [--bbox <west,south,east,north>] [--threads <n>]\n\
+                         world-compiler graph --input <splines.geoparquet> --output <dir> [--mode drive|taxi] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>]]";
 
 /// Parses the command line (everything after the program name).
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, CompileError> {
@@ -239,8 +265,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Co
         Some("tiles") => parse_tiles(it).map(Command::Tiles),
         Some("raster") => parse_raster(it).map(Command::Raster),
         Some("osm") => parse_osm(it).map(Command::Osm),
+        Some("graph") => parse_graph(it).map(Command::Graph),
         other => Err(CompileError::Usage(format!(
-            "expected subcommand `arinc`, `validate`, `tiles`, `raster` or `osm`, got {other:?}\n{USAGE}"
+            "expected subcommand `arinc`, `validate`, `tiles`, `raster`, `osm` or `graph`, got {other:?}\n{USAGE}"
         ))),
     }
 }
@@ -441,4 +468,53 @@ pub fn run_osm(args: &OsmArgs) -> Result<(Vec<osm::SplineRow>, osm::OsmSummary),
     let (rows, summary) = osm::extract(&args.input, &args.options)?;
     osm::write_splines(&args.output, &rows)?;
     Ok((rows, summary))
+}
+
+fn parse_graph<I: Iterator<Item = String>>(mut it: I) -> Result<GraphArgs, CompileError> {
+    let (mut input, mut output) = (None, None);
+    let mut args = GraphArgs {
+        input: PathBuf::new(),
+        output: PathBuf::new(),
+        mode: graph::Mode::Drive,
+        largest_component: false,
+        simulate_s: None,
+        demand_veh_per_h: 300.0,
+        dt_s: 1.0,
+    };
+    let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
+    let positive = |v: f64| v.is_finite() && v > 0.0;
+    while let Some(flag) = it.next() {
+        if flag == "--largest-component" {
+            args.largest_component = true;
+            continue;
+        }
+        let value = it.next().ok_or_else(|| CompileError::Usage(format!("{flag} needs a value\n{USAGE}")))?;
+        let num = || value.parse::<f64>().ok().filter(|v| positive(*v)).ok_or_else(|| bad(&flag, &value));
+        match flag.as_str() {
+            "--input" => input = Some(PathBuf::from(&value)),
+            "--output" => output = Some(PathBuf::from(&value)),
+            "--mode" => args.mode = graph::Mode::parse(&value).ok_or_else(|| bad(&flag, &value))?,
+            "--simulate" => args.simulate_s = Some(num()?),
+            "--demand" => args.demand_veh_per_h = num()?,
+            "--dt" => args.dt_s = num()?,
+            _ => return Err(CompileError::Usage(format!("unknown flag {flag}\n{USAGE}"))),
+        }
+    }
+    args.input = input.ok_or_else(|| CompileError::Usage(format!("--input is required\n{USAGE}")))?;
+    args.output = output.ok_or_else(|| CompileError::Usage(format!("--output is required\n{USAGE}")))?;
+    Ok(args)
+}
+
+/// Runs `graph`: builds and writes the graph, then optionally runs the CTM on it.
+pub fn run_graph(
+    args: &GraphArgs,
+) -> Result<(graph::Graph, graph::GraphSummary, Option<graph::SimSummary>), CompileError> {
+    let rows = osm::read_splines(&args.input)?;
+    let (g, summary) = graph::build(&rows, args.mode, args.largest_component);
+    graph::write(&args.output, &g)?;
+    let sim = match args.simulate_s {
+        Some(seconds) => Some(graph::simulate(&g, args.dt_s, seconds, args.demand_veh_per_h / 3600.0)?),
+        None => None,
+    };
+    Ok((g, summary, sim))
 }

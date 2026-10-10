@@ -26,6 +26,15 @@ pub fn polygon(ring: &[(f64, f64)]) -> Vec<u8> {
     out
 }
 
+/// Little-endian WKB point.
+pub fn point(p: (f64, f64)) -> Vec<u8> {
+    let mut out = vec![1u8];
+    push_u32(&mut out, 1);
+    push_f64(&mut out, p.0);
+    push_f64(&mut out, p.1);
+    out
+}
+
 /// Little-endian WKB linestring.
 pub fn linestring(points: &[(f64, f64)]) -> Vec<u8> {
     let mut out = vec![1u8];

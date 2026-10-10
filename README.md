@@ -41,7 +41,8 @@ src/
   phenology.rs   Four-season phase classifier, leaf scale, snow mask  (spec §6)
   traffic.rs     IDM longitudinal model, MOBIL lane change, VAT UVs   (spec §7)
   traffic/ctm.rs Far-field Cell Transmission Model: links, priority
-                 merge / FIFO diverge network, near-field handoff     (spec §7)
+                 merge / FIFO diverge, general junctions (Tampère node
+                 model), graph-to-network builder, near-field handoff (spec §7)
   traffic/orca.rs ORCA pedestrian avoidance (RVO2 port): agents,
                  polygon obstacles, 2D LP with safest-velocity fallback (spec §7B)
   photometry.rs  Hapke regolith BRDF, Chapman function, limb shell    (spec §8B, §8C)
@@ -66,13 +67,16 @@ compiler/
                  Cesium quantized-mesh encoder / decoder (quantized_mesh.rs)
   src/osm/       OpenStreetMap PBF reader: blobs, zlib, dense and plain nodes, ways (pbf.rs);
                  road and aeroway extraction with tag normalisation, spline GeoParquet (mod.rs)
+  src/graph.rs   Road graph: splines split at shared nodes into directed edges, strongly
+                 connected components, edge / node GeoParquet, CTM construction and run
   src/par.rs     Order-preserving parallel map over scoped threads, shared by raster and osm
   src/lib.rs     Override application through the VFS; CLI parsing; run_arinc / run_validate /
-                 run_tiles / run_raster / run_osm
+                 run_tiles / run_raster / run_osm / run_graph
   tests/         The Phase 2 pipeline end to end, including the §3 override loop; the tiler
                  from the KJFK runway table to decoded tiles on disk; the raster processor
                  from three GeoTIFF encodings to decoded PNG and mesh tiles; OSM extraction
-                 from two libosmium encodings to the package's spline table
+                 from two libosmium encodings to the package's spline table; the road graph
+                 from that fixture to open and closed CTM runs
 fixtures/        The spec's KJFK example package (scenery tests) — its arinc_runways.parquet
                  and taxiways_and_roads.geoparquet are real tables compiled from the CIFP and
                  OSM samples, so the package validates and overrides end to end; the BSC5 catalogue
@@ -83,7 +87,8 @@ examples/        compile_bsc5: turns the CDS catalogue text into the packed star
 tools/           ephem_tables.py: reference evaluator + generator for the ephemeris tables;
                  make_dem_fixtures.py: writes the DEM fixtures (standard library only);
                  make_osm_fixture.py: writes the OSM fixtures through libosmium (pyosmium);
-                 check_osm_extract.py: cross-checks `osm` output against libosmium
+                 check_osm_extract.py: cross-checks `osm` output against libosmium;
+                 check_road_graph.py: cross-checks `graph` output against networkx
 docs/            Architecture specification
 ```
 
@@ -129,7 +134,8 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §6 — phenology table rows | `phenology::spec_table_rows` |
 | §7 — IDM equilibrium gap `s₀ + vT`, MOBIL safety/etiquette | `traffic` |
 | §7B — ORCA: a head-on pair and six agents in opposing corridor streams pass with zero overlap; a block is never penetrated (stops at the face alone, routes around with waypoints); walls hold from both sides; a 24-agent circle crossing arrives with overlap bounded by the infeasible-crush fallback; results are deterministic and independent of insertion order | `traffic::orca` |
-| §7 — CTM: vehicles conserved and bounded, free-flow platoon moves exactly one cell per step, steady demand gives density `q / v_f` in every cell, a closed exit sends a shockwave upstream at the wave speed, merges split capacity by priority, a blocked diverge branch holds the whole node (FIFO), spawn count at the near-field boundary equals the exited flow | `traffic::ctm` |
+| §7 — CTM: vehicles conserved and bounded, free-flow platoon moves exactly one cell per step, steady demand gives density `q / v_f` in every cell, a closed exit sends a shockwave upstream at the wave speed, merges split capacity by priority, a blocked diverge branch holds the whole node (FIFO), spawn count at the near-field boundary equals the exited flow; the general junction equals the merge with one exit and the diverge with one entrance, and on 2,000 random intersections never exceeds a supply or a demand, keeps each approach's turns in proportion, and holds an input back only behind a full exit; links shorter than one step stay conserved and below jam | `traffic::ctm` |
+| §7 road graph — on the fixture, the drive graph splits the JFK Expressway at its two junctions, keeps it one-way, implies the ramp's direction, reverses the Nassau Expressway, halves Rockaway Boulevard's lanes per direction, closes the roundabout as a loop, leaves out the bus lane closed to cars, and finds the expected 12 components; the taxi graph is one two-way component; an open CTM run accounts for every vehicle and a closed one circulates over every link without loss | `compiler/tests/graph.rs`, `graph` |
 | §8C — opposition surge and full-moon limb flattening vs Lambert | `photometry::hapke_opposition_and_limb_flattening` |
 | §8B — limb is the *brightest* part of the atmosphere, finite airmass (~35) at the horizon | `photometry::limb_is_brightest`, `photometry::chapman_function` |
 | §8 — LOD collapse past 100 km (terrain quadtree and raymarcher dropped) | `lod::policies` |
@@ -144,7 +150,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §4 ARINC 424 decode, extrusion, grade fit, markings data | Implemented; heightfield patching is engine-side |
 | §5 Seed hash, Poisson levels, pier spacing, flatten falloff | Implemented; WFC/PCG graphs and bridge detection are engine-side |
 | §6 Calendar, declination, lapse rate, phenology, snow mask | Implemented; GPU buffer plumbing is engine-side |
-| §7 IDM, MOBIL, VAT addressing, CTM far-field with near-field handoff, ORCA crowds | Implemented; the ECS and the navigation graph that feeds ORCA its preferred velocities are engine-side |
+| §7 IDM, MOBIL, VAT addressing, CTM far-field with general junctions and near-field handoff, road graph from OSM, ORCA crowds | Implemented; turning fractions are capacity-proportional (no turn counts or routing yet); the ECS and the pedestrian navigation graph that feeds ORCA its preferred velocities are engine-side |
 | §8A VSOP87D / ELP 2000-82B evaluators, nutation, apparent places, topocentric vectors, phase, libration | Implemented (see below); physical libration (≤ 0.04°) not modelled |
 | §8A Yale Bright Star Catalogue loader, packed buffer, Planckian colour | Implemented; the catalogue itself goes to V ≈ 7.96, deeper than the spec's "to 6.5" |
 | §6/§8A Time scales (UTC → UT1 / TT / TDB, ΔT) | Implemented; DUT1 is an input (IERS Bulletin A), leap-second table valid through 2026-12-28 |
@@ -204,6 +210,44 @@ cargo run -p nosim-compiler --release -- tiles --input features.parquet --output
 ```
 
 ```sh
+cargo run -p nosim-compiler --release -- graph --input splines.geoparquet --output graph/ [--mode drive|taxi] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>]]
+```
+
+`graph` turns a spline table into the directed graph the §7 traffic layer runs on, written
+as `edges.geoparquet` (LineStrings in travel direction) and `nodes.geoparquet` (Points).
+Splines are split at every node two of them share, found through the `node_ids` column, or
+through coincident points for splines drawn outside OpenStreetMap. One-way roads give one
+edge and two-way roads two, each naming the other as its reverse. Lanes are per direction:
+tagged lanes on one-way roads, half of them on two-way roads, and otherwise two on
+motorways and trunks and one elsewhere.
+
+- **Modes.** `drive` keeps roads open to motor vehicles: motorway down to service roads,
+  without anything tagged `access`, `vehicle`, `motorcar` or `motor_vehicle` = `no`.
+  `taxi` keeps runways, taxiways, taxilanes and stands. The two never connect.
+- **Components.** Each node and edge carries its strongly connected component, 0 being
+  the largest. `--largest-component` keeps only that one: every node in it can reach every
+  other.
+- **Traffic.** `--simulate` builds the far-field CTM from the graph and runs it with the
+  same demand at every source. Free-flow speed is the edge's `speed_mps` and capacity
+  depends on road class. Every intersection becomes a general junction (Tampère et al.
+  2011). Traffic splits over the exits in proportion to their capacity, with no U-turn
+  unless it is the only way on. The run reports vehicles in, out and on the network.
+
+Verified on the BBBike New York extract. The KJFK bounds give a drive graph of 3,581 nodes
+and 7,929 edges in 176 components, the largest holding 2,814 nodes, and a taxi graph of
+1,099 nodes and 2,548 edges. The whole state gives 405,550 nodes and 944,918 edges in 7 s.
+`tools/check_road_graph.py` rebuilds both from the same splines with networkx: node sets,
+edge multisets, component counts and largest sizes all match. A 30-minute KJFK run at
+300 veh/h per source is conserved to 1e-12. A CTM step over the whole state's 944,918 links
+takes about 0.46 s on one core, faster than real time at Δt = 1 s.
+
+The real-data runs found a bug in the CTM itself. Links shorter than one free-flow step
+(`v_f·Δt`), 47,980 of them statewide, let a cell send more than it held, and the clamp at
+zero then created vehicles. Advance and retreat are now capped at one cell per step, which
+keeps every link conserved and below jam for any length. Links that already met the CFL
+condition behave exactly as before.
+
+```sh
 cargo run -p nosim-compiler --release -- osm --input extract.osm.pbf --output splines.geoparquet [--bbox <west,south,east,north>] [--threads <n>]
 ```
 
@@ -220,6 +264,8 @@ never parses strings:
   roundabouts imply 1, as in OSM.
 - `lanes`, `width_m` (metres or feet), `bridge`, `tunnel`, `layer`, `surface`, `name`,
   `ref` and the geodesic `length_m` sit alongside.
+- `access` is the motor-vehicle access value, and `node_ids` the OSM node of every point,
+  which the road graph uses to find junctions.
 
 The reader is hand-written and handles raw and zlib blobs, plain and dense nodes, and
 inline way locations. It refuses LZMA, LZ4 and ZSTD blobs and unknown required features

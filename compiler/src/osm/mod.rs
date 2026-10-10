@@ -15,7 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    Array, ArrayRef, AsArray, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, Int64Builder, ListArray,
+    ListBuilder, RecordBatch, StringArray,
 };
 use arrow::datatypes::{DataType, Field, Float64Type, Int32Type, Int64Type, Schema};
 use nosim::geodesy::{Geodetic, geodetic_to_ecef};
@@ -95,6 +96,11 @@ pub struct SplineRow {
     pub length_m: f64,
     /// `(lon, lat)` in node order.
     pub points: Vec<(f64, f64)>,
+    /// OSM node id of each point, so a graph can find where splines meet. `None` for
+    /// splines drawn outside OpenStreetMap; a graph then joins them by coincident points.
+    pub node_ids: Option<Vec<i64>>,
+    /// Motor-vehicle access: the first of `motor_vehicle`, `motorcar`, `vehicle`, `access`.
+    pub access: Option<String>,
 }
 
 /// `highway` values that are not drivable or walkable lines.
@@ -177,7 +183,9 @@ fn parse_oneway(way: &pbf::Way, network: Network, class: &str) -> i32 {
         Some(_) => 0,
         None => {
             let implied = network == Network::Road
-                && (class == "motorway" || matches!(way.tag("junction"), Some("roundabout" | "circular")));
+                && (class == "motorway"
+                    || class == "motorway_link"
+                    || matches!(way.tag("junction"), Some("roundabout" | "circular")));
             i32::from(implied)
         }
     }
@@ -315,14 +323,14 @@ pub fn extract(path: &Path, opts: &OsmOptions) -> Result<(Vec<SplineRow>, OsmSum
     let mut rows = Vec::new();
     for (way, network, class) in ways {
         // Split at missing nodes; each run of two or more resolved nodes becomes a row.
-        let mut runs: Vec<Vec<(f64, f64)>> = vec![Vec::new()];
+        let mut runs: Vec<Vec<(i64, (f64, f64))>> = vec![Vec::new()];
         for (i, id) in way.refs.iter().enumerate() {
             let p = match &way.locations {
                 Some(locs) => Some(locs[i]),
                 None => coords.get(id).copied(),
             };
             match p {
-                Some(p) => runs.last_mut().expect("non-empty").push(p),
+                Some(p) => runs.last_mut().expect("non-empty").push((*id, p)),
                 None => {
                     summary.missing_nodes += 1;
                     if !runs.last().expect("non-empty").is_empty() {
@@ -331,7 +339,7 @@ pub fn extract(path: &Path, opts: &OsmOptions) -> Result<(Vec<SplineRow>, OsmSum
                 }
             }
         }
-        let runs: Vec<Vec<(f64, f64)>> = runs.into_iter().filter(|r| r.len() >= 2).collect();
+        let runs: Vec<Vec<(i64, (f64, f64))>> = runs.into_iter().filter(|r| r.len() >= 2).collect();
         if runs.is_empty() {
             summary.ways_unresolved += 1;
             continue;
@@ -345,7 +353,10 @@ pub fn extract(path: &Path, opts: &OsmOptions) -> Result<(Vec<SplineRow>, OsmSum
         };
         let lanes = way.tag("lanes").and_then(|v| v.split(';').next()?.trim().parse::<i32>().ok()).filter(|&l| l > 0);
         let oneway = parse_oneway(&way, network, &class);
-        for (part, points) in runs.into_iter().enumerate() {
+        let access =
+            ["motor_vehicle", "motorcar", "vehicle", "access"].iter().find_map(|k| way.tag(k)).map(str::to_owned);
+        for (part, run) in runs.into_iter().enumerate() {
+            let (ids, points): (Vec<i64>, Vec<(f64, f64)>) = run.into_iter().unzip();
             if let Some((w, s, e, n)) = opts.bbox
                 && !points.iter().any(|&(lon, lat)| lon >= w && lon <= e && lat >= s && lat <= n)
             {
@@ -370,6 +381,8 @@ pub fn extract(path: &Path, opts: &OsmOptions) -> Result<(Vec<SplineRow>, OsmSum
                 surface: way.tag("surface").map(str::to_owned),
                 length_m: length_m(&points),
                 points,
+                node_ids: Some(ids),
+                access: access.clone(),
             });
         }
     }
@@ -399,8 +412,24 @@ fn schema() -> Arc<Schema> {
         Field::new("layer", DataType::Int32, false),
         Field::new("surface", DataType::Utf8, true),
         Field::new("length_m", DataType::Float64, false),
+        Field::new("access", DataType::Utf8, true),
+        Field::new("node_ids", DataType::List(Arc::new(Field::new("item", DataType::Int64, false))), true),
         Field::new("geometry", DataType::Binary, false),
     ]))
+}
+
+fn node_id_lists(rows: &[SplineRow]) -> ListArray {
+    let mut b = ListBuilder::new(Int64Builder::new()).with_field(Arc::new(Field::new("item", DataType::Int64, false)));
+    for r in rows {
+        match &r.node_ids {
+            Some(ids) => {
+                b.values().append_slice(ids);
+                b.append(true);
+            }
+            None => b.append(false),
+        }
+    }
+    b.finish()
 }
 
 /// Writes the spline table as GeoParquet.
@@ -426,6 +455,8 @@ pub fn write_splines(path: &Path, rows: &[SplineRow]) -> Result<(), CompileError
         Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.layer))),
         Arc::new(StringArray::from_iter(rows.iter().map(|r| r.surface.as_deref()))),
         Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.length_m))),
+        Arc::new(StringArray::from_iter(rows.iter().map(|r| r.access.as_deref()))),
+        Arc::new(node_id_lists(rows)),
         Arc::new(BinaryArray::from_iter_values(lines.iter().map(Vec::as_slice))),
     ];
     let batch = RecordBatch::try_new(schema(), columns).map_err(|e| CompileError::Arrow(e.to_string()))?;
@@ -460,6 +491,9 @@ pub fn read_splines(path: &Path) -> Result<Vec<SplineRow>, CompileError> {
             (f("speed_mps")?, s("speed_source")?, i("lanes")?, i("oneway")?, f("width_m")?);
         let (bridge, tunnel) = (col("bridge")?.as_boolean().clone(), col("tunnel")?.as_boolean().clone());
         let (layer, surface, length) = (i("layer")?, s("surface")?, f("length_m")?);
+        // Optional in tables written before these columns existed.
+        let access = b.column_by_name("access").map(|c| c.as_string::<i32>().clone());
+        let node_ids = b.column_by_name("node_ids").map(|c| c.as_list::<i32>().clone());
         let geometry = col("geometry")?.as_binary::<i32>().clone();
         let opt_s = |a: &arrow::array::StringArray, k: usize| (!a.is_null(k)).then(|| a.value(k).to_owned());
         for k in 0..b.num_rows() {
@@ -486,6 +520,11 @@ pub fn read_splines(path: &Path) -> Result<Vec<SplineRow>, CompileError> {
                 length_m: length.value(k),
                 points: wkb::parse_linestring(geometry.value(k))
                     .map_err(|e| CompileError::Parquet(format!("geometry row {k}: {e:?}")))?,
+                node_ids: node_ids
+                    .as_ref()
+                    .filter(|l| !l.is_null(k))
+                    .map(|l| l.value(k).as_primitive::<Int64Type>().values().to_vec()),
+                access: access.as_ref().and_then(|a| opt_s(a, k)),
             });
         }
     }
@@ -541,6 +580,7 @@ mod tests {
         };
         assert_eq!(dir(&[("highway", "motorway")]), 1);
         assert_eq!(dir(&[("highway", "motorway"), ("oneway", "no")]), 0);
+        assert_eq!(dir(&[("highway", "motorway_link")]), 1);
         assert_eq!(dir(&[("highway", "primary"), ("junction", "roundabout")]), 1);
         assert_eq!(dir(&[("highway", "primary"), ("oneway", "-1")]), -1);
         assert_eq!(dir(&[("highway", "primary"), ("oneway", "reversible")]), 0);

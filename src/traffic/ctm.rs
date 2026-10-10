@@ -169,15 +169,18 @@ impl Link {
         self.diagram.capacity_per_lane * f64::from(self.lanes) * self.dt_s
     }
 
-    /// Vehicles cell `i` can send downstream this step.
+    /// Vehicles cell `i` can send downstream this step. The free-flow advance is capped at
+    /// one cell per step: on a link shorter than `v_f·Δt` (CFL not met) a cell can still never
+    /// send more than it holds, so conservation stays exact.
     pub fn sending(&self, cell: usize) -> f64 {
-        let advance = self.diagram.free_flow_speed * self.dt_s / self.cell_length_m;
+        let advance = (self.diagram.free_flow_speed * self.dt_s / self.cell_length_m).min(1.0);
         (self.cells[cell] * advance).min(self.capacity_per_step())
     }
 
-    /// Vehicles cell `i` can receive this step.
+    /// Vehicles cell `i` can receive this step; likewise capped at its free room, so a short
+    /// cell is never filled past jam.
     pub fn receiving(&self, cell: usize) -> f64 {
-        let retreat = self.diagram.wave_speed() * self.dt_s / self.cell_length_m;
+        let retreat = (self.diagram.wave_speed() * self.dt_s / self.cell_length_m).min(1.0);
         (retreat * (self.jam_capacity() - self.cells[cell])).max(0.0).min(self.capacity_per_step())
     }
 
@@ -254,6 +257,17 @@ pub enum Node {
         /// `(link, fraction)`; fractions are normalised.
         to: Vec<(usize, f64)>,
     },
+    /// A general intersection: any number of inputs and outputs, with a turning fraction for
+    /// every input–output pair (Tampère et al. 2011). See [`junction_flows`].
+    Junction {
+        /// `(link, priority)`; usually the input's capacity.
+        from: Vec<(usize, f64)>,
+        /// Output links.
+        to: Vec<usize>,
+        /// `turning[i][j]`: share of input `i`'s traffic bound for output `j`. Rows are
+        /// normalised; zero entries are turns that are not allowed.
+        turning: Vec<Vec<f64>>,
+    },
 }
 
 /// Links joined by nodes, stepped together.
@@ -261,6 +275,10 @@ pub enum Node {
 pub struct Network {
     links: Vec<Link>,
     nodes: Vec<Node>,
+    /// Node attached to each link's upstream end.
+    upstream: Vec<Option<usize>>,
+    /// Node attached to each link's downstream end.
+    downstream: Vec<Option<usize>>,
 }
 
 fn positive(x: f64) -> bool {
@@ -274,7 +292,7 @@ pub enum NetworkError {
     UnknownLink(usize),
     /// A link end already has a node attached.
     EndAlreadyConnected(usize),
-    /// A merge or diverge has no branches, or weights are not positive.
+    /// A merge, diverge or junction has no branches, or weights are not positive.
     BadWeights,
 }
 
@@ -287,11 +305,14 @@ impl Network {
     /// Adds a link; returns its index.
     pub fn add_link(&mut self, link: Link) -> usize {
         self.links.push(link);
+        self.upstream.push(None);
+        self.downstream.push(None);
         self.links.len() - 1
     }
 
     /// Adds a node after checking every referenced link exists and no end is doubly fed.
     pub fn add_node(&mut self, node: Node) -> Result<usize, NetworkError> {
+        // `ups`: links whose upstream end this node feeds; `downs`: links it drains.
         let (ups, downs): (Vec<usize>, Vec<usize>) = match &node {
             Node::Source { link, .. } => (vec![*link], vec![]),
             Node::Sink { link, .. } => (vec![], vec![*link]),
@@ -307,42 +328,55 @@ impl Network {
                 }
                 (to.iter().map(|(l, _)| *l).collect(), vec![*from])
             }
+            Node::Junction { from, to, turning } => {
+                let rows_ok = turning.len() == from.len()
+                    && turning.iter().all(|row| {
+                        row.len() == to.len()
+                            && row.iter().all(|b| b.is_finite() && *b >= 0.0)
+                            && positive(row.iter().sum())
+                    });
+                if from.is_empty() || to.is_empty() || !from.iter().all(|(_, p)| positive(*p)) || !rows_ok {
+                    return Err(NetworkError::BadWeights);
+                }
+                (to.clone(), from.iter().map(|(l, _)| *l).collect())
+            }
         };
         for &l in ups.iter().chain(&downs) {
             if l >= self.links.len() {
                 return Err(NetworkError::UnknownLink(l));
             }
         }
+        let mut seen = std::collections::HashSet::new();
         for &l in &ups {
-            if self.upstream_node(l).is_some() {
+            if self.upstream[l].is_some() || !seen.insert(l) {
                 return Err(NetworkError::EndAlreadyConnected(l));
             }
+        }
+        seen.clear();
+        for &l in &downs {
+            if self.downstream[l].is_some() || !seen.insert(l) {
+                return Err(NetworkError::EndAlreadyConnected(l));
+            }
+        }
+        let index = self.nodes.len();
+        for &l in &ups {
+            self.upstream[l] = Some(index);
         }
         for &l in &downs {
-            if self.downstream_node(l).is_some() {
-                return Err(NetworkError::EndAlreadyConnected(l));
-            }
+            self.downstream[l] = Some(index);
         }
         self.nodes.push(node);
-        Ok(self.nodes.len() - 1)
+        Ok(index)
     }
 
-    fn upstream_node(&self, link: usize) -> Option<usize> {
-        self.nodes.iter().position(|n| match n {
-            Node::Source { link: l, .. } => *l == link,
-            Node::Merge { to, .. } => *to == link,
-            Node::Diverge { to, .. } => to.iter().any(|(l, _)| *l == link),
-            Node::Sink { .. } => false,
-        })
+    /// Node attached to a link's upstream end.
+    pub fn upstream_node(&self, link: usize) -> Option<usize> {
+        self.upstream.get(link).copied().flatten()
     }
 
-    fn downstream_node(&self, link: usize) -> Option<usize> {
-        self.nodes.iter().position(|n| match n {
-            Node::Sink { link: l, .. } => *l == link,
-            Node::Merge { from, .. } => from.iter().any(|(l, _)| *l == link),
-            Node::Diverge { from, .. } => *from == link,
-            Node::Source { .. } => false,
-        })
+    /// Node attached to a link's downstream end.
+    pub fn downstream_node(&self, link: usize) -> Option<usize> {
+        self.downstream.get(link).copied().flatten()
     }
 
     /// Links in index order.
@@ -389,11 +423,12 @@ impl Network {
                 }
                 Node::Merge { from, to } => {
                     let flows = merge_flows(&from.iter().map(|(l, p)| (send[*l], *p)).collect::<Vec<_>>(), recv[*to]);
+                    let mut total = 0.0;
                     for ((l, _), f) in from.iter().zip(flows) {
                         outflow[*l] = f;
+                        total += f;
                     }
-                    inflow[*to] =
-                        outflow.iter().zip(0..).filter(|(_, i)| from.iter().any(|(l, _)| l == i)).map(|(f, _)| f).sum();
+                    inflow[*to] = total;
                 }
                 Node::Diverge { from, to } => {
                     let total: f64 = to.iter().map(|(_, f)| f).sum();
@@ -407,10 +442,193 @@ impl Network {
                         inflow[*l] = y * f / total;
                     }
                 }
+                Node::Junction { from, to, turning } => {
+                    let sending: Vec<f64> = from.iter().map(|(l, _)| send[*l]).collect();
+                    let priority: Vec<f64> = from.iter().map(|(_, p)| *p).collect();
+                    let receiving: Vec<f64> = to.iter().map(|l| recv[*l]).collect();
+                    let q = junction_flows(&sending, &priority, turning, &receiving);
+                    for (i, (l, _)) in from.iter().enumerate() {
+                        outflow[*l] = q[i].iter().sum();
+                    }
+                    for (j, l) in to.iter().enumerate() {
+                        inflow[*l] = q.iter().map(|row| row[j]).sum();
+                    }
+                }
             }
         }
         (0..n).map(|i| self.links[i].step_with_boundary_flows(inflow[i], outflow[i])).collect()
     }
+}
+
+/// The general first-order node model of Tampère, Corthout, Cattrysse & Immers (2011):
+/// flows `q[i][j]` from each input to each output, given input sending flows, input
+/// priorities (normally capacities), row-normalised turning fractions and output receiving
+/// flows.
+///
+/// It satisfies the requirements that model sets out: no input sends more than it has and
+/// no output receives more than it can take; flows are conserved; each input's turns move
+/// in fixed proportion (FIFO), so a blocked exit holds back that whole approach; an input
+/// that is supply-constrained gets a share of the scarce output proportional to its
+/// priority; and an input whose demand fits is never cut. With one output it is Daganzo's
+/// priority merge ([`merge_flows`]); with one input it is Daganzo's diverge.
+pub fn junction_flows(sending: &[f64], priority: &[f64], turning: &[Vec<f64>], receiving: &[f64]) -> Vec<Vec<f64>> {
+    let (ni, nj) = (sending.len(), receiving.len());
+    let beta: Vec<Vec<f64>> = turning
+        .iter()
+        .map(|row| {
+            let total: f64 = row.iter().sum();
+            row.iter().map(|b| if total > 0.0 { b / total } else { 0.0 }).collect()
+        })
+        .collect();
+    let mut q = vec![vec![0.0; nj]; ni];
+    let mut remaining: Vec<f64> = receiving.iter().map(|r| r.max(0.0)).collect();
+    // Undetermined inputs competing for each output.
+    let mut competing: Vec<Vec<usize>> =
+        (0..nj).map(|j| (0..ni).filter(|&i| sending[i] > 0.0 && beta[i][j] > 0.0).collect()).collect();
+    let mut determined = vec![false; ni];
+    loop {
+        // Most restrictive output: the smallest supply per unit of competing priority.
+        let mut best: Option<(usize, f64)> = None;
+        for (j, inputs) in competing.iter().enumerate() {
+            if inputs.is_empty() {
+                continue;
+            }
+            let weight: f64 = inputs.iter().map(|&i| priority[i] * beta[i][j]).sum();
+            let a = remaining[j].max(0.0) / weight;
+            if best.is_none_or(|(_, b)| a < b) {
+                best = Some((j, a));
+            }
+        }
+        let Some((jstar, a)) = best else { break };
+        let demand_bound: Vec<usize> =
+            competing[jstar].iter().copied().filter(|&i| sending[i] <= a * priority[i]).collect();
+        // Inputs whose demand fits get all of it; otherwise every input at j* is held to its
+        // priority share of j*.
+        let fixed: Vec<(usize, f64)> = if demand_bound.is_empty() {
+            competing[jstar].iter().map(|&i| (i, a * priority[i])).collect()
+        } else {
+            demand_bound.iter().map(|&i| (i, sending[i])).collect()
+        };
+        for (i, total) in fixed {
+            determined[i] = true;
+            for j in 0..nj {
+                q[i][j] = total * beta[i][j];
+                remaining[j] -= q[i][j];
+            }
+        }
+        for inputs in &mut competing {
+            inputs.retain(|&i| !determined[i]);
+        }
+    }
+    q
+}
+
+/// A directed road segment for [`build_network`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GraphEdge {
+    /// Graph node at the upstream end.
+    pub from: usize,
+    /// Graph node at the downstream end.
+    pub to: usize,
+    /// Length, metres.
+    pub length_m: f64,
+    /// Lanes in this direction.
+    pub lanes: u32,
+    /// Fundamental diagram.
+    pub diagram: FundamentalDiagram,
+    /// The opposite-direction edge of the same road, if two-way (its U-turn).
+    pub reverse: Option<usize>,
+}
+
+/// A network built from a graph, with the external boundary nodes listed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphNetwork {
+    /// The network; link `k` is edge `k`.
+    pub network: Network,
+    /// `(network node, link)` for every edge leaving a graph node that nothing enters.
+    pub sources: Vec<(usize, usize)>,
+    /// `(network node, link)` for every edge entering a graph node that nothing leaves.
+    pub sinks: Vec<(usize, usize)>,
+    /// Intersections built as [`Node::Junction`].
+    pub junctions: usize,
+    /// Links shorter than one free-flow step (`v_f·Δt`): they hold a single cell, so traffic
+    /// crosses them at most one cell per step, slower than free flow. Shorten `Δt` to remove.
+    pub short_links: usize,
+}
+
+/// Why a graph could not be built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildError {
+    /// Edge `k` has a non-positive length, no lanes or an invalid diagram.
+    BadEdge(usize),
+    /// Edge `k` names a node at or beyond the node count.
+    UnknownNode(usize),
+    /// The network rejected a node (a bug in the graph, such as a malformed reverse link).
+    Network(NetworkError),
+}
+
+/// Builds a CTM network from a directed graph. Every edge becomes a link; every graph node
+/// with both entering and leaving edges becomes a [`Node::Junction`] whose turning fractions
+/// split each input over its outputs in proportion to their capacity, never back onto its
+/// own reverse (no U-turns) unless that is the only way on; priorities are input
+/// capacities. Nodes only left become sources (demand 0, set it with
+/// [`Network::set_rate`]); nodes only entered become free-exit sinks.
+pub fn build_network(node_count: usize, edges: &[GraphEdge], dt_s: f64) -> Result<GraphNetwork, BuildError> {
+    let mut network = Network::new();
+    let mut short_links = 0;
+    for (k, e) in edges.iter().enumerate() {
+        if e.from >= node_count || e.to >= node_count {
+            return Err(BuildError::UnknownNode(k));
+        }
+        let link = Link::new(e.diagram, e.lanes, e.length_m, dt_s).ok_or(BuildError::BadEdge(k))?;
+        if e.length_m < e.diagram.free_flow_speed * dt_s {
+            short_links += 1;
+        }
+        network.add_link(link);
+    }
+    let capacity = |e: &GraphEdge| e.diagram.capacity_per_lane * f64::from(e.lanes);
+    let mut ins: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+    let mut outs: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+    for (k, e) in edges.iter().enumerate() {
+        outs[e.from].push(k);
+        ins[e.to].push(k);
+    }
+    let (mut sources, mut sinks, mut junctions) = (Vec::new(), Vec::new(), 0);
+    let net_err = BuildError::Network;
+    for v in 0..node_count {
+        match (ins[v].is_empty(), outs[v].is_empty()) {
+            (true, true) => {}
+            (true, false) => {
+                for &l in &outs[v] {
+                    let n = network.add_node(Node::Source { link: l, demand_veh_per_s: 0.0 }).map_err(net_err)?;
+                    sources.push((n, l));
+                }
+            }
+            (false, true) => {
+                for &l in &ins[v] {
+                    let n =
+                        network.add_node(Node::Sink { link: l, supply_veh_per_s: f64::INFINITY }).map_err(net_err)?;
+                    sinks.push((n, l));
+                }
+            }
+            (false, false) => {
+                let turning: Vec<Vec<f64>> = ins[v]
+                    .iter()
+                    .map(|&i| {
+                        let no_uturn = outs[v].iter().any(|&o| edges[i].reverse != Some(o));
+                        outs[v]
+                            .iter()
+                            .map(|&o| if no_uturn && edges[i].reverse == Some(o) { 0.0 } else { capacity(&edges[o]) })
+                            .collect()
+                    })
+                    .collect();
+                let from = ins[v].iter().map(|&i| (i, capacity(&edges[i]))).collect();
+                network.add_node(Node::Junction { from, to: outs[v].clone(), turning }).map_err(net_err)?;
+                junctions += 1;
+            }
+        }
+    }
+    Ok(GraphNetwork { network, sources, sinks, junctions, short_links })
 }
 
 /// Daganzo's priority merge for any number of inputs: each input gets its sending flow if
@@ -703,5 +921,170 @@ mod tests {
         assert!(near(last_batch.spacing_m, 30.0 / 0.35, 0.5), "{}", last_batch.spacing_m);
         let empty = Link::new(d, 1, 300.0, 1.0).unwrap();
         assert_eq!(NearFieldBoundary::new().take_spawns(&empty, 0.0).spacing_m, f64::INFINITY);
+    }
+
+    /// Deterministic pseudo-random numbers in [0, 1).
+    fn lcg(seed: &mut u64) -> f64 {
+        *seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (*seed >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    #[test]
+    fn junction_reduces_to_merge_and_diverge() {
+        let mut seed = 7u64;
+        for _ in 0..500 {
+            // One output: Daganzo's priority merge.
+            let n = 1 + (lcg(&mut seed) * 4.0) as usize;
+            let inputs: Vec<(f64, f64)> = (0..n).map(|_| (lcg(&mut seed) * 5.0, 0.1 + lcg(&mut seed))).collect();
+            let r = lcg(&mut seed) * 8.0;
+            let sending: Vec<f64> = inputs.iter().map(|x| x.0).collect();
+            let priority: Vec<f64> = inputs.iter().map(|x| x.1).collect();
+            let q = junction_flows(&sending, &priority, &vec![vec![1.0]; n], &[r]);
+            for (got, want) in q.iter().map(|row| row[0]).zip(merge_flows(&inputs, r)) {
+                assert!((got - want).abs() < 1e-9, "merge {got} vs {want}");
+            }
+            // One input: Daganzo's diverge, y = min(S, min_j R_j / β_j).
+            let m = 1 + (lcg(&mut seed) * 4.0) as usize;
+            let beta: Vec<f64> = (0..m).map(|_| 0.05 + lcg(&mut seed)).collect();
+            let total: f64 = beta.iter().sum();
+            let recv: Vec<f64> = (0..m).map(|_| lcg(&mut seed) * 3.0).collect();
+            let s = lcg(&mut seed) * 5.0;
+            let q = junction_flows(&[s], &[1.0], std::slice::from_ref(&beta), &recv);
+            let y = beta.iter().zip(&recv).fold(s, |y, (b, r)| y.min(r / (b / total)));
+            assert!((q[0].iter().sum::<f64>() - y).abs() < 1e-9);
+            for (j, b) in beta.iter().enumerate() {
+                assert!((q[0][j] - y * b / total).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn junction_invariants_on_random_intersections() {
+        let mut seed = 99u64;
+        for _ in 0..2000 {
+            let (ni, nj) = (1 + (lcg(&mut seed) * 4.0) as usize, 1 + (lcg(&mut seed) * 4.0) as usize);
+            let sending: Vec<f64> =
+                (0..ni).map(|_| if lcg(&mut seed) < 0.1 { 0.0 } else { lcg(&mut seed) * 4.0 }).collect();
+            let priority: Vec<f64> = (0..ni).map(|_| 0.2 + lcg(&mut seed)).collect();
+            let turning: Vec<Vec<f64>> = (0..ni)
+                .map(|_| {
+                    let mut row: Vec<f64> =
+                        (0..nj).map(|_| if lcg(&mut seed) < 0.3 { 0.0 } else { lcg(&mut seed) }).collect();
+                    if row.iter().sum::<f64>() == 0.0 {
+                        row[0] = 1.0;
+                    }
+                    row
+                })
+                .collect();
+            let receiving: Vec<f64> = (0..nj).map(|_| lcg(&mut seed) * 5.0).collect();
+            let q = junction_flows(&sending, &priority, &turning, &receiving);
+            let eps = 1e-9;
+            for j in 0..nj {
+                let into: f64 = q.iter().map(|row| row[j]).sum();
+                assert!(into <= receiving[j] + eps, "output {j} over capacity");
+            }
+            for i in 0..ni {
+                let total: f64 = turning[i].iter().sum();
+                let out: f64 = q[i].iter().sum();
+                assert!(q[i].iter().all(|&x| x >= -eps));
+                assert!(out <= sending[i] + eps, "input {i} sends more than it has");
+                // FIFO: every turn of an input carries its share of that input's flow.
+                for j in 0..nj {
+                    assert!((q[i][j] - out * turning[i][j] / total).abs() < 1e-9);
+                }
+                // Maximal: an input held below its demand is held by a full output it uses.
+                if out < sending[i] - 1e-7 {
+                    let blocked = (0..nj)
+                        .any(|j| turning[i][j] > 0.0 && q.iter().map(|row| row[j]).sum::<f64>() >= receiving[j] - 1e-7);
+                    assert!(blocked, "input {i} held back with no full output");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_exit_holds_the_whole_approach() {
+        // Input 0 splits evenly to a wide-open exit and a nearly full one; input 1 only uses
+        // the nearly full one. Exit 1 admits 6: shared by priority (equal), input 0 gets 4 in
+        // total, so only 2 reach the open exit although it could take 100 (FIFO).
+        let q = junction_flows(&[10.0, 10.0], &[1.0, 1.0], &[vec![1.0, 1.0], vec![0.0, 1.0]], &[100.0, 6.0]);
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        assert!(near(q[0][0], 2.0) && near(q[0][1], 2.0) && near(q[1][0], 0.0) && near(q[1][1], 4.0), "{q:?}");
+        // With room everywhere, everything flows.
+        let q = junction_flows(&[10.0, 10.0], &[1.0, 1.0], &[vec![1.0, 1.0], vec![0.0, 1.0]], &[100.0, 100.0]);
+        assert!(near(q[0][0], 5.0) && near(q[0][1], 5.0) && near(q[1][1], 10.0));
+        // A higher-priority input gets the larger share of a contested exit.
+        let q = junction_flows(&[10.0, 10.0], &[3.0, 1.0], &[vec![1.0], vec![1.0]], &[8.0]);
+        assert!(near(q[0][0], 6.0) && near(q[1][0], 2.0));
+    }
+
+    #[test]
+    fn graph_network_routes_and_conserves() {
+        // A two-way street 0–1–2 (dead end at 2) and a one-way feeder 3 → 1.
+        let d = FundamentalDiagram::URBAN;
+        let e = |from, to, reverse| GraphEdge { from, to, length_m: 300.0, lanes: 1, diagram: d, reverse };
+        let edges = vec![e(0, 1, Some(1)), e(1, 0, Some(0)), e(1, 2, Some(3)), e(2, 1, Some(2)), e(3, 1, None)];
+        let g = build_network(4, &edges, 1.0).unwrap();
+        // Node 0: entered by 1→0 and left by 0→1 → a junction (with the U-turn as its only way on).
+        // Node 1: a three-in / two-out intersection. Node 2: dead end, U-turn junction. Node 3: source.
+        assert_eq!((g.junctions, g.sources.len(), g.sinks.len(), g.short_links), (3, 1, 0, 0));
+        let at1 = g.network.nodes().iter().find_map(|n| match n {
+            Node::Junction { from, to, turning } if from.len() == 3 => {
+                Some((from.clone(), to.clone(), turning.clone()))
+            }
+            _ => None,
+        });
+        let (from, to, turning) = at1.unwrap();
+        for (row, (input, _)) in turning.iter().zip(&from) {
+            for (b, out) in row.iter().zip(&to) {
+                if edges[*input].reverse == Some(*out) {
+                    assert_eq!(*b, 0.0, "U-turn {input} → {out} allowed at a through node");
+                }
+            }
+        }
+        // Feed 0.2 veh/s at the source for ten minutes: nothing leaves (no sinks), so every
+        // vehicle that entered is on the network, and no cell ever exceeds jam.
+        let mut g = g;
+        g.network.set_rate(g.sources[0].0, 0.2);
+        let (mut entered, mut exited) = (0.0, 0.0);
+        for _ in 0..600 {
+            let flows = g.network.step();
+            entered += flows[g.sources[0].1].entered;
+            exited += g.sinks.iter().map(|&(_, l)| flows[l].exited).sum::<f64>();
+            for l in g.network.links() {
+                assert!(l.vehicles().iter().all(|&v| v >= -1e-9 && v <= l.jam_capacity() + 1e-9));
+            }
+        }
+        assert!((entered - 0.2 * 600.0).abs() < 1e-6, "{entered}");
+        assert!((entered - exited - g.network.total_vehicles()).abs() < 1e-6);
+        assert!(g.network.links()[0].total_vehicles() > 0.0, "traffic reached the far street");
+        // Malformed input is refused.
+        assert_eq!(build_network(2, &[e(0, 5, None)], 1.0), Err(BuildError::UnknownNode(0)));
+        let mut bad = e(0, 1, None);
+        bad.length_m = 0.0;
+        assert_eq!(build_network(2, &[bad], 1.0), Err(BuildError::BadEdge(0)));
+    }
+
+    #[test]
+    fn links_shorter_than_one_step_conserve_and_stay_bounded() {
+        // 5 m at 30 m/s with Δt = 1 s: six cells' worth of free-flow travel per step. Before the
+        // advance was capped, a full cell sent six times its content and the clamp at zero
+        // created vehicles.
+        let mut l = Link::new(FundamentalDiagram::MOTORWAY, 2, 5.0, 1.0).unwrap();
+        assert_eq!(l.cell_count(), 1);
+        let jam = l.jam_capacity();
+        let (mut total_in, mut total_out) = (0.0, 0.0);
+        for step in 0..200 {
+            // Alternate a hard push and a blocked exit, then a free exit.
+            let supply = if step % 20 < 10 { 0.0 } else { f64::INFINITY };
+            let f = l.step(5.0, supply);
+            total_in += f.entered;
+            total_out += f.exited;
+            let n = l.total_vehicles();
+            assert!((0.0..=jam + 1e-12).contains(&n), "{n} outside [0, {jam}]");
+            assert!(f.exited <= n + f.exited - f.entered + 1e-12);
+        }
+        assert!((total_in - total_out - l.total_vehicles()).abs() < 1e-9);
+        assert!(total_out > 0.0);
     }
 }

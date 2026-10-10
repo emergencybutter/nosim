@@ -2,7 +2,9 @@
 
 use std::process::ExitCode;
 
-use nosim_compiler::{Command, USAGE, parse_args, run_arinc, run_osm, run_raster, run_tiles, run_validate, validate};
+use nosim_compiler::{
+    Command, USAGE, parse_args, run_arinc, run_graph, run_osm, run_raster, run_tiles, run_validate, validate,
+};
 
 fn main() -> ExitCode {
     let command = match parse_args(std::env::args().skip(1)) {
@@ -26,6 +28,52 @@ fn main() -> ExitCode {
             }
             if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
+        Command::Graph(args) => match run_graph(&args) {
+            Ok((_, s, sim)) => {
+                println!(
+                    "{}: {} spline(s) used ({} other class, {} closed to motor vehicles) → {} segment(s)",
+                    args.input.display(),
+                    s.splines_used,
+                    s.splines_other,
+                    s.splines_no_access,
+                    s.segments
+                );
+                println!(
+                    "{}: {} node(s), {} directed edge(s), {} boundary node(s); {} strongly connected component(s), the largest with {} node(s){}",
+                    args.output.display(),
+                    s.nodes,
+                    s.edges,
+                    s.boundary_nodes,
+                    s.components,
+                    s.largest_component_nodes,
+                    if args.largest_component { " (kept alone)" } else { "" }
+                );
+                if let Some(m) = sim {
+                    println!(
+                        "CTM {} s at Δt {} s: {} source(s), {} sink(s), {} junction(s), {} link(s) shorter than one step; \
+                         {:.1} veh entered, {:.1} exited, {:.1} on the network (conservation error {:.2e}); \
+                         peak density {:.0}% of jam, mean speed {:.0}% of free flow",
+                        m.steps as f64 * args.dt_s,
+                        args.dt_s,
+                        m.sources,
+                        m.sinks,
+                        m.junctions,
+                        m.short_links,
+                        m.entered,
+                        m.exited,
+                        m.on_network,
+                        m.conservation_error,
+                        100.0 * m.peak_density_ratio,
+                        100.0 * m.speed_ratio
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Command::Osm(args) => match run_osm(&args) {
             Ok((_, s)) => {
                 println!(
