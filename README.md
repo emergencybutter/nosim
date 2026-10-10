@@ -89,7 +89,7 @@ tools/           ephem_tables.py: reference evaluator + generator for the epheme
                  make_osm_fixture.py: writes the OSM fixtures through libosmium (pyosmium);
                  check_osm_extract.py: cross-checks `osm` output against libosmium;
                  check_road_graph.py: cross-checks `graph` output against networkx
-docs/            Architecture specification
+docs/            Architecture specification; roadmap of the next milestones
 ```
 
 Each module carries its tests inline (`#[cfg(test)]`). Dependencies: `serde` and
@@ -158,6 +158,8 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §8 LOD band policy, parent-frame selection | Implemented |
 | C ABI for the UE5 client | Implemented: every module above is reachable from C; proven by a compiled C smoke test |
 | §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler; raster processor; OSM ingestion) | Implemented for runways, packages, GeoParquet → MVT tiling with Morton ordering, geographic DEM → Terrain-RGB / normal maps / quantized mesh, and OSM PBF roads and aeroways → spline GeoParquet, matched way for way against libosmium on the New York extract; OSM buildings, water and land use, relations (turn restrictions, multipolygons), FlatGeobuf, H3, 3D Tiles, projected-CRS DEMs, BigTIFF and imagery / land-cover rasters not started |
+
+What comes next, milestone by milestone, is in [docs/roadmap.md](docs/roadmap.md).
 
 Anything that needs Unreal (Nanite, PCG, virtual heightfield, decals, raymarcher) lives in
 the client project and is out of scope here.
