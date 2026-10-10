@@ -8,6 +8,7 @@
 //! | `mesh/z/x/y.terrain` + `layer.json` | TMS geographic | Cesium quantized-mesh 1.0 with vertex normals |
 
 pub mod geotiff;
+pub mod patch;
 pub mod png;
 pub mod quantized_mesh;
 pub mod terrain_rgb;
@@ -23,6 +24,18 @@ use crate::tiler::TileId;
 use geotiff::Dem;
 use quantized_mesh::GeoTile;
 use terrain_rgb::TileHeights;
+
+/// Anything terrain can be sampled from: a DEM, or a DEM with constraints applied.
+pub trait HeightField: Sync {
+    /// Height in metres at a longitude / latitude, `None` where there is no data.
+    fn sample(&self, lon: f64, lat: f64) -> Option<f32>;
+}
+
+impl HeightField for Dem {
+    fn sample(&self, lon: f64, lat: f64) -> Option<f32> {
+        Dem::sample(self, lon, lat)
+    }
+}
 
 /// Which body the DEM describes; sets the reference surface for body-fixed coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,6 +181,17 @@ pub fn mercator_tiles(bounds: (f64, f64, f64, f64), z: u8) -> Vec<TileId> {
 
 /// Runs the processor, writing under `out`.
 pub fn process(dem: &Dem, out: &Path, opts: &RasterOptions) -> Result<RasterSummary, CompileError> {
+    process_field(dem, dem, out, opts)
+}
+
+/// Like [`process`], but samples heights from `field` (for example a [`patch::PatchedDem`])
+/// while taking bounds and statistics from `dem`.
+pub fn process_field(
+    dem: &Dem,
+    field: &dyn HeightField,
+    out: &Path,
+    opts: &RasterOptions,
+) -> Result<RasterSummary, CompileError> {
     if opts.min_zoom > opts.max_zoom || opts.max_zoom > 24 {
         return Err(CompileError::Usage("zoom range must satisfy min ≤ max ≤ 24".into()));
     }
@@ -192,7 +216,7 @@ pub fn process(dem: &Dem, out: &Path, opts: &RasterOptions) -> Result<RasterSumm
     if opts.terrain_rgb || opts.normals {
         let tiles: Vec<TileId> = (opts.min_zoom..=opts.max_zoom).flat_map(|z| mercator_tiles(bounds, z)).collect();
         let written = parallel_map(&tiles, threads, |&tile| {
-            let heights = TileHeights::sample(dem, tile, opts.tile_size, opts.body);
+            let heights = TileHeights::sample(field, tile, opts.tile_size, opts.body);
             if heights.covered == 0 {
                 return Ok(false);
             }
@@ -243,7 +267,7 @@ pub fn process(dem: &Dem, out: &Path, opts: &RasterOptions) -> Result<RasterSumm
                 let lat = s + (n - s) * j as f64 / (g - 1) as f64;
                 for i in 0..g {
                     let lon = w + (e - w) * i as f64 / (g - 1) as f64;
-                    let h = dem.sample(lon, lat);
+                    let h = field.sample(lon, lat);
                     covered += usize::from(h.is_some());
                     grid.push(h);
                 }

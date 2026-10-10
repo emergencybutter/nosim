@@ -111,7 +111,20 @@ fn main() -> ExitCode {
             }
         },
         Command::Raster(args) => match run_raster(&args) {
-            Ok((storage, s)) => {
+            Ok((storage, s, patch)) => {
+                if let Some(p) = &patch {
+                    println!(
+                        "patch: {} runway pavement(s), {} road(s) ({} skipped: bridges, tunnels, other layers or off the DEM), {} strip(s){}",
+                        p.runways,
+                        p.roads,
+                        p.roads_skipped,
+                        p.strips,
+                        args.patch
+                            .patched_dem
+                            .as_ref()
+                            .map_or(String::new(), |d| format!("; patched DEM written to {}", d.display()))
+                    );
+                }
                 println!(
                     "{}: DEM {}×{} ({} no-data pixel(s); compression {}, predictor {}, sample format {} / {} bits, {}), bounds {:.5} {:.5} {:.5} {:.5}",
                     args.input.display(),

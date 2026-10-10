@@ -308,8 +308,10 @@ fn cli() {
         input: fixture("kjfk_i16_lzw_strips.tif"),
         output: out.clone(),
         options: RasterOptions { min_zoom: 11, max_zoom: 11, mesh_grid: 17, ..RasterOptions::default() },
+        patch: Default::default(),
     };
-    let (storage, s) = run_raster(&args).unwrap();
+    let (storage, s, patch) = run_raster(&args).unwrap();
+    assert!(patch.is_none());
     assert_eq!(storage.compression, 5);
     assert!(s.terrain_rgb_tiles >= 1 && s.mesh_tiles >= 1);
     assert!(out.join("normals/metadata.json").is_file());

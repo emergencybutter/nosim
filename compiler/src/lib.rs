@@ -235,6 +235,28 @@ pub struct RasterArgs {
     pub output: PathBuf,
     /// Processing parameters.
     pub options: raster::RasterOptions,
+    /// Terrain patching inputs; all `None` processes the DEM as it is.
+    pub patch: PatchInputs,
+}
+
+/// Where the runway and road constraints for terrain patching come from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PatchInputs {
+    /// An ARINC runway table (as written by `arinc`).
+    pub runways: Option<PathBuf>,
+    /// A spline table (as written by `osm`); its road rows are used.
+    pub roads: Option<PathBuf>,
+    /// A §3 package whose `arinc_overrides` and `spline_networks` supply both.
+    pub package: Option<PathBuf>,
+    /// Also write the patched DEM here, at the input DEM's resolution.
+    pub patched_dem: Option<PathBuf>,
+}
+
+impl PatchInputs {
+    /// Whether any constraint source was given.
+    pub fn any(&self) -> bool {
+        self.runways.is_some() || self.roads.is_some() || self.package.is_some()
+    }
 }
 
 /// `tiles` subcommand options.
@@ -252,7 +274,7 @@ pub struct TilesArgs {
 pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runways.parquet> [--packages <dir>] [--airport <ICAO>]\n\
                          world-compiler validate [--strict] [--json] <package-or-directory>...\n\
                          world-compiler tiles --input <features.parquet> --output <dir> [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]\n\
-                         world-compiler raster --input <dem.tif> --output <dir> [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]\n\
+                         world-compiler raster --input <dem.tif> --output <dir> [--patch-runways <runways.parquet>] [--patch-roads <splines.geoparquet>] [--package <dir>] [--patched-dem <out.tif>] [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]\n\
                          world-compiler osm --input <extract.osm.pbf> --output <splines.geoparquet> [--bbox <west,south,east,north>] [--threads <n>]\n\
                          world-compiler graph --input <splines.geoparquet> --output <dir> [--mode drive|taxi] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>]]";
 
@@ -371,10 +393,15 @@ pub fn run_tiles(args: &TilesArgs) -> Result<(tiler::source::SourceSummary, tile
 fn parse_raster<I: Iterator<Item = String>>(mut it: I) -> Result<RasterArgs, CompileError> {
     let (mut input, mut output) = (None, None);
     let mut options = raster::RasterOptions::default();
+    let mut patch = PatchInputs::default();
     let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
     while let Some(flag) = it.next() {
         let value = it.next().ok_or_else(|| CompileError::Usage(format!("{flag} needs a value\n{USAGE}")))?;
         match flag.as_str() {
+            "--patch-runways" => patch.runways = Some(PathBuf::from(value)),
+            "--patch-roads" => patch.roads = Some(PathBuf::from(value)),
+            "--package" => patch.package = Some(PathBuf::from(value)),
+            "--patched-dem" => patch.patched_dem = Some(PathBuf::from(value)),
             "--input" => input = Some(PathBuf::from(value)),
             "--output" => output = Some(PathBuf::from(value)),
             "--body" => options.body = raster::Body::parse(&value).ok_or_else(|| bad(&flag, &value))?,
@@ -408,19 +435,51 @@ fn parse_raster<I: Iterator<Item = String>>(mut it: I) -> Result<RasterArgs, Com
     {
         return Err(CompileError::Usage(format!("tile size > 0, 2 ≤ mesh grid ≤ 1025, mesh error ≥ 0\n{USAGE}")));
     }
+    if patch.patched_dem.is_some() && !patch.any() {
+        return Err(CompileError::Usage(format!(
+            "--patched-dem needs --patch-runways, --patch-roads or --package\n{USAGE}"
+        )));
+    }
     Ok(RasterArgs {
         input: input.ok_or_else(|| CompileError::Usage(format!("--input is required\n{USAGE}")))?,
         output: output.ok_or_else(|| CompileError::Usage(format!("--output is required\n{USAGE}")))?,
         options,
+        patch,
     })
 }
 
 /// Runs `raster`: loads the DEM and writes every requested pyramid under the output
 /// directory; returns the loaded DEM's storage details and the run summary.
-pub fn run_raster(args: &RasterArgs) -> Result<(raster::geotiff::Storage, raster::RasterSummary), CompileError> {
+pub fn run_raster(
+    args: &RasterArgs,
+) -> Result<(raster::geotiff::Storage, raster::RasterSummary, Option<raster::patch::PatchSummary>), CompileError> {
     let dem = raster::geotiff::Dem::load(&args.input)?;
-    let summary = raster::process(&dem, &args.output, &args.options)?;
-    Ok((dem.storage, summary))
+    if !args.patch.any() {
+        let summary = raster::process(&dem, &args.output, &args.options)?;
+        return Ok((dem.storage, summary, None));
+    }
+    let (mut runways, mut roads) = (Vec::new(), Vec::new());
+    if let Some(dir) = &args.patch.package {
+        let package = Package::load(dir).map_err(|e| CompileError::Package(format!("{}: {e}", dir.display())))?;
+        if let Some(p) = package.content_path(ContentKind::ArincOverrides) {
+            runways.extend(geoparquet::read_runways(&p)?);
+        }
+        if let Some(p) = package.content_path(ContentKind::SplineNetworks) {
+            roads.extend(osm::read_splines(&p)?);
+        }
+    }
+    if let Some(p) = &args.patch.runways {
+        runways.extend(geoparquet::read_runways(p)?);
+    }
+    if let Some(p) = &args.patch.roads {
+        roads.extend(osm::read_splines(p)?);
+    }
+    let patched = raster::patch::PatchedDem::new(&dem, &runways, &roads);
+    if let Some(p) = &args.patch.patched_dem {
+        raster::geotiff::write_f32(p, &patched.to_dem())?;
+    }
+    let summary = raster::process_field(&dem, &patched, &args.output, &args.options)?;
+    Ok((dem.storage.clone(), summary, Some(patched.summary.clone())))
 }
 
 fn parse_osm<I: Iterator<Item = String>>(mut it: I) -> Result<OsmArgs, CompileError> {

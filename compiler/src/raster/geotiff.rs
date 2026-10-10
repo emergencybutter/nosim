@@ -327,6 +327,90 @@ impl Dem {
     }
 }
 
+/// No-data value written by [`write_f32`].
+pub const WRITE_NODATA: f32 = -9999.0;
+
+/// Writes a DEM as a little-endian, uncompressed, single-strip float32 GeoTIFF in a
+/// geographic CRS (PixelIsArea), with `NaN` written as [`WRITE_NODATA`] and declared in
+/// `GDAL_NODATA`. Axis-aligned transforms use ModelPixelScale and ModelTiepoint; others use
+/// ModelTransformation.
+pub fn write_f32(path: &Path, dem: &Dem) -> Result<(), CompileError> {
+    let (w, h) = (dem.width as u32, dem.height as u32);
+    let t = dem.transform;
+    let mut tags: Vec<(u16, u16, Vec<u8>, u32)> = Vec::new(); // tag, type, payload, count
+    let shorts = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    let longs = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    let doubles = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    let data_len = w * h * 4;
+    tags.push((256, 4, longs(&[w]), 1));
+    tags.push((257, 4, longs(&[h]), 1));
+    tags.push((258, 3, shorts(&[32]), 1));
+    tags.push((259, 3, shorts(&[1]), 1));
+    tags.push((262, 3, shorts(&[1]), 1));
+    tags.push((273, 4, longs(&[0]), 1)); // strip offset, patched below
+    tags.push((277, 3, shorts(&[1]), 1));
+    tags.push((278, 4, longs(&[h]), 1));
+    tags.push((279, 4, longs(&[data_len]), 1));
+    tags.push((284, 3, shorts(&[1]), 1));
+    tags.push((339, 3, shorts(&[3]), 1));
+    if t[2] == 0.0 && t[4] == 0.0 && t[1] > 0.0 && t[5] < 0.0 {
+        tags.push((33550, 12, doubles(&[t[1], -t[5], 0.0]), 3));
+        tags.push((33922, 12, doubles(&[0.0, 0.0, 0.0, t[0], t[3], 0.0]), 6));
+    } else {
+        let m = [t[1], t[2], 0.0, t[0], t[4], t[5], 0.0, t[3], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        tags.push((34264, 12, doubles(&m), 16));
+    }
+    let geokeys = [1u16, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, dem.crs.unwrap_or(4326)];
+    tags.push((34735, 3, shorts(&geokeys), geokeys.len() as u32));
+    let nodata = format!("{}\0", WRITE_NODATA);
+    tags.push((42113, 2, nodata.as_bytes().to_vec(), nodata.len() as u32));
+    tags.sort_by_key(|t| t.0);
+
+    let ifd_len = 2 + tags.len() * 12 + 4;
+    let mut extra: Vec<u8> = Vec::new();
+    let extra_base = 8 + ifd_len;
+    let mut entries: Vec<u8> = Vec::new();
+    // Payloads over 4 bytes go after the IFD, then the pixel data.
+    let mut offsets = Vec::new();
+    for (_, _, payload, _) in &tags {
+        if payload.len() > 4 {
+            offsets.push(Some(extra_base + extra.len()));
+            extra.extend_from_slice(payload);
+            if extra.len() % 2 == 1 {
+                extra.push(0);
+            }
+        } else {
+            offsets.push(None);
+        }
+    }
+    let data_offset = (extra_base + extra.len()) as u32;
+    for ((tag, typ, payload, count), off) in tags.iter().zip(&offsets) {
+        entries.extend_from_slice(&tag.to_le_bytes());
+        entries.extend_from_slice(&typ.to_le_bytes());
+        entries.extend_from_slice(&count.to_le_bytes());
+        match off {
+            Some(o) => entries.extend_from_slice(&(*o as u32).to_le_bytes()),
+            None if *tag == 273 => entries.extend_from_slice(&data_offset.to_le_bytes()),
+            None => {
+                let mut v = payload.clone();
+                v.resize(4, 0);
+                entries.extend_from_slice(&v);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(data_offset as usize + data_len as usize);
+    out.extend_from_slice(b"II\x2a\x00");
+    out.extend_from_slice(&8u32.to_le_bytes());
+    out.extend_from_slice(&(tags.len() as u16).to_le_bytes());
+    out.extend_from_slice(&entries);
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&extra);
+    for &v in &dem.heights {
+        out.extend_from_slice(&(if v.is_finite() { v } else { WRITE_NODATA }).to_le_bytes());
+    }
+    std::fs::write(path, out).map_err(|e| CompileError::Io(path.to_path_buf(), e))
+}
+
 struct Georef {
     transform: [f64; 6],
     crs: Option<u16>,
@@ -689,5 +773,35 @@ mod tests {
     fn rejects_non_tiff() {
         assert!(matches!(Dem::parse(b"PNG\r\n"), Err(TiffError::NotTiff(_))));
         assert!(matches!(Dem::parse(b"II\x2b\x00"), Err(TiffError::Unsupported(_))));
+    }
+
+    #[test]
+    fn writer_round_trips() {
+        let dem = Dem {
+            width: 3,
+            height: 2,
+            heights: vec![1.0, 2.5, f32::NAN, -4.0, 1e3, 7.25],
+            transform: [-74.0, 0.01, 0.0, 41.0, 0.0, -0.01],
+            crs: Some(4326),
+            pixel_is_point: false,
+            nodata: None,
+            storage: Storage {
+                compression: 1,
+                predictor: 1,
+                sample_format: 3,
+                bits: 32,
+                tiled: false,
+                big_endian: false,
+            },
+        };
+        let path = std::env::temp_dir().join(format!("nosim-geotiff-{}.tif", std::process::id()));
+        write_f32(&path, &dem).unwrap();
+        let back = Dem::load(&path).unwrap();
+        assert_eq!((back.width, back.height, back.transform, back.crs), (3, 2, dem.transform, Some(4326)));
+        assert_eq!(back.nodata, Some(f64::from(WRITE_NODATA)));
+        for (a, b) in back.heights.iter().zip(&dem.heights) {
+            assert!(a == b || (a.is_nan() && b.is_nan()), "{a} vs {b}");
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -64,7 +64,8 @@ compiler/
   src/raster/    Raster Processor: GeoTIFF DEM reader with LZW / DEFLATE and predictors
                  (geotiff.rs), Terrain-RGB and normal-map tiles (terrain_rgb.rs), PNG
                  writer / reader (png.rs), greedy Delaunay TIN with gap filling (tin.rs),
-                 Cesium quantized-mesh encoder / decoder (quantized_mesh.rs)
+                 Cesium quantized-mesh encoder / decoder (quantized_mesh.rs), runway and
+                 road heightfield patching (patch.rs), float32 GeoTIFF writer
   src/osm/       OpenStreetMap PBF reader: blobs, zlib, dense and plain nodes, ways (pbf.rs);
                  road and aeroway extraction with tag normalisation, spline GeoParquet (mod.rs)
   src/graph.rs   Road graph: splines split at shared nodes into directed edges, strongly
@@ -74,7 +75,8 @@ compiler/
                  run_tiles / run_raster / run_osm / run_graph
   tests/         The Phase 2 pipeline end to end, including the §3 override loop; the tiler
                  from the KJFK runway table to decoded tiles on disk; the raster processor
-                 from three GeoTIFF encodings to decoded PNG and mesh tiles; OSM extraction
+                 from three GeoTIFF encodings to decoded PNG and mesh tiles; terrain patching
+                 under the KJFK package's runways and roads; OSM extraction
                  from two libosmium encodings to the package's spline table; the road graph
                  from that fixture to open and closed CTM runs
 fixtures/        The spec's KJFK example package (scenery tests) — its arinc_runways.parquet
@@ -120,6 +122,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | Phase 2 end to end — CIFP text → eight paired KJFK runway ends → GeoParquet with `geo` metadata → read back identical; RW31L centreline 14,511 ft ± 1 ft; true heading = magnetic + variation; a scenery package's `arinc_overrides` replaces the authoritative rows for its airport | `compiler/tests/pipeline.rs` |
 | §1 vector tiler — KJFK reference point lands in XYZ tile 302/385 at z 10 and 4834/6164 at z 14; the runway GeoParquet tiles into a single z 10 tile holding all eight ends, every deeper tile descends from it, a runway straddling a tile edge appears clipped in both, and the `z/x/y.pbf` files decode as MVT v2 with the attributes intact; Morton keys interleave bits so a tile's four children are consecutive | `tiler::tile_addressing`, `tiler::morton_keys`, `mvt::encode_then_decode_round_trip`, `compiler/tests/tiles.rs` |
 | §1 raster processor — three GeoTIFFs of one analytic surface (float32 DEFLATE tiled with float predictor and a no-data hole; big-endian int16 LZW strips with horizontal predictor and PixelIsPoint; uncompressed uint16 with a ModelTransformation) all decode to that surface; Terrain-RGB tiles decode within 0.05 m of the DEM and 1 m of the surface; normal-map tiles match the analytic gradient within 3°; quantized-mesh tiles stay within the TIN tolerance, wind counter-clockwise, list their edge vertices, and carry outward normals; a lunar DEM is placed on the 1737.4 km sphere. The fixtures were also decoded independently by libtiff (Pillow) when generated | `compiler/tests/raster.rs`, `raster::tin`, `raster::quantized_mesh`, `raster::png`, `raster::geotiff` |
+| Phase 2.2 heightfield patching — RW31L's centreline follows its grade line within 1 mm over a DEM 50–300 m high, and is the mean of both planes where it crosses another runway; the edge blends exactly by the §5 smoothstep across 60 m; terrain beyond the margin is untouched; roads are level across and continuous along, bridges stay on the terrain; Terrain-RGB, quantized-mesh vertices and the written GeoTIFF all carry the patch; the package route and the explicit route give identical output | `compiler/tests/patch.rs` |
 | §1 OSM ingestion — dense-node zlib and plain-node uncompressed PBFs written by libosmium decode to identical splines; taxiway A lies 180 m ± 2 m off the 04L/22R centreline over the runway's length; mph, knots, km/h and non-numeric `maxspeed` normalise to m/s with provenance; implied, explicit and reversed one-way; lanes, width in feet, bridge, tunnel and layer; areas, construction and buildings skipped; a way cut by a missing node splits into two rows; the package's spline table passes the validator, a tampered length fails it, and the tiler reads it as lines; a vehicle at the posted speed has zero IDM free-road acceleration | `compiler/tests/osm.rs`, `osm::pbf`, `osm` |
 | §8A — VSOP87D Earth reproduces IMCCE's own `vsop87.chk` values to 10 decimals (1700–2000) | `ephem::vsop87d_matches_imcce_check_values` |
 | §8A — ELP82B Moon matches JPL Horizons (DE441) J2000 ecliptic vectors to 0.35 km in 1969–2000, 1.2 km by 2047 | `ephem::elp82b_matches_jpl_horizons` |
@@ -147,7 +150,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 |---|---|
 | §2 Coordinate hierarchy, ENU, floating origin | Implemented |
 | §3 Package manifest, validator, exclusion masks, mount table | Implemented; reading the referenced GeoParquet / glTF payloads is the consumer's job |
-| §4 ARINC 424 decode, extrusion, grade fit, markings data | Implemented; heightfield patching is engine-side |
+| §4 ARINC 424 decode, extrusion, grade fit, markings data, heightfield patching | Implemented; patching is baked into the terrain tiles and an optional patched DEM; decals and the runtime virtual heightfield are engine-side |
 | §5 Seed hash, Poisson levels, pier spacing, flatten falloff | Implemented; WFC/PCG graphs and bridge detection are engine-side |
 | §6 Calendar, declination, lapse rate, phenology, snow mask | Implemented; GPU buffer plumbing is engine-side |
 | §7 IDM, MOBIL, VAT addressing, CTM far-field with general junctions and near-field handoff, road graph from OSM, ORCA crowds | Implemented; turning fractions are capacity-proportional (no turn counts or routing yet); the ECS and the pedestrian navigation graph that feeds ORCA its preferred velocities are engine-side |
@@ -297,7 +300,7 @@ The real data is not committed: OpenStreetMap data is licensed under the ODbL, s
 package fixture stays synthetic.
 
 ```sh
-cargo run -p nosim-compiler --release -- raster --input dem.tif --output terrain/ [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]
+cargo run -p nosim-compiler --release -- raster --input dem.tif --output terrain/ [--patch-runways <runways.parquet>] [--patch-roads <splines.geoparquet>] [--package <dir>] [--patched-dem <out.tif>] [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]
 ```
 
 `raster` is the §1 Raster Processor. It reads a single-band GeoTIFF DEM in a geographic
@@ -320,6 +323,30 @@ grids. Projected rasters, BigTIFF and JPEG / ZSTD / WebP compression are refused
 message rather than misread; reproject to geographic coordinates with GDAL first.
 Tiles are spread over every core by default (`--threads` overrides); the files written
 are byte-identical whatever the thread count.
+
+**Terrain patching** (§4 spline deformation, §10 Phase 2.2) writes runways and roads into
+the terrain before it is tiled. `--patch-runways` takes an `arinc` runway table,
+`--patch-roads` an `osm` spline table, and `--package` reads both from a §3 package's
+manifest. `--patched-dem` also writes the result at the DEM's resolution as float32 GeoTIFF.
+
+- **Runways** become a plane along the fitted centreline grade, level across, over the
+  pavement rectangle. Outside the edge they blend back to the DEM across the spec's 60 m
+  margin with the §5 smoothstep.
+- **Roads** have no elevation in OSM. Their corridors are made level across, at a profile
+  sampled from the DEM along the centreline and smoothed over ±25 m. The corridor is the
+  `width` tag, or 3.5 m per lane, or 2 m for paths. It blends out over 15 m. Bridges,
+  tunnels and roads on another layer are left alone.
+- **Overlaps.** Runways take precedence over roads. Where several runways cover a point, as
+  at a runway crossing, or several roads at an at-grade junction, their heights are
+  averaged.
+
+The constraints are analytic and evaluated wherever the tiles sample, so a 45 m runway on
+a 30 m DEM still comes out flat in a 3.6 m zoom-15 tile. On the GLO-30 KJFK tile, the raw
+surface sits 1 to 4 m off the runways' grade lines, and 9.8 m on RW31R, since GLO-30 is a
+surface model. After patching, the pavement pixels are on the grade line, except where
+RW31L crosses RW04L: there the surface is the mean of the two planes, 0.13 m from each.
+The real-data run patches 4 runways and 5,335 OSM roads, and costs 8% over unpatched
+tiling.
 
 Verified on real data with the Copernicus GLO-30 tile `N40_00_W074_00` (3600 × 3600
 float32, DEFLATE with the floating-point predictor, PixelIsPoint), which covers KJFK:

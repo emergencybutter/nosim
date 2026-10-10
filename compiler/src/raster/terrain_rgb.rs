@@ -4,7 +4,7 @@
 use crate::tiler::{TileId, tile_to_lonlat};
 
 use super::Body;
-use super::geotiff::Dem;
+use super::HeightField;
 use super::png;
 
 /// Terrain-RGB: `h = −10000 + (R·65536 + G·256 + B) · 0.1`.
@@ -34,7 +34,7 @@ pub struct TileHeights {
 
 impl TileHeights {
     /// Samples the DEM over a tile.
-    pub fn sample(dem: &Dem, tile: TileId, size: u32, body: Body) -> TileHeights {
+    pub fn sample(dem: &dyn HeightField, tile: TileId, size: u32, body: Body) -> TileHeights {
         let n = size as usize + 2;
         let mut samples = Vec::with_capacity(n * n);
         let mut metres_per_pixel = Vec::with_capacity(n);

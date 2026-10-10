@@ -20,7 +20,7 @@ Against the spec's verification blueprint (§10):
 | Phase | Done here | Open |
 |---|---|---|
 | 1 Coordinate & terrain spine | Floating origin, sub-millimetre check, quantized-mesh terrain | 3D Tiles streaming client (engine-side) |
-| 2 Aeronautical & spline layer | ARINC 424 parse, extrusion, grade fit, RW31L ± 1 ft, OSM splines, road graph | Terrain heightfield patching under runways and roads |
+| 2 Aeronautical & spline layer | ARINC 424 parse, extrusion, grade fit, RW31L ± 1 ft, OSM splines, road graph, heightfield patching (M1) | Complete on the compiler side |
 | 3 Procedural gaps & synthesis | Seed hash, Poisson levels, pier spacing, flatten falloff | OSM polygons, bridge detection, WorldCover masks |
 | 4 Environment & traffic | Calendar, phenology, IDM / MOBIL, CTM with general junctions, ORCA | Routing and demand, near-field vehicles on the graph, pedestrian navigation graph |
 | 5 Astronomy & translunar flight | VSOP87 / ELP 2000-82, BSC5, Hapke, LOD band policy | Translunar trajectory harness, atmosphere lookup tables |
@@ -52,10 +52,14 @@ Today the gate runs only on the machine that pushes.
 
 **Acceptance:** `main` is green, and a pull request that breaks any check is red.
 
-## M1 — Terrain heightfield patching (finishes Phase 2)
+## M1 — Terrain heightfield patching (finishes Phase 2) — done
 
-Runways and roads must sit on terrain that agrees with them. Today the quantized-mesh terrain
-comes straight from the DEM.
+Done as `raster --patch-runways / --patch-roads / --package / --patched-dem`; see the README
+for the behaviour and the GLO-30 results. The acceptance checks below hold, except that a
+runway crossing another runway is the mean of the two planes there, by design.
+
+Runways and roads must sit on terrain that agrees with them. Until M1 the quantized-mesh
+terrain came straight from the DEM.
 
 **Deliverables**
 - A `raster` option that burns a runway table into the DEM before tiling. Under each pavement
