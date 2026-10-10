@@ -60,20 +60,29 @@ compiler/
                  Sutherland–Hodgman / Liang–Barsky clipping (clip.rs), Douglas–Peucker
                  (simplify.rs), a Mapbox Vector Tile 2.1 encoder and decoder (mvt.rs),
                  GeoParquet feature source (source.rs)
-  src/lib.rs     Override application through the VFS; CLI parsing; run_arinc / run_validate / run_tiles
+  src/raster/    Raster Processor: GeoTIFF DEM reader with LZW / DEFLATE and predictors
+                 (geotiff.rs), Terrain-RGB and normal-map tiles (terrain_rgb.rs), PNG
+                 writer / reader (png.rs), greedy Delaunay TIN with gap filling (tin.rs),
+                 Cesium quantized-mesh encoder / decoder (quantized_mesh.rs)
+  src/lib.rs     Override application through the VFS; CLI parsing; run_arinc / run_validate /
+                 run_tiles / run_raster
   tests/         The Phase 2 pipeline end to end, including the §3 override loop; the tiler
-                 from the KJFK runway table to decoded tiles on disk
+                 from the KJFK runway table to decoded tiles on disk; the raster processor
+                 from three GeoTIFF encodings to decoded PNG and mesh tiles
 fixtures/        The spec's KJFK example package (scenery tests) — its arinc_runways.parquet
                  is a real table compiled from the CIFP sample, so the package overrides work
                  end to end; the BSC5 catalogue
-                 compiled to nosim's packed form plus a 22-line text excerpt (starfield tests)
+                 compiled to nosim's packed form plus a 22-line text excerpt (starfield tests);
+                 three synthetic GeoTIFF DEMs of one analytic surface (raster tests)
 examples/        compile_bsc5: turns the CDS catalogue text into the packed star buffer
-tools/           ephem_tables.py: reference evaluator + generator for the ephemeris tables
+tools/           ephem_tables.py: reference evaluator + generator for the ephemeris tables;
+                 make_dem_fixtures.py: writes the DEM fixtures (standard library only)
 docs/            Architecture specification
 ```
 
 Each module carries its tests inline (`#[cfg(test)]`). Dependencies: `serde` and
-`serde_json` for the manifest and GeoJSON formats; nothing else.
+`serde_json` for the manifest and GeoJSON formats; nothing else. The compiler adds
+`arrow` / `parquet` for GeoParquet and `flate2` for DEFLATE in GeoTIFF and PNG.
 
 ## Build and test
 
@@ -98,6 +107,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §3 — validator catches path traversal, bad bounds, open rings | `scenery::validator_rejects_unsafe_paths`, `geojson::closure_and_shape_auditing` |
 | Phase 2 end to end — CIFP text → eight paired KJFK runway ends → GeoParquet with `geo` metadata → read back identical; RW31L centreline 14,511 ft ± 1 ft; true heading = magnetic + variation; a scenery package's `arinc_overrides` replaces the authoritative rows for its airport | `compiler/tests/pipeline.rs` |
 | §1 vector tiler — KJFK reference point lands in XYZ tile 302/385 at z 10 and 4834/6164 at z 14; the runway GeoParquet tiles into a single z 10 tile holding all eight ends, every deeper tile descends from it, a runway straddling a tile edge appears clipped in both, and the `z/x/y.pbf` files decode as MVT v2 with the attributes intact; Morton keys interleave bits so a tile's four children are consecutive | `tiler::tile_addressing`, `tiler::morton_keys`, `mvt::encode_then_decode_round_trip`, `compiler/tests/tiles.rs` |
+| §1 raster processor — three GeoTIFFs of one analytic surface (float32 DEFLATE tiled with float predictor and a no-data hole; big-endian int16 LZW strips with horizontal predictor and PixelIsPoint; uncompressed uint16 with a ModelTransformation) all decode to that surface; Terrain-RGB tiles decode within 0.05 m of the DEM and 1 m of the surface; normal-map tiles match the analytic gradient within 3°; quantized-mesh tiles stay within the TIN tolerance, wind counter-clockwise, list their edge vertices, and carry outward normals; a lunar DEM is placed on the 1737.4 km sphere. The fixtures were also decoded independently by libtiff (Pillow) when generated | `compiler/tests/raster.rs`, `raster::tin`, `raster::quantized_mesh`, `raster::png`, `raster::geotiff` |
 | §8A — VSOP87D Earth reproduces IMCCE's own `vsop87.chk` values to 10 decimals (1700–2000) | `ephem::vsop87d_matches_imcce_check_values` |
 | §8A — ELP82B Moon matches JPL Horizons (DE441) J2000 ecliptic vectors to 0.35 km in 1969–2000, 1.2 km by 2047 | `ephem::elp82b_matches_jpl_horizons` |
 | §8A — apparent Sun / Moon RA–Dec, nutation, phase angle, illuminated fraction, optical libration against Meeus's worked examples | `ephem::apparent_sun_ra_dec`, `apparent_moon_ra_dec`, `obliquity_and_nutation`, `phase_and_illumination`, `libration` |
@@ -133,7 +143,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §8B/§8C Hapke BRDF, Chapman limb | Implemented as CPU reference for the shaders |
 | §8 LOD band policy, parent-frame selection | Implemented |
 | C ABI for the UE5 client | Implemented: every module above is reachable from C; proven by a compiled C smoke test |
-| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler) | Implemented for runways, packages and GeoParquet → MVT tiling with Morton ordering; OSM PBF / FlatGeobuf input, H3 indexing and raster processing not started |
+| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler; raster processor) | Implemented for runways, packages, GeoParquet → MVT tiling with Morton ordering, and geographic DEM → Terrain-RGB / normal maps / quantized mesh; OSM PBF / FlatGeobuf, H3, 3D Tiles, projected-CRS DEMs, BigTIFF and imagery / land-cover rasters not started |
 
 Anything that needs Unreal (Nanite, PCG, virtual heightfield, decals, raymarcher) lives in
 the client project and is out of scope here.
@@ -184,6 +194,29 @@ cargo run -p nosim-compiler --release -- validate [--strict] [--json] <package-o
 ```sh
 cargo run -p nosim-compiler --release -- tiles --input features.parquet --output tiles/ [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]
 ```
+
+```sh
+cargo run -p nosim-compiler --release -- raster --input dem.tif --output terrain/ [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--only terrain-rgb,normals,mesh]
+```
+
+`raster` is the §1 Raster Processor. It reads a single-band GeoTIFF DEM in a geographic
+CRS (classic TIFF in either byte order; strips or tiles; uncompressed, LZW or DEFLATE;
+horizontal or floating-point predictor; 8 to 64-bit integer or float samples; PixelIsArea
+or PixelIsPoint; GDAL no-data) and writes three pyramids:
+
+- `terrain-rgb/z/x/y.png` holds Web-Mercator tiles in the Mapbox Terrain-RGB encoding, a
+  height of −10000 + (R·65536 + G·256 + B) · 0.1 metres.
+- `normals/z/x/y.png` holds tangent-space normal maps on the same tiles, green pointing
+  north, computed from central differences with a one-pixel apron so tile edges match.
+- `mesh/z/x/y.terrain` plus `layer.json` holds Cesium quantized-mesh 1.0 tiles on the
+  geographic TMS grid with oct-encoded vertex normals. Each tile is sampled on a
+  `--mesh-grid` lattice, gaps are flooded outward from the data, and a greedy Delaunay
+  TIN inserts points until no sample is more than `--mesh-error` metres off.
+
+Heights are bilinear samples of the DEM; no-data neighbours drop out of the weighting
+so holes do not bleed. `--body moon` places meshes on the 1737.4 km lunar sphere for LOLA
+grids. Projected rasters, BigTIFF and JPEG / ZSTD / WebP compression are refused with a
+message rather than misread; reproject to geographic coordinates with GDAL first.
 
 `tiles` is the §1 Vector Tiler. It reads any GeoParquet file (the geometry column named by
 the `geo` metadata, WKB point / line / polygon and their multi forms; every scalar column

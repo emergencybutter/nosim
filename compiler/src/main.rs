@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use nosim_compiler::{Command, USAGE, parse_args, run_arinc, run_tiles, run_validate, validate};
+use nosim_compiler::{Command, USAGE, parse_args, run_arinc, run_raster, run_tiles, run_validate, validate};
 
 fn main() -> ExitCode {
     let command = match parse_args(std::env::args().skip(1)) {
@@ -26,6 +26,42 @@ fn main() -> ExitCode {
             }
             if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
+        Command::Raster(args) => match run_raster(&args) {
+            Ok((storage, s)) => {
+                println!(
+                    "{}: DEM {}×{} ({} no-data pixel(s); compression {}, predictor {}, sample format {} / {} bits, {}), bounds {:.5} {:.5} {:.5} {:.5}",
+                    args.input.display(),
+                    s.dem_size.0,
+                    s.dem_size.1,
+                    s.nodata_pixels,
+                    storage.compression,
+                    storage.predictor,
+                    storage.sample_format,
+                    storage.bits,
+                    if storage.tiled { "tiled" } else { "stripped" },
+                    s.bounds.0,
+                    s.bounds.1,
+                    s.bounds.2,
+                    s.bounds.3
+                );
+                println!(
+                    "{}: {} terrain-rgb tile(s), {} normal-map tile(s), {} mesh tile(s) with {} vertices / {} triangles (max error {:.3} m), {} empty tile(s) skipped",
+                    args.output.display(),
+                    s.terrain_rgb_tiles,
+                    s.normal_tiles,
+                    s.mesh_tiles,
+                    s.mesh_vertices,
+                    s.mesh_triangles,
+                    s.mesh_max_error_m,
+                    s.empty_tiles_skipped
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Command::Tiles(args) => match run_tiles(&args) {
             Ok((source, summary)) => {
                 println!(

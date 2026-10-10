@@ -29,7 +29,7 @@ This specification defines the architecture for a real-time world simulator that
  └── Kinematic Simulation Layer (IDM Multi-Lane Traffic, ORCA Pedestrian VAT)
 ```
 
-> **Implementation note (world-compiler).** The Vector Tiler is implemented as `world-compiler tiles`: GeoParquet in, Web-Mercator XYZ quadtree out as Mapbox Vector Tiles (`z/x/y.pbf`), written in Morton order. FlatGeobuf output, OSM PBF input and H3 indexing are not implemented; the Raster Processor is not started.
+> **Implementation note (world-compiler).** The Vector Tiler is implemented as `world-compiler tiles`: GeoParquet in, Web-Mercator XYZ quadtree out as Mapbox Vector Tiles (`z/x/y.pbf`), written in Morton order. FlatGeobuf output, OSM PBF input and H3 indexing are not implemented. The Raster Processor is implemented as `world-compiler raster`: a geographic GeoTIFF DEM in; Terrain-RGB and normal-map PNG pyramids (Web Mercator) and Cesium quantized-mesh terrain (geographic TMS, greedy Delaunay TIN, oct-encoded normals) out, for the Earth or the Moon. 3D Tiles output and imagery / land-cover rasters are not implemented.
 
 ## 2. Spatial Hierarchy & Coordinate Transformations
 

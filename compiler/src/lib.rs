@@ -7,6 +7,7 @@
 
 pub mod arinc;
 pub mod geoparquet;
+pub mod raster;
 pub mod tiler;
 pub mod validate;
 pub mod wkb;
@@ -74,6 +75,8 @@ pub enum CompileError {
     Package(String),
     /// Command-line usage.
     Usage(String),
+    /// Raster processing (GeoTIFF reading, tile encoding).
+    Raster(String),
 }
 
 impl fmt::Display for CompileError {
@@ -84,6 +87,7 @@ impl fmt::Display for CompileError {
             CompileError::Arrow(m) => write!(f, "arrow: {m}"),
             CompileError::Package(m) => write!(f, "package: {m}"),
             CompileError::Usage(m) => write!(f, "usage: {m}"),
+            CompileError::Raster(m) => write!(f, "raster: {m}"),
         }
     }
 }
@@ -175,6 +179,19 @@ pub enum Command {
     Validate(ValidateArgs),
     /// Cut vector tiles from a GeoParquet file.
     Tiles(TilesArgs),
+    /// Process a DEM into Terrain-RGB, normal-map and quantized-mesh tiles.
+    Raster(RasterArgs),
+}
+
+/// `raster` subcommand options.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RasterArgs {
+    /// GeoTIFF DEM to read.
+    pub input: PathBuf,
+    /// Directory to write the pyramids into.
+    pub output: PathBuf,
+    /// Processing parameters.
+    pub options: raster::RasterOptions,
 }
 
 /// `tiles` subcommand options.
@@ -191,7 +208,8 @@ pub struct TilesArgs {
 /// Usage text.
 pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runways.parquet> [--packages <dir>] [--airport <ICAO>]\n\
                          world-compiler validate [--strict] [--json] <package-or-directory>...\n\
-                         world-compiler tiles --input <features.parquet> --output <dir> [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]";
+                         world-compiler tiles --input <features.parquet> --output <dir> [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]\n\
+                         world-compiler raster --input <dem.tif> --output <dir> [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--only terrain-rgb,normals,mesh]";
 
 /// Parses the command line (everything after the program name).
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, CompileError> {
@@ -200,8 +218,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Co
         Some("arinc") => parse_arinc(it).map(Command::Arinc),
         Some("validate") => parse_validate(it).map(Command::Validate),
         Some("tiles") => parse_tiles(it).map(Command::Tiles),
+        Some("raster") => parse_raster(it).map(Command::Raster),
         other => Err(CompileError::Usage(format!(
-            "expected subcommand `arinc`, `validate` or `tiles`, got {other:?}\n{USAGE}"
+            "expected subcommand `arinc`, `validate`, `tiles` or `raster`, got {other:?}\n{USAGE}"
         ))),
     }
 }
@@ -300,4 +319,58 @@ pub fn run_tiles(args: &TilesArgs) -> Result<(tiler::source::SourceSummary, tile
     let bounds = tiler::features_bbox(&features);
     tiler::write_tiles(&args.output, &tiles, &args.options, bounds)?;
     Ok((source, summary))
+}
+
+fn parse_raster<I: Iterator<Item = String>>(mut it: I) -> Result<RasterArgs, CompileError> {
+    let (mut input, mut output) = (None, None);
+    let mut options = raster::RasterOptions::default();
+    let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
+    while let Some(flag) = it.next() {
+        let value = it.next().ok_or_else(|| CompileError::Usage(format!("{flag} needs a value\n{USAGE}")))?;
+        match flag.as_str() {
+            "--input" => input = Some(PathBuf::from(value)),
+            "--output" => output = Some(PathBuf::from(value)),
+            "--body" => options.body = raster::Body::parse(&value).ok_or_else(|| bad(&flag, &value))?,
+            "--min-zoom" => options.min_zoom = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--max-zoom" => options.max_zoom = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--tile-size" => options.tile_size = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--mesh-grid" => options.mesh_grid = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--mesh-error" => options.mesh_error_m = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--only" => {
+                (options.terrain_rgb, options.normals, options.mesh) = (false, false, false);
+                for part in value.split(',') {
+                    match part.trim() {
+                        "terrain-rgb" => options.terrain_rgb = true,
+                        "normals" => options.normals = true,
+                        "mesh" => options.mesh = true,
+                        _ => return Err(bad(&flag, &value)),
+                    }
+                }
+            }
+            _ => return Err(CompileError::Usage(format!("unknown flag {flag}\n{USAGE}"))),
+        }
+    }
+    if options.min_zoom > options.max_zoom || options.max_zoom > 24 {
+        return Err(CompileError::Usage(format!("zoom range must satisfy min ≤ max ≤ 24\n{USAGE}")));
+    }
+    if options.tile_size == 0
+        || !(2..=1025).contains(&options.mesh_grid)
+        || options.mesh_error_m.is_nan()
+        || options.mesh_error_m < 0.0
+    {
+        return Err(CompileError::Usage(format!("tile size > 0, 2 ≤ mesh grid ≤ 1025, mesh error ≥ 0\n{USAGE}")));
+    }
+    Ok(RasterArgs {
+        input: input.ok_or_else(|| CompileError::Usage(format!("--input is required\n{USAGE}")))?,
+        output: output.ok_or_else(|| CompileError::Usage(format!("--output is required\n{USAGE}")))?,
+        options,
+    })
+}
+
+/// Runs `raster`: loads the DEM and writes every requested pyramid under the output
+/// directory; returns the loaded DEM's storage details and the run summary.
+pub fn run_raster(args: &RasterArgs) -> Result<(raster::geotiff::Storage, raster::RasterSummary), CompileError> {
+    let dem = raster::geotiff::Dem::load(&args.input)?;
+    let summary = raster::process(&dem, &args.output, &args.options)?;
+    Ok((dem.storage, summary))
 }
