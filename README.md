@@ -108,7 +108,22 @@ cargo doc --no-deps --open
 cargo build -p nosim-ffi --release   # target/release/libnosim_ffi.{a,so,dylib,dll} + ffi/include/nosim.h
 ```
 
-Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
+The toolchain is pinned in `rust-toolchain.toml` (Rust 1.97.0 with rustfmt and clippy);
+rustup installs it on first use.
+
+The full gate, the same one CI runs on every push and pull request, is one script:
+
+```sh
+tools/ci.sh check                 # format, clippy, docs (warnings denied), all tests incl. the C smoke
+                                  # test, C header and fixture-table drift, command-line runs on fixtures
+tools/ci.sh real-data <cache-dir> # GLO-30 and BBBike New York, cross-checked against libtiff,
+                                  # libosmium and networkx (needs osmium, pyarrow, networkx, pillow)
+```
+
+`check` also fails if the committed C header or the KJFK package's runway and road tables
+differ from what the code now produces, so regenerate them when a change affects them. In
+GitHub Actions, `check` runs on every push and pull request. `real-data` runs nightly and on
+manual dispatch, with downloads cached for a week.
 
 ## What the tests prove
 

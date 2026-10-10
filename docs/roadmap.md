@@ -37,9 +37,13 @@ These held for every milestone so far and stay in force:
   every workspace test including the C smoke test, and a real command-line run.
 - No new dependency without a reason the standard library cannot meet.
 
-## M0 — Continuous integration
+## M0 — Continuous integration — done
 
-Today the gate runs only on the machine that pushes.
+Done as `.github/workflows/ci.yml` running `tools/ci.sh`, with the toolchain pinned in
+`rust-toolchain.toml`; see the README. `graph --simulate` now fails on a conservation error,
+so the real-data job checks traffic as well as readers.
+
+Until M0 the gate ran only on the machine that pushed.
 
 **Deliverables**
 - A GitHub Actions workflow on every push and pull request: format check, clippy with

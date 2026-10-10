@@ -48,6 +48,15 @@ fn main() -> ExitCode {
                     s.largest_component_nodes,
                     if args.largest_component { " (kept alone)" } else { "" }
                 );
+                if let Some(m) = &sim
+                    && m.conservation_error.abs() > 1e-6 * m.entered.max(1.0)
+                {
+                    eprintln!(
+                        "error: CTM conservation violated: {:.6} vehicles unaccounted for ({:.1} entered, {:.1} exited, {:.1} on the network)",
+                        m.conservation_error, m.entered, m.exited, m.on_network
+                    );
+                    return ExitCode::FAILURE;
+                }
                 if let Some(m) = sim {
                     println!(
                         "CTM {} s at Δt {} s: {} source(s), {} sink(s), {} junction(s), {} link(s) shorter than one step; \

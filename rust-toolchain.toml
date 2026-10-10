@@ -1,0 +1,5 @@
+# The toolchain the gate runs on, locally and in CI.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
