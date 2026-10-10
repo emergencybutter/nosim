@@ -10,6 +10,24 @@ set -euo pipefail
 
 say() { printf '\n==> %s\n' "$*"; }
 
+# fetch <dest> <url>...: download from the first URL that answers, failing fast on hosts that
+# refuse the connection.
+fetch() {
+    local dest="$1"
+    shift
+    for url in "$@"; do
+        echo "fetching $url"
+        if curl -sSfL --connect-timeout 20 --retry 2 --retry-delay 5 -o "$dest.part" "$url"; then
+            mv "$dest.part" "$dest"
+            return 0
+        fi
+        echo "  unreachable, trying the next source" >&2
+    done
+    rm -f "$dest.part"
+    echo "no source answered for $dest" >&2
+    return 1
+}
+
 check() {
     local tmp
     tmp="$(mktemp -d)"
@@ -63,11 +81,16 @@ real_data() {
     local dir="${1:?usage: tools/ci.sh real-data <cache-dir>}"
     mkdir -p "$dir"
     local glo="Copernicus_DSM_COG_10_N40_00_W074_00_DEM"
-    local dem="$dir/$glo.tif" pbf="$dir/NewYork.osm.pbf"
+    local dem="$dir/$glo.tif" pbf="$dir/new-york.osm.pbf"
 
     say "download (skipped when cached)"
-    [ -s "$dem" ] || curl -sSf --retry 3 -o "$dem" "https://copernicus-dem-30m.s3.amazonaws.com/$glo/$glo.tif"
-    [ -s "$pbf" ] || curl -sSf --retry 3 -o "$pbf" "https://download.bbbike.org/osm/bbbike/NewYork/NewYork.osm.pbf"
+    [ -s "$dem" ] || fetch "$dem" "https://copernicus-dem-30m.s3.amazonaws.com/$glo/$glo.tif"
+    # BBBike's New York City extract is small; some networks (GitHub's runners among them)
+    # cannot reach it, so Geofabrik's New York State extract, which contains it, is the
+    # fallback. The checks use only the KJFK bounding box, so either serves.
+    [ -s "$pbf" ] || fetch "$pbf" \
+        "https://download.bbbike.org/osm/bbbike/NewYork/NewYork.osm.pbf" \
+        "https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf"
 
     say "release builds"
     cargo build --release --locked -p nosim-compiler --bin world-compiler --example probe_dem

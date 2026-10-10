@@ -116,7 +116,7 @@ The full gate, the same one CI runs on every push and pull request, is one scrip
 ```sh
 tools/ci.sh check                 # format, clippy, docs (warnings denied), all tests incl. the C smoke
                                   # test, C header and fixture-table drift, command-line runs on fixtures
-tools/ci.sh real-data <cache-dir> # GLO-30 and BBBike New York, cross-checked against libtiff,
+tools/ci.sh real-data <cache-dir> # GLO-30 and New York OSM (BBBike, else Geofabrik), cross-checked against libtiff,
                                   # libosmium and networkx (needs osmium, pyarrow, networkx, pillow)
 ```
 
