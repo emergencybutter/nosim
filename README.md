@@ -82,7 +82,8 @@ fixtures/        The spec's KJFK example package (scenery tests) — its arinc_r
 examples/        compile_bsc5: turns the CDS catalogue text into the packed star buffer
 tools/           ephem_tables.py: reference evaluator + generator for the ephemeris tables;
                  make_dem_fixtures.py: writes the DEM fixtures (standard library only);
-                 make_osm_fixture.py: writes the OSM fixtures through libosmium (pyosmium)
+                 make_osm_fixture.py: writes the OSM fixtures through libosmium (pyosmium);
+                 check_osm_extract.py: cross-checks `osm` output against libosmium
 docs/            Architecture specification
 ```
 
@@ -150,7 +151,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §8B/§8C Hapke BRDF, Chapman limb | Implemented as CPU reference for the shaders |
 | §8 LOD band policy, parent-frame selection | Implemented |
 | C ABI for the UE5 client | Implemented: every module above is reachable from C; proven by a compiled C smoke test |
-| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler; raster processor; OSM ingestion) | Implemented for runways, packages, GeoParquet → MVT tiling with Morton ordering, geographic DEM → Terrain-RGB / normal maps / quantized mesh, and OSM PBF roads and aeroways → spline GeoParquet; not yet run on a real OSM extract (the session's network policy blocked the download hosts); OSM buildings, water and land use, relations (turn restrictions, multipolygons), FlatGeobuf, H3, 3D Tiles, projected-CRS DEMs, BigTIFF and imagery / land-cover rasters not started |
+| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler; raster processor; OSM ingestion) | Implemented for runways, packages, GeoParquet → MVT tiling with Morton ordering, geographic DEM → Terrain-RGB / normal maps / quantized mesh, and OSM PBF roads and aeroways → spline GeoParquet, matched way for way against libosmium on the New York extract; OSM buildings, water and land use, relations (turn restrictions, multipolygons), FlatGeobuf, H3, 3D Tiles, projected-CRS DEMs, BigTIFF and imagery / land-cover rasters not started |
 
 Anything that needs Unreal (Nanite, PCG, virtual heightfield, decals, raymarcher) lives in
 the client project and is out of scope here.
@@ -230,7 +231,22 @@ geometry, valid speeds and directions, and a warning for splines wholly outside 
 The fixture is a synthetic network drawn around the synthetic runways, so its geometry is
 invented rather than OpenStreetMap data. It is written by libosmium in its default
 encoding and again with plain nodes and no compression, so the decoder is tested on a real
-producer's output. A run on a real Geofabrik extract is still to do.
+producer's output.
+
+Verified on real data with BBBike's New York extract (153 MB; 15.0 million nodes, 2.6
+million ways and 33,518 relations in 2,215 blocks):
+
+- The whole extract gives 675,312 splines, 1,412 of them aeroways, in 15 s on 4 cores. The
+  KJFK package bounds give 6,305 in 7 s.
+- `tools/check_osm_extract.py` re-implements the selection on libosmium. For the whole
+  extract it selects the same 675,312 ways, and all 3.6 million points agree to 1e-14°.
+  Class, name and ref match on every way.
+- All 41,016 tagged speed limits parsed; none fell back to a default.
+- The KJFK table passes `validate --strict` in place of the fixture table, and tiles into
+  249 line tiles across zooms 12 to 16.
+
+The real data is not committed: OpenStreetMap data is licensed under the ODbL, so the
+package fixture stays synthetic.
 
 ```sh
 cargo run -p nosim-compiler --release -- raster --input dem.tif --output terrain/ [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]
