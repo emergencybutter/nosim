@@ -230,7 +230,7 @@ cargo run -p nosim-compiler --release -- tiles --input features.parquet --output
 ```
 
 ```sh
-cargo run -p nosim-compiler --release -- graph --input splines.geoparquet --output graph/ [--mode drive|taxi] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>]]
+cargo run -p nosim-compiler --release -- graph --input splines.geoparquet --output graph/ [--mode drive|taxi] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>] [--capacity-split] [--assign-iterations <n>] [--min-exit-ratio <r>]]
 ```
 
 `graph` turns a spline table into the directed graph the §7 traffic layer runs on, written
@@ -250,15 +250,36 @@ motorways and trunks and one elsewhere.
 - **Traffic.** `--simulate` builds the far-field CTM from the graph and runs it with the
   same demand at every source. Free-flow speed is the edge's `speed_mps` and capacity
   depends on road class. Every intersection becomes a general junction (Tampère et al.
-  2011). Traffic splits over the exits in proportion to their capacity, with no U-turn
-  unless it is the only way on. The run reports vehicles in, out and on the network.
+  2011).
+- **Routing.** By default each source's demand goes to the sinks it can reach, split by
+  their entering capacity, along shortest travel-time paths. Five rounds of successive
+  averages with BPR delay let congested routes shed traffic. Routed movement flows set each
+  junction's turning shares. An approach that carries no routed flow only uses exits from
+  which a sink can be reached, and a source that reaches no sink stays idle.
+  `--capacity-split` restores the plain capacity-proportional split for comparison.
+- **Report.** The run reports vehicles in, out and on the network, the exit ratio over the
+  second half of the run, links left jammed, and per road class the vehicle-kilometres,
+  vehicle-hours, mean speed and delay. `--min-exit-ratio` makes the command fail below a
+  threshold, which CI uses.
 
 Verified on the BBBike New York extract. The KJFK bounds give a drive graph of 3,581 nodes
 and 7,929 edges in 176 components, the largest holding 2,814 nodes, and a taxi graph of
 1,099 nodes and 2,548 edges. The whole state gives 405,550 nodes and 944,918 edges in 7 s.
 `tools/check_road_graph.py` rebuilds both from the same splines with networkx: node sets,
 edge multisets, component counts and largest sizes all match. A 30-minute KJFK run at
-300 veh/h per source is conserved to 1e-12. A CTM step over the whole state's 944,918 links
+300 veh/h per source is conserved to 1e-10.
+
+Routing is what makes the real network work:
+
+| 30 min, 300 veh/h per source | Capacity split | Routed |
+|---|---|---|
+| Exit ratio, second half of the run | 83.8% | 99.9% |
+| Links jammed at the end | 5 | 0 |
+| Peak density | 100% of jam | 43% |
+| Residential delay | 19.5% | 0.2% |
+
+Without routes, traffic drifts into pockets that have no exit and fills them. Routed, it
+keeps to motorways, ramps and arterials, and one source that can reach no exit stays idle. A CTM step over the whole state's 944,918 links
 takes about 0.46 s on one core, faster than real time at Δt = 1 s.
 
 The real-data runs found a bug in the CTM itself. Links shorter than one free-flow step

@@ -96,7 +96,8 @@ fn edge_and_node_tables_round_trip() {
 fn ctm_open_network_accounts_for_every_vehicle() {
     let (g, _) = graph::build(&splines(), Mode::Drive, false);
     let demand = 600.0 / 3600.0;
-    let s = graph::simulate(&g, 1.0, 900.0, demand).unwrap();
+    let opts = graph::SimOptions { seconds: 900.0, demand_veh_per_s: demand, routed: false, ..Default::default() };
+    let s = graph::simulate(&g, &opts).unwrap();
     assert_eq!((s.sources, s.sinks, s.junctions), (1, 3, 16));
     assert!((s.entered - demand * 900.0).abs() < 1e-6, "{}", s.entered);
     assert!(s.exited > 0.0 && s.on_network > 0.0);
@@ -136,6 +137,22 @@ fn ctm_closed_component_circulates_without_loss() {
 }
 
 #[test]
+fn routed_demand_leaves_and_nothing_jams() {
+    let (g, _) = graph::build(&splines(), Mode::Drive, false);
+    let opts = graph::SimOptions { seconds: 1800.0, demand_veh_per_s: 600.0 / 3600.0, ..Default::default() };
+    let routed = graph::simulate(&g, &opts).unwrap();
+    assert!(routed.routed && routed.conservation_error.abs() < 1e-9);
+    assert!(routed.exit_ratio > 0.99, "{}", routed.exit_ratio);
+    assert_eq!(routed.jammed_links, 0);
+    // Travel is accounted per class, and the expressway carries the most.
+    assert!(!routed.per_class.is_empty());
+    assert_eq!(routed.per_class[0].class, "motorway");
+    let total_km: f64 = routed.per_class.iter().map(|c| c.vehicle_km).sum();
+    assert!(total_km > 0.0 && routed.per_class.iter().all(|c| (0.0..1.0).contains(&c.delay_share())));
+    assert!(routed.per_class.iter().all(|c| c.mean_speed_kmh() > 0.0 && c.mean_speed_kmh() < 130.0));
+}
+
+#[test]
 fn cli() {
     let args = |s: &str| parse_args(s.split_whitespace().map(str::to_owned));
     match args(
@@ -152,6 +169,14 @@ fn cli() {
         other => panic!("{other:?}"),
     }
     assert!(args("graph --input a --output b --mode walk").is_err());
+    match args("graph --input a --output b --simulate 60 --capacity-split --assign-iterations 3 --min-exit-ratio 0.95")
+        .unwrap()
+    {
+        Command::Graph(a) => assert_eq!((a.routed, a.assign_iterations, a.min_exit_ratio), (false, 3, Some(0.95))),
+        other => panic!("{other:?}"),
+    }
+    assert!(args("graph --input a --output b --min-exit-ratio 1.5").is_err());
+    assert!(args("graph --input a --output b --assign-iterations 0").is_err());
     assert!(args("graph --input a --output b --dt 0").is_err());
     assert!(args("graph --output b").is_err());
 
@@ -167,6 +192,9 @@ fn cli() {
         simulate_s: Some(60.0),
         demand_veh_per_h: 300.0,
         dt_s: 1.0,
+        routed: true,
+        assign_iterations: 5,
+        min_exit_ratio: None,
     };
     let (g, s, sim) = run_graph(&a).unwrap();
     // The package is clipped to its bounds, so the detached Van Wyck stretch north of it is gone.

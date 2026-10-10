@@ -554,6 +554,9 @@ pub struct GraphNetwork {
     /// Links shorter than one free-flow step (`v_f·Δt`): they hold a single cell, so traffic
     /// crosses them at most one cell per step, slower than free flow. Shorten `Δt` to remove.
     pub short_links: usize,
+    /// Junction inputs whose given turning weights were all zero, so the default
+    /// capacity-proportional, no-U-turn split was used instead.
+    pub default_turn_rows: usize,
 }
 
 /// Why a graph could not be built.
@@ -574,6 +577,20 @@ pub enum BuildError {
 /// capacities. Nodes only left become sources (demand 0, set it with
 /// [`Network::set_rate`]); nodes only entered become free-exit sinks.
 pub fn build_network(node_count: usize, edges: &[GraphEdge], dt_s: f64) -> Result<GraphNetwork, BuildError> {
+    build_network_with_turns(node_count, edges, dt_s, &|_, _| f64::NAN)
+}
+
+/// Like [`build_network`], with the turning weight from input edge `i` to output edge `o` at a
+/// junction given by `weight(i, o)`, typically the routed flow making that movement. Rows are
+/// normalised; zero forbids a turn. An input whose weights are all zero, negative or not
+/// finite gets the default split of [`build_network`] instead, counted in
+/// [`GraphNetwork::default_turn_rows`].
+pub fn build_network_with_turns(
+    node_count: usize,
+    edges: &[GraphEdge],
+    dt_s: f64,
+    weight: &dyn Fn(usize, usize) -> f64,
+) -> Result<GraphNetwork, BuildError> {
     let mut network = Network::new();
     let mut short_links = 0;
     for (k, e) in edges.iter().enumerate() {
@@ -593,7 +610,7 @@ pub fn build_network(node_count: usize, edges: &[GraphEdge], dt_s: f64) -> Resul
         outs[e.from].push(k);
         ins[e.to].push(k);
     }
-    let (mut sources, mut sinks, mut junctions) = (Vec::new(), Vec::new(), 0);
+    let (mut sources, mut sinks, mut junctions, mut default_turn_rows) = (Vec::new(), Vec::new(), 0, 0);
     let net_err = BuildError::Network;
     for v in 0..node_count {
         match (ins[v].is_empty(), outs[v].is_empty()) {
@@ -615,6 +632,13 @@ pub fn build_network(node_count: usize, edges: &[GraphEdge], dt_s: f64) -> Resul
                 let turning: Vec<Vec<f64>> = ins[v]
                     .iter()
                     .map(|&i| {
+                        let given: Vec<f64> = outs[v].iter().map(|&o| weight(i, o)).collect();
+                        if given.iter().all(|w| w.is_finite() && *w >= 0.0) && given.iter().sum::<f64>() > 0.0 {
+                            return given;
+                        }
+                        if given.iter().any(|w| !w.is_nan()) {
+                            default_turn_rows += 1;
+                        }
                         let no_uturn = outs[v].iter().any(|&o| edges[i].reverse != Some(o));
                         outs[v]
                             .iter()
@@ -628,7 +652,7 @@ pub fn build_network(node_count: usize, edges: &[GraphEdge], dt_s: f64) -> Resul
             }
         }
     }
-    Ok(GraphNetwork { network, sources, sinks, junctions, short_links })
+    Ok(GraphNetwork { network, sources, sinks, junctions, short_links, default_turn_rows })
 }
 
 /// Daganzo's priority merge for any number of inputs: each input gets its sending flow if

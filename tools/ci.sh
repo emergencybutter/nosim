@@ -71,7 +71,7 @@ check() {
     "$wc" raster --input fixtures/dem/kjfk_f32_deflate_tiled.tif --output "$tmp/terrain" --package "$pkg" \
         --patched-dem "$tmp/patched.tif" --min-zoom 12 --max-zoom 13
     "$wc" osm --input fixtures/osm/kjfk_sample_plain.osm.pbf --output "$tmp/plain.geoparquet"
-    "$wc" graph --input "$tmp/plain.geoparquet" --output "$tmp/graph" --mode drive --simulate 300
+    "$wc" graph --input "$tmp/plain.geoparquet" --output "$tmp/graph" --mode drive --simulate 300 --min-exit-ratio 0.95
     "$wc" graph --input "$tmp/plain.geoparquet" --output "$tmp/taxi" --mode taxi --largest-component
 
     say "check passed"
@@ -110,8 +110,9 @@ real_data() {
         python3 tools/check_road_graph.py "$dir/kjfk.geoparquet" "$dir/graph_$mode" "$mode"
     done
 
-    say "CTM on the real KJFK drive graph (conservation)"
-    "$wc" graph --input "$dir/kjfk.geoparquet" --output "$dir/graph_sim" --mode drive --simulate 1800 --demand 300
+    say "routed CTM on the real KJFK drive graph (conservation, at least 95% of vehicles exit)"
+    "$wc" graph --input "$dir/kjfk.geoparquet" --output "$dir/graph_sim" --mode drive --simulate 1800 --demand 300 \
+        --min-exit-ratio 0.95
 
     say "terrain patching on GLO-30 with real roads"
     "$wc" raster --input "$dem" --output "$dir/terrain" \

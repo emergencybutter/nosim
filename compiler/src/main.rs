@@ -57,24 +57,52 @@ fn main() -> ExitCode {
                     );
                     return ExitCode::FAILURE;
                 }
+                if let (Some(m), Some(min)) = (&sim, args.min_exit_ratio)
+                    && m.exit_ratio < min
+                {
+                    eprintln!(
+                        "error: steady-state exit ratio {:.1}% is below the required {:.1}%",
+                        100.0 * m.exit_ratio,
+                        100.0 * min
+                    );
+                    return ExitCode::FAILURE;
+                }
                 if let Some(m) = sim {
                     println!(
-                        "CTM {} s at Δt {} s: {} source(s), {} sink(s), {} junction(s), {} link(s) shorter than one step; \
-                         {:.1} veh entered, {:.1} exited, {:.1} on the network (conservation error {:.2e}); \
-                         peak density {:.0}% of jam, mean speed {:.0}% of free flow",
+                        "CTM {} s at Δt {} s, {}: {} source(s){}, {} sink(s), {} junction(s), {} link(s) shorter than one step",
                         m.steps as f64 * args.dt_s,
                         args.dt_s,
+                        if m.routed { "routed demand" } else { "capacity split" },
                         m.sources,
+                        if m.stranded_sources > 0 {
+                            format!(" ({} with no reachable exit, idle)", m.stranded_sources)
+                        } else {
+                            String::new()
+                        },
                         m.sinks,
                         m.junctions,
-                        m.short_links,
+                        m.short_links
+                    );
+                    println!(
+                        "  {:.1} veh entered, {:.1} exited, {:.1} on the network (conservation error {:.2e}); steady-state exit ratio {:.1}%; {} link(s) jammed at the end; peak density {:.0}% of jam",
                         m.entered,
                         m.exited,
                         m.on_network,
                         m.conservation_error,
-                        100.0 * m.peak_density_ratio,
-                        100.0 * m.speed_ratio
+                        100.0 * m.exit_ratio,
+                        m.jammed_links,
+                        100.0 * m.peak_density_ratio
                     );
+                    for c in m.per_class.iter().take(8) {
+                        println!(
+                            "  {:<16} {:>9.1} veh-km  {:>8.2} veh-h  {:>6.1} km/h  delay {:>5.1}%",
+                            c.class,
+                            c.vehicle_km,
+                            c.vehicle_hours,
+                            c.mean_speed_kmh(),
+                            100.0 * c.delay_share()
+                        );
+                    }
                 }
                 ExitCode::SUCCESS
             }

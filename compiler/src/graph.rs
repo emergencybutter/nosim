@@ -429,10 +429,8 @@ pub fn diagram(e: &GraphEdge) -> FundamentalDiagram {
     FundamentalDiagram { free_flow_speed: e.speed_mps, capacity_per_lane: capacity, jam_density_per_lane: jam }
 }
 
-/// The far-field CTM for a graph: link `k` is edge `k`.
-pub fn to_ctm(g: &Graph, dt_s: f64) -> Result<ctm::GraphNetwork, CompileError> {
-    let edges: Vec<ctm::GraphEdge> = g
-        .edges
+fn ctm_edges(g: &Graph) -> Vec<ctm::GraphEdge> {
+    g.edges
         .iter()
         .map(|e| ctm::GraphEdge {
             from: e.from as usize,
@@ -442,8 +440,239 @@ pub fn to_ctm(g: &Graph, dt_s: f64) -> Result<ctm::GraphNetwork, CompileError> {
             diagram: diagram(e),
             reverse: e.reverse.map(|r| r as usize),
         })
-        .collect();
-    ctm::build_network(g.nodes.len(), &edges, dt_s).map_err(|e| CompileError::Graph(format!("{e:?}")))
+        .collect()
+}
+
+/// The far-field CTM for a graph with capacity-proportional turning: link `k` is edge `k`.
+pub fn to_ctm(g: &Graph, dt_s: f64) -> Result<ctm::GraphNetwork, CompileError> {
+    ctm::build_network(g.nodes.len(), &ctm_edges(g), dt_s).map_err(|e| CompileError::Graph(format!("{e:?}")))
+}
+
+/// Capacity of an edge, vehicles per second.
+pub fn capacity_veh_per_s(e: &GraphEdge) -> f64 {
+    diagram(e).capacity_per_lane * f64::from(e.lanes)
+}
+
+/// Routed demand on a graph (see [`assign`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Assignment {
+    /// Flow on each edge, vehicles per second.
+    pub edge_flow: Vec<f64>,
+    /// Flow per movement `(input edge, output edge)` through a junction, vehicles per second.
+    pub movement: HashMap<(u32, u32), f64>,
+    /// Demand each source node emits, vehicles per second; 0 for stranded sources.
+    pub source_rate: Vec<(u32, f64)>,
+    /// Sources with no reachable sink, which emit nothing.
+    pub stranded_sources: usize,
+    /// Origin–destination pairs routed.
+    pub od_pairs: usize,
+    /// Successive-averages iterations run.
+    pub iterations: usize,
+}
+
+/// Source nodes (left by edges, entered by none) and sink nodes (the reverse).
+pub fn boundary(g: &Graph) -> (Vec<u32>, Vec<u32>) {
+    let mut sources = Vec::new();
+    let mut sinks = Vec::new();
+    for (v, n) in g.nodes.iter().enumerate() {
+        match (n.in_degree, n.out_degree) {
+            (0, o) if o > 0 => sources.push(v as u32),
+            (i, 0) if i > 0 => sinks.push(v as u32),
+            _ => {}
+        }
+    }
+    (sources, sinks)
+}
+
+/// Shortest-path tree from `source` over `cost` per edge: the incoming tree edge of each node.
+fn dijkstra(g: &Graph, out: &[Vec<u32>], source: u32, cost: &[f64]) -> Vec<Option<u32>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let n = g.nodes.len();
+    let mut dist = vec![f64::INFINITY; n];
+    let mut pred: Vec<Option<u32>> = vec![None; n];
+    let mut heap = BinaryHeap::new();
+    dist[source as usize] = 0.0;
+    // Costs are positive and finite, so their bit patterns order like the values.
+    heap.push(Reverse((0u64, source)));
+    while let Some(Reverse((d_bits, v))) = heap.pop() {
+        let d = f64::from_bits(d_bits);
+        if d > dist[v as usize] {
+            continue;
+        }
+        for &e in &out[v as usize] {
+            let edge = &g.edges[e as usize];
+            let nd = d + cost[e as usize];
+            if nd < dist[edge.to as usize] {
+                dist[edge.to as usize] = nd;
+                pred[edge.to as usize] = Some(e);
+                heap.push(Reverse((nd.to_bits(), edge.to)));
+            }
+        }
+    }
+    pred
+}
+
+/// Routes `demand_veh_per_s` from every source to the sinks it can reach, split in proportion
+/// to the sinks' entering capacity, along shortest travel-time paths. Travel time starts at
+/// free flow and is updated for `iterations` rounds of the method of successive averages with
+/// the BPR function `t = t₀ · (1 + 0.15 (v / c)⁴)`, so congested routes shed traffic to
+/// alternatives. Sources that reach no sink are stranded and emit nothing.
+pub fn assign(g: &Graph, demand_veh_per_s: f64, iterations: usize) -> Assignment {
+    let (sources, sinks) = boundary(g);
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); g.nodes.len()];
+    for (k, e) in g.edges.iter().enumerate() {
+        out[e.from as usize].push(k as u32);
+    }
+    let mut sink_weight = vec![0.0; g.nodes.len()];
+    for e in &g.edges {
+        sink_weight[e.to as usize] += capacity_veh_per_s(e);
+    }
+    let free: Vec<f64> = g.edges.iter().map(|e| e.length_m / e.speed_mps).collect();
+    let cap: Vec<f64> = g.edges.iter().map(capacity_veh_per_s).collect();
+    let mut a = Assignment { edge_flow: vec![0.0; g.edges.len()], ..Default::default() };
+    let rounds = iterations.max(1);
+    for k in 0..rounds {
+        let cost: Vec<f64> =
+            (0..g.edges.len()).map(|e| free[e] * (1.0 + 0.15 * (a.edge_flow[e] / cap[e]).powi(4))).collect();
+        let mut flow = vec![0.0; g.edges.len()];
+        let mut movement: HashMap<(u32, u32), f64> = HashMap::new();
+        let (mut stranded, mut pairs, mut rates) = (0, 0, Vec::with_capacity(sources.len()));
+        for &s in &sources {
+            let pred = dijkstra(g, &out, s, &cost);
+            let reached: Vec<u32> = sinks.iter().copied().filter(|&t| pred[t as usize].is_some()).collect();
+            let total: f64 = reached.iter().map(|&t| sink_weight[t as usize]).sum();
+            if reached.is_empty() || total <= 0.0 {
+                stranded += 1;
+                rates.push((s, 0.0));
+                continue;
+            }
+            rates.push((s, demand_veh_per_s));
+            for &t in &reached {
+                let q = demand_veh_per_s * sink_weight[t as usize] / total;
+                pairs += 1;
+                // Walk the tree back from the sink, crediting edges and the movements between them.
+                let mut next: Option<u32> = None;
+                let mut v = t;
+                while let Some(e) = pred[v as usize] {
+                    flow[e as usize] += q;
+                    if let Some(n) = next {
+                        *movement.entry((e, n)).or_default() += q;
+                    }
+                    next = Some(e);
+                    v = g.edges[e as usize].from;
+                }
+            }
+        }
+        // Successive averages: x ← x + (y − x) / (k + 1).
+        let step = 1.0 / (k as f64 + 1.0);
+        for (x, y) in a.edge_flow.iter_mut().zip(&flow) {
+            *x += (y - *x) * step;
+        }
+        for m in a.movement.values_mut() {
+            *m *= 1.0 - step;
+        }
+        for (key, y) in movement {
+            *a.movement.entry(key).or_default() += y * step;
+        }
+        a.stranded_sources = stranded;
+        a.od_pairs = pairs;
+        a.source_rate = rates;
+    }
+    a.iterations = rounds;
+    a
+}
+
+/// Edges from whose downstream end some sink can be reached.
+pub fn reaches_sink(g: &Graph) -> Vec<bool> {
+    let mut into: Vec<Vec<u32>> = vec![Vec::new(); g.nodes.len()];
+    for (k, e) in g.edges.iter().enumerate() {
+        into[e.to as usize].push(k as u32);
+    }
+    let mut node_ok = vec![false; g.nodes.len()];
+    let mut stack: Vec<u32> = boundary(g).1;
+    for &t in &stack {
+        node_ok[t as usize] = true;
+    }
+    while let Some(v) = stack.pop() {
+        for &e in &into[v as usize] {
+            let u = g.edges[e as usize].from;
+            if !node_ok[u as usize] {
+                node_ok[u as usize] = true;
+                stack.push(u);
+            }
+        }
+    }
+    g.edges.iter().map(|e| node_ok[e.to as usize]).collect()
+}
+
+/// The far-field CTM with turning from an [`Assignment`]: each junction input splits in
+/// proportion to the routed flow on its movements. An input that carries no routed flow splits
+/// by capacity over the exits from which a sink can still be reached (no U-turn unless it is
+/// the only one), so traffic is never sent into a pocket it cannot leave.
+pub fn to_ctm_routed(g: &Graph, dt_s: f64, a: &Assignment) -> Result<ctm::GraphNetwork, CompileError> {
+    let reach = reaches_sink(g);
+    let mut routed_inputs = vec![false; g.edges.len()];
+    for &(i, _) in a.movement.keys() {
+        routed_inputs[i as usize] = true;
+    }
+    let weight = |i: usize, o: usize| -> f64 {
+        if routed_inputs[i] {
+            return a.movement.get(&(i as u32, o as u32)).copied().unwrap_or(0.0);
+        }
+        if !reach[o] || g.edges[i].reverse == Some(o as u32) {
+            return 0.0;
+        }
+        capacity_veh_per_s(&g.edges[o])
+    };
+    ctm::build_network_with_turns(g.nodes.len(), &ctm_edges(g), dt_s, &weight)
+        .map_err(|e| CompileError::Graph(format!("{e:?}")))
+}
+
+/// How [`simulate`] runs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SimOptions {
+    /// Time step, seconds.
+    pub dt_s: f64,
+    /// Duration, seconds.
+    pub seconds: f64,
+    /// Demand at every source, vehicles per second.
+    pub demand_veh_per_s: f64,
+    /// Route the demand (true) or split by capacity alone (false).
+    pub routed: bool,
+    /// Successive-averages iterations when routing.
+    pub assign_iterations: usize,
+}
+
+impl Default for SimOptions {
+    fn default() -> Self {
+        Self { dt_s: 1.0, seconds: 1800.0, demand_veh_per_s: 300.0 / 3600.0, routed: true, assign_iterations: 5 }
+    }
+}
+
+/// Travel on one road class over a run.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClassStats {
+    /// `highway` class.
+    pub class: String,
+    /// Vehicle-kilometres travelled.
+    pub vehicle_km: f64,
+    /// Vehicle-hours spent.
+    pub vehicle_hours: f64,
+    /// Vehicle-hours the same distance takes at free flow.
+    pub free_flow_hours: f64,
+}
+
+impl ClassStats {
+    /// Mean speed, km/h.
+    pub fn mean_speed_kmh(&self) -> f64 {
+        if self.vehicle_hours > 0.0 { self.vehicle_km / self.vehicle_hours } else { 0.0 }
+    }
+
+    /// Share of the time spent that is delay beyond free flow.
+    pub fn delay_share(&self) -> f64 {
+        if self.vehicle_hours > 0.0 { 1.0 - self.free_flow_hours / self.vehicle_hours } else { 0.0 }
+    }
 }
 
 /// Result of [`simulate`].
@@ -451,7 +680,7 @@ pub fn to_ctm(g: &Graph, dt_s: f64) -> Result<ctm::GraphNetwork, CompileError> {
 pub struct SimSummary {
     /// Steps run.
     pub steps: usize,
-    /// Source and sink count.
+    /// Source count.
     pub sources: usize,
     /// Sinks.
     pub sinks: usize,
@@ -459,6 +688,10 @@ pub struct SimSummary {
     pub junctions: usize,
     /// Links shorter than one free-flow step.
     pub short_links: usize,
+    /// Whether demand was routed.
+    pub routed: bool,
+    /// Sources with no reachable sink (routed runs only; they emit nothing).
+    pub stranded_sources: usize,
     /// Vehicles that entered at sources.
     pub entered: f64,
     /// Vehicles that left at sinks.
@@ -467,42 +700,83 @@ pub struct SimSummary {
     pub on_network: f64,
     /// `entered − exited − on_network`.
     pub conservation_error: f64,
+    /// Vehicles leaving per vehicle entering over the second half of the run (steady state).
+    pub exit_ratio: f64,
+    /// Links with a cell at 90% of jam density or more at the end.
+    pub jammed_links: usize,
     /// Highest cell density reached, as a fraction of jam density.
     pub peak_density_ratio: f64,
     /// Vehicle-weighted mean speed at the end over the free-flow speed, 1 when empty.
     pub speed_ratio: f64,
+    /// Travel by road class, busiest first.
+    pub per_class: Vec<ClassStats>,
 }
 
-/// Runs the CTM for `seconds` with the same demand at every source, every sink free.
-pub fn simulate(g: &Graph, dt_s: f64, seconds: f64, demand_veh_per_s: f64) -> Result<SimSummary, CompileError> {
-    let mut built = to_ctm(g, dt_s)?;
-    for &(node, _) in &built.sources {
-        built.network.set_rate(node, demand_veh_per_s);
-    }
-    let steps = (seconds / dt_s).round() as usize;
-    let mut s = SimSummary {
-        steps,
-        sources: built.sources.len(),
-        sinks: built.sinks.len(),
-        junctions: built.junctions,
-        short_links: built.short_links,
-        ..Default::default()
+/// Runs the CTM with the same demand at every source and every sink free.
+pub fn simulate(g: &Graph, o: &SimOptions) -> Result<SimSummary, CompileError> {
+    let mut s = SimSummary { routed: o.routed, ..Default::default() };
+    let mut built = if o.routed {
+        let a = assign(g, o.demand_veh_per_s, o.assign_iterations);
+        s.stranded_sources = a.stranded_sources;
+        let rate: HashMap<u32, f64> = a.source_rate.iter().copied().collect();
+        let mut built = to_ctm_routed(g, o.dt_s, &a)?;
+        for &(node, link) in &built.sources.clone() {
+            let v = g.edges[link].from;
+            built.network.set_rate(node, rate.get(&v).copied().unwrap_or(0.0));
+        }
+        built
+    } else {
+        let mut built = to_ctm(g, o.dt_s)?;
+        for &(node, _) in &built.sources.clone() {
+            built.network.set_rate(node, o.demand_veh_per_s);
+        }
+        built
     };
-    for _ in 0..steps {
+    let steps = (o.seconds / o.dt_s).round() as usize;
+    s.steps = steps;
+    s.sources = built.sources.len();
+    s.sinks = built.sinks.len();
+    s.junctions = built.junctions;
+    s.short_links = built.short_links;
+    let mut classes: std::collections::BTreeMap<String, ClassStats> = std::collections::BTreeMap::new();
+    let class_of: Vec<String> = g.edges.iter().map(|e| e.class.clone()).collect();
+    let (mut steady_in, mut steady_out) = (0.0, 0.0);
+    for step in 0..steps {
         let flows = built.network.step();
-        s.entered += built.sources.iter().map(|&(_, l)| flows[l].entered).sum::<f64>();
-        s.exited += built.sinks.iter().map(|&(_, l)| flows[l].exited).sum::<f64>();
-        for l in built.network.links() {
+        let entered: f64 = built.sources.iter().map(|&(_, l)| flows[l].entered).sum();
+        let exited: f64 = built.sinks.iter().map(|&(_, l)| flows[l].exited).sum();
+        s.entered += entered;
+        s.exited += exited;
+        if step >= steps / 2 {
+            steady_in += entered;
+            steady_out += exited;
+        }
+        for (k, l) in built.network.links().iter().enumerate() {
             let jam = l.diagram().jam_density_per_lane;
+            let (mut on, mut moved) = (0.0, 0.0);
             for c in 0..l.cell_count() {
                 s.peak_density_ratio = s.peak_density_ratio.max(l.density(c) / jam);
+                on += l.vehicles()[c];
+                moved += l.flux(c + 1);
+            }
+            if on > 0.0 || moved > 0.0 {
+                let st = classes.entry(class_of[k].clone()).or_default();
+                let km = moved * l.cell_length_m() / 1000.0;
+                st.vehicle_km += km;
+                st.vehicle_hours += on * o.dt_s / 3600.0;
+                st.free_flow_hours += km / (l.diagram().free_flow_speed * 3.6);
             }
         }
     }
     s.on_network = built.network.total_vehicles();
     s.conservation_error = s.entered - s.exited - s.on_network;
+    s.exit_ratio = if steady_in > 0.0 { steady_out / steady_in } else { 1.0 };
     let (mut weighted, mut free, mut vehicles) = (0.0, 0.0, 0.0);
     for l in built.network.links() {
+        let jam = l.diagram().jam_density_per_lane;
+        if (0..l.cell_count()).any(|c| l.density(c) >= 0.9 * jam) {
+            s.jammed_links += 1;
+        }
         for (c, &n) in l.vehicles().iter().enumerate() {
             weighted += n * l.speed(c);
             free += n * l.diagram().free_flow_speed;
@@ -510,6 +784,14 @@ pub fn simulate(g: &Graph, dt_s: f64, seconds: f64, demand_veh_per_s: f64) -> Re
         }
     }
     s.speed_ratio = if vehicles > 0.0 { weighted / free } else { 1.0 };
+    s.per_class = classes
+        .into_iter()
+        .map(|(class, mut st)| {
+            st.class = class;
+            st
+        })
+        .collect();
+    s.per_class.sort_by(|a, b| b.vehicle_km.total_cmp(&a.vehicle_km));
     Ok(s)
 }
 
@@ -779,6 +1061,132 @@ mod tests {
                 let (g, _) = build(&[r], Mode::Drive, false);
                 let d = diagram(&g.edges[0]);
                 assert!(ctm::Link::new(d, 1, 100.0, 1.0).is_some(), "{class} at {speed} m/s");
+            }
+        }
+    }
+
+    /// A hand-built graph: nodes at given points, one-way edges with a speed and lanes.
+    fn hand_graph(points: &[(f64, f64)], edges: &[(u32, u32, f64, u32)]) -> Graph {
+        let mut g = Graph {
+            nodes: points
+                .iter()
+                .map(|&(lon, lat)| GraphNode { osm_id: None, lon, lat, in_degree: 0, out_degree: 0, component: 0 })
+                .collect(),
+            edges: edges
+                .iter()
+                .map(|&(from, to, speed, lanes)| {
+                    let pts = vec![points[from as usize], points[to as usize]];
+                    GraphEdge {
+                        from,
+                        to,
+                        osm_id: 0,
+                        part: 0,
+                        class: "primary".into(),
+                        name: None,
+                        reference: None,
+                        speed_mps: speed,
+                        lanes,
+                        length_m: osm::length_m(&pts),
+                        bridge: false,
+                        tunnel: false,
+                        layer: 0,
+                        reverse: None,
+                        component: None,
+                        points: pts,
+                    }
+                })
+                .collect(),
+        };
+        for e in &g.edges.clone() {
+            g.nodes[e.from as usize].out_degree += 1;
+            g.nodes[e.to as usize].in_degree += 1;
+        }
+        g
+    }
+
+    #[test]
+    fn routing_takes_the_fast_way_then_spreads_under_load() {
+        // s(0) → a(1) → t(3) is fast; s → b(2) → t is the same length but slower.
+        let p = [(-73.80, 40.60), (-73.79, 40.61), (-73.79, 40.59), (-73.78, 40.60)];
+        let g = hand_graph(&p, &[(0, 1, 20.0, 1), (1, 3, 20.0, 1), (0, 2, 12.0, 1), (2, 3, 12.0, 1)]);
+        assert_eq!(boundary(&g), (vec![0], vec![3]));
+        // Light demand, one round: all of it on the fast route.
+        let light = assign(&g, 0.05, 1);
+        assert_eq!((light.od_pairs, light.stranded_sources), (1, 0));
+        assert!((light.edge_flow[0] - 0.05).abs() < 1e-12 && light.edge_flow[2] == 0.0);
+        assert!((light.movement[&(0, 1)] - 0.05).abs() < 1e-12);
+        // At 90% of capacity BPR adds only ~10% to the fast route, which stays faster than the
+        // slow one (×1.67): everything stays on it. At twice its capacity the fast route costs
+        // ×3.4, so successive averages shift traffic onto the slow route.
+        let near = assign(&g, 0.9 * capacity_veh_per_s(&g.edges[0]), 10);
+        assert_eq!(near.edge_flow[2], 0.0);
+        let heavy = assign(&g, 2.0 * capacity_veh_per_s(&g.edges[0]), 10);
+        assert!(heavy.edge_flow[2] > 0.0 && heavy.edge_flow[0] > heavy.edge_flow[2]);
+        // Flow is conserved at every interior node and the total leaves at the sink.
+        for v in [1u32, 2] {
+            let inflow: f64 =
+                g.edges.iter().enumerate().filter(|(_, e)| e.to == v).map(|(k, _)| heavy.edge_flow[k]).sum();
+            let outflow: f64 =
+                g.edges.iter().enumerate().filter(|(_, e)| e.from == v).map(|(k, _)| heavy.edge_flow[k]).sum();
+            assert!((inflow - outflow).abs() < 1e-12);
+        }
+        let demand = 2.0 * capacity_veh_per_s(&g.edges[0]);
+        assert!((heavy.edge_flow[1] + heavy.edge_flow[3] - demand).abs() < 1e-9);
+    }
+
+    #[test]
+    fn demand_splits_by_sink_capacity_and_strands_unreachable_sources() {
+        // s(0) feeds a junction j(1) with exits to t1(2) (one lane) and t2(3) (three lanes).
+        // A second source s2(4) only reaches a dead-end loop 5 ↔ 6 with no sink.
+        let p = [
+            (-73.80, 40.60),
+            (-73.79, 40.60),
+            (-73.78, 40.61),
+            (-73.78, 40.59),
+            (-73.70, 40.70),
+            (-73.69, 40.70),
+            (-73.69, 40.71),
+        ];
+        let g = hand_graph(
+            &p,
+            &[(0, 1, 15.0, 2), (1, 2, 15.0, 1), (1, 3, 15.0, 3), (4, 5, 15.0, 1), (5, 6, 15.0, 1), (6, 5, 15.0, 1)],
+        );
+        let a = assign(&g, 0.4, 1);
+        assert_eq!(a.stranded_sources, 1);
+        assert_eq!(a.source_rate.iter().find(|r| r.0 == 4).unwrap().1, 0.0);
+        assert!((a.edge_flow[1] - 0.1).abs() < 1e-12 && (a.edge_flow[2] - 0.3).abs() < 1e-12);
+        assert_eq!(reaches_sink(&g), vec![true, true, true, false, false, false]);
+    }
+
+    #[test]
+    fn routed_turning_keeps_traffic_out_of_pockets() {
+        // Through road s(0) → j(1) → t(2), with a one-way spur j → p(3) into a pocket loop
+        // p ↔ q(4) that has no exit. Capacity splitting sends part of the traffic into the pocket,
+        // where it piles up; routing never does.
+        let p = [(-73.80, 40.60), (-73.79, 40.60), (-73.78, 40.60), (-73.79, 40.61), (-73.785, 40.615)];
+        let g = hand_graph(&p, &[(0, 1, 15.0, 1), (1, 2, 15.0, 1), (1, 3, 15.0, 1), (3, 4, 15.0, 1), (4, 3, 15.0, 1)]);
+        let run = |routed: bool| {
+            simulate(&g, &SimOptions { seconds: 1200.0, demand_veh_per_s: 0.1, routed, ..Default::default() }).unwrap()
+        };
+        let (split, routed) = (run(false), run(true));
+        assert!(split.exit_ratio < 0.7, "{}", split.exit_ratio);
+        assert!(routed.exit_ratio > 0.999, "{}", routed.exit_ratio);
+        assert!(routed.conservation_error.abs() < 1e-9 && split.conservation_error.abs() < 1e-9);
+        let a = assign(&g, 0.1, 3);
+        let built = to_ctm_routed(&g, 1.0, &a).unwrap();
+        // Only the pocket's own inputs (spur → p, q → p, p → q) carry no routed flow and have no
+        // exit that reaches a sink; they keep the default split, harmlessly, since nothing enters.
+        assert_eq!(built.default_turn_rows, 3);
+        let n = built.network.nodes().iter().find_map(|n| match n {
+            ctm::Node::Junction { from, to, turning } if from.len() == 1 && to.len() == 2 => {
+                Some((to.clone(), turning[0].clone()))
+            }
+            _ => None,
+        });
+        let (to, row) = n.unwrap();
+        for (o, w) in to.iter().zip(&row) {
+            if *o == 2 {
+                assert_eq!(*w, 0.0, "routed traffic turned into the pocket");
             }
         }
     }

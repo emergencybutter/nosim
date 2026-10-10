@@ -213,6 +213,12 @@ pub struct GraphArgs {
     pub demand_veh_per_h: f64,
     /// CTM time step, seconds.
     pub dt_s: f64,
+    /// Route the demand (default) rather than splitting by capacity alone.
+    pub routed: bool,
+    /// Successive-averages iterations when routing.
+    pub assign_iterations: usize,
+    /// Fail when the steady-state exit ratio of the simulation falls below this.
+    pub min_exit_ratio: Option<f64>,
 }
 
 /// `osm` subcommand options.
@@ -276,7 +282,7 @@ pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runwa
                          world-compiler tiles --input <features.parquet> --output <dir> [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]\n\
                          world-compiler raster --input <dem.tif> --output <dir> [--patch-runways <runways.parquet>] [--patch-roads <splines.geoparquet>] [--package <dir>] [--patched-dem <out.tif>] [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]\n\
                          world-compiler osm --input <extract.osm.pbf> --output <splines.geoparquet> [--bbox <west,south,east,north>] [--threads <n>]\n\
-                         world-compiler graph --input <splines.geoparquet> --output <dir> [--mode drive|taxi] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>]]";
+                         world-compiler graph --input <splines.geoparquet> --output <dir> [--mode drive|taxi] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>] [--capacity-split] [--assign-iterations <n>] [--min-exit-ratio <r>]]";
 
 /// Parses the command line (everything after the program name).
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, CompileError> {
@@ -539,12 +545,19 @@ fn parse_graph<I: Iterator<Item = String>>(mut it: I) -> Result<GraphArgs, Compi
         simulate_s: None,
         demand_veh_per_h: 300.0,
         dt_s: 1.0,
+        routed: true,
+        assign_iterations: 5,
+        min_exit_ratio: None,
     };
     let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
     let positive = |v: f64| v.is_finite() && v > 0.0;
     while let Some(flag) = it.next() {
         if flag == "--largest-component" {
             args.largest_component = true;
+            continue;
+        }
+        if flag == "--capacity-split" {
+            args.routed = false;
             continue;
         }
         let value = it.next().ok_or_else(|| CompileError::Usage(format!("{flag} needs a value\n{USAGE}")))?;
@@ -556,6 +569,15 @@ fn parse_graph<I: Iterator<Item = String>>(mut it: I) -> Result<GraphArgs, Compi
             "--simulate" => args.simulate_s = Some(num()?),
             "--demand" => args.demand_veh_per_h = num()?,
             "--dt" => args.dt_s = num()?,
+            "--min-exit-ratio" => {
+                args.min_exit_ratio = Some(
+                    value.parse().ok().filter(|r: &f64| (0.0..=1.0).contains(r)).ok_or_else(|| bad(&flag, &value))?,
+                )
+            }
+            "--assign-iterations" => {
+                args.assign_iterations =
+                    value.parse().ok().filter(|&n: &usize| (1..=100).contains(&n)).ok_or_else(|| bad(&flag, &value))?
+            }
             _ => return Err(CompileError::Usage(format!("unknown flag {flag}\n{USAGE}"))),
         }
     }
@@ -572,7 +594,16 @@ pub fn run_graph(
     let (g, summary) = graph::build(&rows, args.mode, args.largest_component);
     graph::write(&args.output, &g)?;
     let sim = match args.simulate_s {
-        Some(seconds) => Some(graph::simulate(&g, args.dt_s, seconds, args.demand_veh_per_h / 3600.0)?),
+        Some(seconds) => Some(graph::simulate(
+            &g,
+            &graph::SimOptions {
+                dt_s: args.dt_s,
+                seconds,
+                demand_veh_per_s: args.demand_veh_per_h / 3600.0,
+                routed: args.routed,
+                assign_iterations: args.assign_iterations,
+            },
+        )?),
         None => None,
     };
     Ok((g, summary, sim))

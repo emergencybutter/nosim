@@ -81,7 +81,11 @@ terrain came straight from the DEM.
 
 **Data:** the runway fixture, then GLO-30.
 
-## M2 — Traffic that goes somewhere (Phase 4.2)
+## M2 — Traffic that goes somewhere (Phase 4.2) — routing done, near field in progress
+
+Routing (demand, shortest paths, successive averages, routed turning) is done: on the real
+KJFK graph the exit ratio rose from 83.8% to 99.9% with no jammed links. The near-field
+vehicles and their handoff are next.
 
 The road graph currently splits traffic over exits by capacity alone. On real KJFK roads
 that sends vehicles into pockets with no exit, and they jam. The CTM needs routes, and the
