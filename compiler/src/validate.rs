@@ -1,5 +1,6 @@
 //! `world-compiler validate`: the core audit plus the checks only this crate can do —
-//! reading an ARINC override table and judging whether its rows can ever apply.
+//! reading the ARINC override and spline network tables and judging whether their rows can
+//! ever apply.
 
 use std::path::{Path, PathBuf};
 
@@ -7,7 +8,7 @@ use nosim::arinc424::FEET_TO_METERS;
 use nosim::scenery::audit::{AuditReport, audit_package};
 use nosim::scenery::{MANIFEST_FILE, Manifest};
 
-use crate::geoparquet;
+use crate::{geoparquet, osm};
 
 /// Audit of one package with the compiler's extra checks folded in.
 pub fn validate_package(dir: &Path) -> AuditReport {
@@ -56,7 +57,62 @@ pub fn validate_package(dir: &Path) -> AuditReport {
             }
         }
     }
+    if let Some(rel) = &manifest.content.spline_networks {
+        let path = dir.join(rel);
+        if path.is_file() {
+            check_splines(&mut report, rel, &path, &manifest);
+        }
+    }
     report
+}
+
+/// `content.spline_networks`: readable, well-formed, and at least partly inside the bounds.
+fn check_splines(report: &mut AuditReport, rel: &str, path: &Path, manifest: &Manifest) {
+    let rows = match osm::read_splines(path) {
+        Ok(rows) => rows,
+        Err(e) => {
+            report.errors.push(format!("content.spline_networks {rel}: not a readable spline table ({e})"));
+            return;
+        }
+    };
+    if rows.is_empty() {
+        report.warnings.push(format!("content.spline_networks {rel}: table has no rows"));
+    }
+    let b = &manifest.bounds;
+    let outside: Vec<String> = rows
+        .iter()
+        .filter(|r| !r.points.iter().any(|&(lon, lat)| b.contains(lat, lon)))
+        .map(|r| format!("{}#{}", r.osm_id, r.part))
+        .collect();
+    if !outside.is_empty() {
+        report.warnings.push(format!(
+            "content.spline_networks {rel}: {} spline(s) lie wholly outside the package bounds and can never apply: {}",
+            outside.len(),
+            outside.join(", ")
+        ));
+    }
+    for r in &rows {
+        let id = format!("{}#{}", r.osm_id, r.part);
+        if r.points.len() < 2 {
+            report.errors.push(format!("content.spline_networks {rel}: {id} has fewer than two points"));
+            continue;
+        }
+        let measured = osm::length_m(&r.points);
+        if (measured - r.length_m).abs() > 0.5 {
+            report.errors.push(format!(
+                "content.spline_networks {rel}: {id} geometry is {measured:.2} m long but length_m says {:.2} m",
+                r.length_m
+            ));
+        }
+        if !(r.speed_mps.is_finite() && r.speed_mps > 0.0) {
+            report
+                .errors
+                .push(format!("content.spline_networks {rel}: {id} speed_mps {} is not positive", r.speed_mps));
+        }
+        if !(-1..=1).contains(&r.oneway) {
+            report.errors.push(format!("content.spline_networks {rel}: {id} oneway {} is not -1, 0 or 1", r.oneway));
+        }
+    }
 }
 
 /// Expands each argument: a package directory stands for itself; any other directory

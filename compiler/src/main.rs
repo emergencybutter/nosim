@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-use nosim_compiler::{Command, USAGE, parse_args, run_arinc, run_raster, run_tiles, run_validate, validate};
+use nosim_compiler::{Command, USAGE, parse_args, run_arinc, run_osm, run_raster, run_tiles, run_validate, validate};
 
 fn main() -> ExitCode {
     let command = match parse_args(std::env::args().skip(1)) {
@@ -26,6 +26,42 @@ fn main() -> ExitCode {
             }
             if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
+        Command::Osm(args) => match run_osm(&args) {
+            Ok((_, s)) => {
+                println!(
+                    "{}: {} block(s), {} node(s), {} way(s), {} relation(s) skipped; written by {}",
+                    args.input.display(),
+                    s.blocks,
+                    s.nodes,
+                    s.ways,
+                    s.relations_skipped,
+                    s.writing_program.as_deref().unwrap_or("an unnamed program")
+                );
+                println!(
+                    "{}: {} spline(s) ({} road, {} aeroway) from {} matching way(s); {} with a tagged speed",
+                    args.output.display(),
+                    s.rows,
+                    s.road_rows,
+                    s.aeroway_rows,
+                    s.ways_matched,
+                    s.tagged_speeds
+                );
+                if s.missing_nodes > 0 {
+                    eprintln!(
+                        "warning: {} reference(s) to nodes not in the file; {} way(s) split, {} dropped",
+                        s.missing_nodes, s.ways_split, s.ways_unresolved
+                    );
+                }
+                if s.outside_bbox > 0 {
+                    println!("{} spline(s) outside the bounding box dropped", s.outside_bbox);
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Command::Raster(args) => match run_raster(&args) {
             Ok((storage, s)) => {
                 println!(

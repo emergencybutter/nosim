@@ -7,6 +7,8 @@
 
 pub mod arinc;
 pub mod geoparquet;
+pub mod osm;
+pub(crate) mod par;
 pub mod raster;
 pub mod tiler;
 pub mod validate;
@@ -77,6 +79,8 @@ pub enum CompileError {
     Usage(String),
     /// Raster processing (GeoTIFF reading, tile encoding).
     Raster(String),
+    /// OpenStreetMap PBF decoding.
+    Osm(String),
 }
 
 impl fmt::Display for CompileError {
@@ -88,6 +92,7 @@ impl fmt::Display for CompileError {
             CompileError::Package(m) => write!(f, "package: {m}"),
             CompileError::Usage(m) => write!(f, "usage: {m}"),
             CompileError::Raster(m) => write!(f, "raster: {m}"),
+            CompileError::Osm(m) => write!(f, "osm: {m}"),
         }
     }
 }
@@ -181,6 +186,19 @@ pub enum Command {
     Tiles(TilesArgs),
     /// Process a DEM into Terrain-RGB, normal-map and quantized-mesh tiles.
     Raster(RasterArgs),
+    /// Extract roads and aeroways from an OpenStreetMap PBF.
+    Osm(OsmArgs),
+}
+
+/// `osm` subcommand options.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OsmArgs {
+    /// `.osm.pbf` to read.
+    pub input: PathBuf,
+    /// GeoParquet spline table to write.
+    pub output: PathBuf,
+    /// Extraction parameters.
+    pub options: osm::OsmOptions,
 }
 
 /// `raster` subcommand options.
@@ -209,7 +227,8 @@ pub struct TilesArgs {
 pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runways.parquet> [--packages <dir>] [--airport <ICAO>]\n\
                          world-compiler validate [--strict] [--json] <package-or-directory>...\n\
                          world-compiler tiles --input <features.parquet> --output <dir> [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]\n\
-                         world-compiler raster --input <dem.tif> --output <dir> [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]";
+                         world-compiler raster --input <dem.tif> --output <dir> [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]\n\
+                         world-compiler osm --input <extract.osm.pbf> --output <splines.geoparquet> [--bbox <west,south,east,north>] [--threads <n>]";
 
 /// Parses the command line (everything after the program name).
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, CompileError> {
@@ -219,8 +238,9 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Co
         Some("validate") => parse_validate(it).map(Command::Validate),
         Some("tiles") => parse_tiles(it).map(Command::Tiles),
         Some("raster") => parse_raster(it).map(Command::Raster),
+        Some("osm") => parse_osm(it).map(Command::Osm),
         other => Err(CompileError::Usage(format!(
-            "expected subcommand `arinc`, `validate`, `tiles` or `raster`, got {other:?}\n{USAGE}"
+            "expected subcommand `arinc`, `validate`, `tiles`, `raster` or `osm`, got {other:?}\n{USAGE}"
         ))),
     }
 }
@@ -374,4 +394,51 @@ pub fn run_raster(args: &RasterArgs) -> Result<(raster::geotiff::Storage, raster
     let dem = raster::geotiff::Dem::load(&args.input)?;
     let summary = raster::process(&dem, &args.output, &args.options)?;
     Ok((dem.storage, summary))
+}
+
+fn parse_osm<I: Iterator<Item = String>>(mut it: I) -> Result<OsmArgs, CompileError> {
+    let (mut input, mut output) = (None, None);
+    let mut options = osm::OsmOptions::default();
+    let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
+    while let Some(flag) = it.next() {
+        let value = it.next().ok_or_else(|| CompileError::Usage(format!("{flag} needs a value\n{USAGE}")))?;
+        match flag.as_str() {
+            "--input" => input = Some(PathBuf::from(value)),
+            "--output" => output = Some(PathBuf::from(value)),
+            "--threads" => options.threads = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--bbox" => {
+                let v: Vec<f64> = value
+                    .split(',')
+                    .map(|x| x.trim().parse::<f64>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| bad(&flag, &value))?;
+                match v[..] {
+                    [w, s, e, n]
+                        if w < e
+                            && s < n
+                            && (-180.0..=180.0).contains(&w)
+                            && (-180.0..=180.0).contains(&e)
+                            && (-90.0..=90.0).contains(&s)
+                            && (-90.0..=90.0).contains(&n) =>
+                    {
+                        options.bbox = Some((w, s, e, n))
+                    }
+                    _ => return Err(bad(&flag, &value)),
+                }
+            }
+            _ => return Err(CompileError::Usage(format!("unknown flag {flag}\n{USAGE}"))),
+        }
+    }
+    Ok(OsmArgs {
+        input: input.ok_or_else(|| CompileError::Usage(format!("--input is required\n{USAGE}")))?,
+        output: output.ok_or_else(|| CompileError::Usage(format!("--output is required\n{USAGE}")))?,
+        options,
+    })
+}
+
+/// Runs `osm`: extracts the roads and aeroways and writes them as a GeoParquet spline table.
+pub fn run_osm(args: &OsmArgs) -> Result<(Vec<osm::SplineRow>, osm::OsmSummary), CompileError> {
+    let (rows, summary) = osm::extract(&args.input, &args.options)?;
+    osm::write_splines(&args.output, &rows)?;
+    Ok((rows, summary))
 }

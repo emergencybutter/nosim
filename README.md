@@ -64,19 +64,25 @@ compiler/
                  (geotiff.rs), Terrain-RGB and normal-map tiles (terrain_rgb.rs), PNG
                  writer / reader (png.rs), greedy Delaunay TIN with gap filling (tin.rs),
                  Cesium quantized-mesh encoder / decoder (quantized_mesh.rs)
+  src/osm/       OpenStreetMap PBF reader: blobs, zlib, dense and plain nodes, ways (pbf.rs);
+                 road and aeroway extraction with tag normalisation, spline GeoParquet (mod.rs)
+  src/par.rs     Order-preserving parallel map over scoped threads, shared by raster and osm
   src/lib.rs     Override application through the VFS; CLI parsing; run_arinc / run_validate /
-                 run_tiles / run_raster
+                 run_tiles / run_raster / run_osm
   tests/         The Phase 2 pipeline end to end, including the §3 override loop; the tiler
                  from the KJFK runway table to decoded tiles on disk; the raster processor
-                 from three GeoTIFF encodings to decoded PNG and mesh tiles
+                 from three GeoTIFF encodings to decoded PNG and mesh tiles; OSM extraction
+                 from two libosmium encodings to the package's spline table
 fixtures/        The spec's KJFK example package (scenery tests) — its arinc_runways.parquet
-                 is a real table compiled from the CIFP sample, so the package overrides work
-                 end to end; the BSC5 catalogue
+                 and taxiways_and_roads.geoparquet are real tables compiled from the CIFP and
+                 OSM samples, so the package validates and overrides end to end; the BSC5 catalogue
                  compiled to nosim's packed form plus a 22-line text excerpt (starfield tests);
-                 three synthetic GeoTIFF DEMs of one analytic surface (raster tests)
+                 three synthetic GeoTIFF DEMs of one analytic surface (raster tests); a
+                 synthetic KJFK road and taxiway network as two OSM PBF encodings (osm tests)
 examples/        compile_bsc5: turns the CDS catalogue text into the packed star buffer
 tools/           ephem_tables.py: reference evaluator + generator for the ephemeris tables;
-                 make_dem_fixtures.py: writes the DEM fixtures (standard library only)
+                 make_dem_fixtures.py: writes the DEM fixtures (standard library only);
+                 make_osm_fixture.py: writes the OSM fixtures through libosmium (pyosmium)
 docs/            Architecture specification
 ```
 
@@ -108,6 +114,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | Phase 2 end to end — CIFP text → eight paired KJFK runway ends → GeoParquet with `geo` metadata → read back identical; RW31L centreline 14,511 ft ± 1 ft; true heading = magnetic + variation; a scenery package's `arinc_overrides` replaces the authoritative rows for its airport | `compiler/tests/pipeline.rs` |
 | §1 vector tiler — KJFK reference point lands in XYZ tile 302/385 at z 10 and 4834/6164 at z 14; the runway GeoParquet tiles into a single z 10 tile holding all eight ends, every deeper tile descends from it, a runway straddling a tile edge appears clipped in both, and the `z/x/y.pbf` files decode as MVT v2 with the attributes intact; Morton keys interleave bits so a tile's four children are consecutive | `tiler::tile_addressing`, `tiler::morton_keys`, `mvt::encode_then_decode_round_trip`, `compiler/tests/tiles.rs` |
 | §1 raster processor — three GeoTIFFs of one analytic surface (float32 DEFLATE tiled with float predictor and a no-data hole; big-endian int16 LZW strips with horizontal predictor and PixelIsPoint; uncompressed uint16 with a ModelTransformation) all decode to that surface; Terrain-RGB tiles decode within 0.05 m of the DEM and 1 m of the surface; normal-map tiles match the analytic gradient within 3°; quantized-mesh tiles stay within the TIN tolerance, wind counter-clockwise, list their edge vertices, and carry outward normals; a lunar DEM is placed on the 1737.4 km sphere. The fixtures were also decoded independently by libtiff (Pillow) when generated | `compiler/tests/raster.rs`, `raster::tin`, `raster::quantized_mesh`, `raster::png`, `raster::geotiff` |
+| §1 OSM ingestion — dense-node zlib and plain-node uncompressed PBFs written by libosmium decode to identical splines; taxiway A lies 180 m ± 2 m off the 04L/22R centreline over the runway's length; mph, knots, km/h and non-numeric `maxspeed` normalise to m/s with provenance; implied, explicit and reversed one-way; lanes, width in feet, bridge, tunnel and layer; areas, construction and buildings skipped; a way cut by a missing node splits into two rows; the package's spline table passes the validator, a tampered length fails it, and the tiler reads it as lines; a vehicle at the posted speed has zero IDM free-road acceleration | `compiler/tests/osm.rs`, `osm::pbf`, `osm` |
 | §8A — VSOP87D Earth reproduces IMCCE's own `vsop87.chk` values to 10 decimals (1700–2000) | `ephem::vsop87d_matches_imcce_check_values` |
 | §8A — ELP82B Moon matches JPL Horizons (DE441) J2000 ecliptic vectors to 0.35 km in 1969–2000, 1.2 km by 2047 | `ephem::elp82b_matches_jpl_horizons` |
 | §8A — apparent Sun / Moon RA–Dec, nutation, phase angle, illuminated fraction, optical libration against Meeus's worked examples | `ephem::apparent_sun_ra_dec`, `apparent_moon_ra_dec`, `obliquity_and_nutation`, `phase_and_illumination`, `libration` |
@@ -143,7 +150,7 @@ Requires a stable Rust toolchain (edition 2024, so 1.85 or newer).
 | §8B/§8C Hapke BRDF, Chapman limb | Implemented as CPU reference for the shaders |
 | §8 LOD band policy, parent-frame selection | Implemented |
 | C ABI for the UE5 client | Implemented: every module above is reachable from C; proven by a compiled C smoke test |
-| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler; raster processor) | Implemented for runways, packages, GeoParquet → MVT tiling with Morton ordering, and geographic DEM → Terrain-RGB / normal maps / quantized mesh; OSM PBF / FlatGeobuf, H3, 3D Tiles, projected-CRS DEMs, BigTIFF and imagery / land-cover rasters not started |
+| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler; raster processor; OSM ingestion) | Implemented for runways, packages, GeoParquet → MVT tiling with Morton ordering, geographic DEM → Terrain-RGB / normal maps / quantized mesh, and OSM PBF roads and aeroways → spline GeoParquet; not yet run on a real OSM extract (the session's network policy blocked the download hosts); OSM buildings, water and land use, relations (turn restrictions, multipolygons), FlatGeobuf, H3, 3D Tiles, projected-CRS DEMs, BigTIFF and imagery / land-cover rasters not started |
 
 Anything that needs Unreal (Nanite, PCG, virtual heightfield, decals, raymarcher) lives in
 the client project and is out of scope here.
@@ -194,6 +201,36 @@ cargo run -p nosim-compiler --release -- validate [--strict] [--json] <package-o
 ```sh
 cargo run -p nosim-compiler --release -- tiles --input features.parquet --output tiles/ [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]
 ```
+
+```sh
+cargo run -p nosim-compiler --release -- osm --input extract.osm.pbf --output splines.geoparquet [--bbox <west,south,east,north>] [--threads <n>]
+```
+
+`osm` builds the §3 `spline_networks` table from an OpenStreetMap PBF extract. It keeps
+`highway=*` lines (except proposed, construction, platforms and the like) and the aeroway
+lines an aircraft moves along (`runway`, `taxiway`, `taxilane`, `parking_position`),
+skipping anything tagged `area=yes`. Each way becomes one LineString row, or several when
+an extract cut it and some of its nodes are missing. Tags are normalised so the simulation
+never parses strings:
+
+- `speed_mps` is the IDM target speed. `maxspeed` is parsed as km/h, mph or knots; when it
+  is absent or not numeric, a class default applies and `speed_source` says `default`.
+- `oneway` is 1 along the node order, −1 against it, 0 both ways. Motorways and
+  roundabouts imply 1, as in OSM.
+- `lanes`, `width_m` (metres or feet), `bridge`, `tunnel`, `layer`, `surface`, `name`,
+  `ref` and the geodesic `length_m` sit alongside.
+
+The reader is hand-written and handles raw and zlib blobs, plain and dense nodes, and
+inline way locations. It refuses LZMA, LZ4 and ZSTD blobs and unknown required features
+by name. It decodes in two parallel passes, the second keeping only the nodes the kept ways
+use. `--bbox` keeps splines with at least one point inside, whole. `validate` checks a
+package's spline table: readable, at least two points per row, stored lengths matching the
+geometry, valid speeds and directions, and a warning for splines wholly outside the bounds.
+
+The fixture is a synthetic network drawn around the synthetic runways, so its geometry is
+invented rather than OpenStreetMap data. It is written by libosmium in its default
+encoding and again with plain nodes and no compression, so the decoder is tested on a real
+producer's output. A run on a real Geofabrik extract is still to do.
 
 ```sh
 cargo run -p nosim-compiler --release -- raster --input dem.tif --output terrain/ [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]

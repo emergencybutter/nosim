@@ -18,6 +18,7 @@ use std::path::Path;
 use nosim::geodesy::{Geodetic, MOON_RADIUS_M, WGS84_A, WGS84_B, geodetic_to_ecef};
 
 use crate::CompileError;
+use crate::par::parallel_map;
 use crate::tiler::TileId;
 use geotiff::Dem;
 use quantized_mesh::GeoTile;
@@ -186,8 +187,7 @@ pub fn process(dem: &Dem, out: &Path, opts: &RasterOptions) -> Result<RasterSumm
         ..Default::default()
     };
 
-    let threads =
-        if opts.threads == 0 { std::thread::available_parallelism().map_or(1, usize::from) } else { opts.threads };
+    let threads = crate::par::thread_count(opts.threads);
 
     if opts.terrain_rgb || opts.normals {
         let tiles: Vec<TileId> = (opts.min_zoom..=opts.max_zoom).flat_map(|z| mercator_tiles(bounds, z)).collect();
@@ -303,45 +303,6 @@ pub fn process(dem: &Dem, out: &Path, opts: &RasterOptions) -> Result<RasterSumm
     Ok(summary)
 }
 
-/// Applies `f` to every item on `threads` scoped workers that take the next unclaimed item,
-/// returning results in input order. Stops handing out work after the first error and
-/// returns the error from the earliest failing item.
-fn parallel_map<T: Sync, R: Send>(
-    items: &[T],
-    threads: usize,
-    f: impl Fn(&T) -> Result<R, CompileError> + Sync,
-) -> Result<Vec<R>, CompileError> {
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    let next = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
-    let slots: Vec<Mutex<Option<Result<R, CompileError>>>> = items.iter().map(|_| Mutex::new(None)).collect();
-    std::thread::scope(|scope| {
-        for _ in 0..threads.clamp(1, items.len().max(1)) {
-            scope.spawn(|| {
-                while !failed.load(Ordering::Relaxed) {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = items.get(i) else { break };
-                    let r = f(item);
-                    if r.is_err() {
-                        failed.store(true, Ordering::Relaxed);
-                    }
-                    *slots[i].lock().expect("no panics while holding the slot") = Some(r);
-                }
-            });
-        }
-    });
-    let mut out = Vec::with_capacity(items.len());
-    for slot in slots {
-        match slot.into_inner().expect("workers joined") {
-            Some(Ok(r)) => out.push(r),
-            Some(Err(e)) => return Err(e),
-            None => {} // never claimed because an earlier item failed; that error follows
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,18 +317,6 @@ mod tests {
         assert!((m[1] - (MOON_RADIUS_M + 100.0)).abs() < 1e-6);
         assert_eq!(Body::parse("Moon"), Some(Body::Moon));
         assert_eq!(Body::parse("mars"), None);
-    }
-
-    #[test]
-    fn parallel_map_keeps_order_and_reports_errors() {
-        let items: Vec<u32> = (0..1000).collect();
-        for threads in [1, 3, 8] {
-            let out = parallel_map(&items, threads, |&i| Ok(i * 2)).unwrap();
-            assert_eq!(out, items.iter().map(|i| i * 2).collect::<Vec<_>>());
-        }
-        let err = parallel_map(&items, 4, |&i| if i == 500 { Err(CompileError::Raster("boom".into())) } else { Ok(i) });
-        assert!(matches!(err, Err(CompileError::Raster(m)) if m == "boom"));
-        assert_eq!(parallel_map(&[] as &[u32], 4, |&i| Ok(i)).unwrap(), Vec::<u32>::new());
     }
 
     #[test]
