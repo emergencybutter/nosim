@@ -101,6 +101,8 @@ pub struct SplineRow {
     pub node_ids: Option<Vec<i64>>,
     /// Motor-vehicle access: the first of `motor_vehicle`, `motorcar`, `vehicle`, `access`.
     pub access: Option<String>,
+    /// Pedestrian access: `foot`, or `access` when `foot` is absent.
+    pub foot: Option<String>,
 }
 
 /// `highway` values that are not drivable or walkable lines.
@@ -355,6 +357,7 @@ pub fn extract(path: &Path, opts: &OsmOptions) -> Result<(Vec<SplineRow>, OsmSum
         let oneway = parse_oneway(&way, network, &class);
         let access =
             ["motor_vehicle", "motorcar", "vehicle", "access"].iter().find_map(|k| way.tag(k)).map(str::to_owned);
+        let foot = ["foot", "access"].iter().find_map(|k| way.tag(k)).map(str::to_owned);
         for (part, run) in runs.into_iter().enumerate() {
             let (ids, points): (Vec<i64>, Vec<(f64, f64)>) = run.into_iter().unzip();
             if let Some((w, s, e, n)) = opts.bbox
@@ -383,6 +386,7 @@ pub fn extract(path: &Path, opts: &OsmOptions) -> Result<(Vec<SplineRow>, OsmSum
                 points,
                 node_ids: Some(ids),
                 access: access.clone(),
+                foot: foot.clone(),
             });
         }
     }
@@ -413,6 +417,7 @@ fn schema() -> Arc<Schema> {
         Field::new("surface", DataType::Utf8, true),
         Field::new("length_m", DataType::Float64, false),
         Field::new("access", DataType::Utf8, true),
+        Field::new("foot", DataType::Utf8, true),
         Field::new("node_ids", DataType::List(Arc::new(Field::new("item", DataType::Int64, false))), true),
         Field::new("geometry", DataType::Binary, false),
     ]))
@@ -456,6 +461,7 @@ pub fn write_splines(path: &Path, rows: &[SplineRow]) -> Result<(), CompileError
         Arc::new(StringArray::from_iter(rows.iter().map(|r| r.surface.as_deref()))),
         Arc::new(Float64Array::from_iter_values(rows.iter().map(|r| r.length_m))),
         Arc::new(StringArray::from_iter(rows.iter().map(|r| r.access.as_deref()))),
+        Arc::new(StringArray::from_iter(rows.iter().map(|r| r.foot.as_deref()))),
         Arc::new(node_id_lists(rows)),
         Arc::new(BinaryArray::from_iter_values(lines.iter().map(Vec::as_slice))),
     ];
@@ -493,6 +499,7 @@ pub fn read_splines(path: &Path) -> Result<Vec<SplineRow>, CompileError> {
         let (layer, surface, length) = (i("layer")?, s("surface")?, f("length_m")?);
         // Optional in tables written before these columns existed.
         let access = b.column_by_name("access").map(|c| c.as_string::<i32>().clone());
+        let foot = b.column_by_name("foot").map(|c| c.as_string::<i32>().clone());
         let node_ids = b.column_by_name("node_ids").map(|c| c.as_list::<i32>().clone());
         let geometry = col("geometry")?.as_binary::<i32>().clone();
         let opt_s = |a: &arrow::array::StringArray, k: usize| (!a.is_null(k)).then(|| a.value(k).to_owned());
@@ -525,6 +532,7 @@ pub fn read_splines(path: &Path) -> Result<Vec<SplineRow>, CompileError> {
                     .filter(|l| !l.is_null(k))
                     .map(|l| l.value(k).as_primitive::<Int64Type>().values().to_vec()),
                 access: access.as_ref().and_then(|a| opt_s(a, k)),
+                foot: foot.as_ref().and_then(|a| opt_s(a, k)),
             });
         }
     }

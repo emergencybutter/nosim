@@ -119,7 +119,13 @@ near field needs individual vehicles on the same graph.
 **Decision needed:** whether demand stays synthetic or comes from a real source, such as
 census commuting flows.
 
-## M3 — Pedestrian navigation graph (Phase 4.3)
+## M3 — Pedestrian navigation graph (Phase 4.3) — done
+
+Done: `graph --mode walk`, shortest routes, `orca::Route` path following, and two-way
+crowd walks (`--walk-from` / `--walk-to`); see the README. On real KJFK footways, 100
+pedestrians walked a 793 m route through each other with no overlap, and the walk graph
+and route matched networkx. Terminal interiors from indoor tags, and buildings as ORCA
+obstacles, wait for OSM polygons (M4).
 
 ORCA avoids collisions but needs preferred velocities from somewhere.
 

@@ -671,6 +671,62 @@ pub fn preferred_velocity_toward(position: Vec2, goal: Vec2, speed: f64, slow_ra
     to_goal * (s / d)
 }
 
+/// A path to follow: waypoints in order, the last being the destination. It turns a route on
+/// the navigation graph into the preferred velocity ORCA needs each step.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Route {
+    waypoints: Vec<Vec2>,
+    next: usize,
+}
+
+impl Route {
+    /// A route through `waypoints`; an empty route is already finished.
+    pub fn new(waypoints: Vec<Vec2>) -> Route {
+        Route { waypoints, next: 0 }
+    }
+
+    /// Index of the waypoint being steered for.
+    pub fn next_index(&self) -> usize {
+        self.next
+    }
+
+    /// Waypoints, destination last.
+    pub fn waypoints(&self) -> &[Vec2] {
+        &self.waypoints
+    }
+
+    /// Whether `position` is within `reach` of the destination.
+    pub fn arrived(&self, position: Vec2, reach: f64) -> bool {
+        self.waypoints.last().is_none_or(|d| (*d - position).length() <= reach)
+    }
+
+    /// Preferred velocity at `position`: toward the next waypoint at `speed`, slowing inside
+    /// `reach` of the destination. A waypoint counts as passed when the agent comes within
+    /// `reach` of it, or when the agent is already beyond it along the next leg and within
+    /// three times `reach` (a crowd can push an agent around a waypoint without touching it).
+    pub fn preferred_velocity(&mut self, position: Vec2, speed: f64, reach: f64) -> Vec2 {
+        while self.next + 1 < self.waypoints.len() {
+            let w = self.waypoints[self.next];
+            let leg = self.waypoints[self.next + 1] - w;
+            let off = position - w;
+            let close = off.length() <= reach;
+            let beyond = off.length() <= 3.0 * reach && off.dot(leg) > 0.0;
+            if close || beyond {
+                self.next += 1;
+            } else {
+                break;
+            }
+        }
+        match self.waypoints.get(self.next) {
+            Some(&goal) if self.next + 1 == self.waypoints.len() => {
+                preferred_velocity_toward(position, goal, speed, reach)
+            }
+            Some(&goal) => preferred_velocity_toward(position, goal, speed, 0.0),
+            None => Vec2::default(),
+        }
+    }
+}
+
 /// Uniform grid for neighbour queries; cell size is the largest neighbour distance.
 struct Grid {
     cell: f64,
@@ -1006,5 +1062,32 @@ mod tests {
         let n = grid.neighbors(&sim.agents, me, &agent);
         assert_eq!(n.len(), 2);
         assert!(near(n[0].position.x, 1.0, 1e-12) && near(n[1].position.x, 2.0, 1e-12));
+    }
+
+    #[test]
+    fn route_following_visits_every_waypoint_in_order() {
+        // An L-shaped route; a lone agent follows it to the end and stops there.
+        let wp = vec![Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0), Vec2::new(0.0, 10.0)];
+        let mut route = Route::new(wp.clone());
+        let mut sim = Simulator::new(0.1);
+        let id = sim.add_agent(Vec2::new(0.0, 0.0), AgentParams::default()).unwrap();
+        let mut visited = Vec::new();
+        for _ in 0..600 {
+            let pos = sim.agent(id).unwrap().position;
+            let v = route.preferred_velocity(pos, 1.4, 0.5);
+            if visited.last() != Some(&route.next_index()) {
+                visited.push(route.next_index());
+            }
+            sim.set_preferred_velocity(id, v).unwrap();
+            sim.step();
+        }
+        let end = sim.agent(id).unwrap().position;
+        assert_eq!(visited, vec![0, 1, 2]);
+        assert!(route.arrived(end, 0.5), "ended at {end:?}");
+        // Pushed past a waypoint without touching it, the agent still moves on to the next leg.
+        let mut r = Route::new(wp);
+        r.preferred_velocity(Vec2::new(10.6, 0.8), 1.4, 0.5);
+        assert_eq!(r.next_index(), 1);
+        assert!(Route::new(Vec::new()).arrived(Vec2::new(5.0, 5.0), 0.5));
     }
 }

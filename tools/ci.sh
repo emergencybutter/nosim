@@ -73,6 +73,8 @@ check() {
     "$wc" osm --input fixtures/osm/kjfk_sample_plain.osm.pbf --output "$tmp/plain.geoparquet"
     "$wc" graph --input "$tmp/plain.geoparquet" --output "$tmp/graph" --mode drive --simulate 300 --min-exit-ratio 0.95
     "$wc" graph --input "$tmp/plain.geoparquet" --output "$tmp/taxi" --mode taxi --largest-component
+    "$wc" graph --input "$tmp/plain.geoparquet" --output "$tmp/walk" --mode walk \
+        --walk-from -73.783,40.644 --walk-to -73.770,40.633 --walkers 10 --walk-seconds 3600
 
     say "check passed"
 }
@@ -113,6 +115,16 @@ real_data() {
     say "routed CTM on the real KJFK drive graph (conservation, at least 95% of vehicles exit)"
     "$wc" graph --input "$dir/kjfk.geoparquet" --output "$dir/graph_sim" --mode drive --simulate 1800 --demand 300 \
         --min-exit-ratio 0.95
+
+    say "pedestrians on the real KJFK walk graph: 50 each way from Terminal 4, route vs networkx"
+    local walk
+    walk="$("$wc" graph --input "$dir/kjfk.geoparquet" --output "$dir/graph_walk" --mode walk \
+        --walk-from -73.7823,40.6441 --walk-to -73.7760,40.6455 --walkers 50 --walk-seconds 3600)"
+    echo "$walk"
+    local ends
+    ends="$(echo "$walk" | grep -o 'from OSM node [0-9]* to [0-9]*, [0-9.]*' | awk '{print $4, $6, $7}' | tr -d ',')"
+    # shellcheck disable=SC2086 # three words on purpose
+    python3 tools/check_road_graph.py "$dir/kjfk.geoparquet" "$dir/graph_walk" walk --path $ends
 
     say "hybrid traffic on real KJFK: vehicles within 1.5 km of Terminal 4, the CTM beyond"
     "$wc" graph --input "$dir/kjfk.geoparquet" --output "$dir/graph_hybrid" --mode drive --simulate 1800 --demand 300 \

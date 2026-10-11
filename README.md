@@ -46,7 +46,8 @@ src/
   traffic/hybrid.rs Near-field IDM / MOBIL vehicles on graph edges with zipper
                  merging, coupled to the CTM beyond, handoff both ways (spec §7)
   traffic/orca.rs ORCA pedestrian avoidance (RVO2 port): agents,
-                 polygon obstacles, 2D LP with safest-velocity fallback (spec §7B)
+                 polygon obstacles, 2D LP with safest-velocity fallback,
+                 route following from the navigation graph (spec §7B)
   photometry.rs  Hapke regolith BRDF, Chapman function, limb shell    (spec §8B, §8C)
   lod.rs         Altitude-band LOD governor, ECI / MCI / ICRF choice  (spec §2, §8)
 ffi/
@@ -156,6 +157,7 @@ manual dispatch, with downloads cached for a week.
 | §7B — ORCA: a head-on pair and six agents in opposing corridor streams pass with zero overlap; a block is never penetrated (stops at the face alone, routes around with waypoints); walls hold from both sides; a 24-agent circle crossing arrives with overlap bounded by the infeasible-crush fallback; results are deterministic and independent of insertion order | `traffic::orca` |
 | §7 — CTM: vehicles conserved and bounded, free-flow platoon moves exactly one cell per step, steady demand gives density `q / v_f` in every cell, a closed exit sends a shockwave upstream at the wave speed, merges split capacity by priority, a blocked diverge branch holds the whole node (FIFO), spawn count at the near-field boundary equals the exited flow; the general junction equals the merge with one exit and the diverge with one entrance, and on 2,000 random intersections never exceeds a supply or a demand, keeps each approach's turns in proportion, and holds an input back only behind a full exit; links shorter than one step stay conserved and below jam | `traffic::ctm` |
 | §7 near-field vehicles and handoff — on a far/near/far corridor every step conserves vehicles to 1e-9, never lets two overlap, and free-flowing vehicles drive near `v₀`; with the far exit closed the near edge holds a standing queue at the IDM jam gap and the queue spills back into the incoming CTM link; turning choices match their weights (3:1 → 75% ± 5%); MOBIL spreads a packed lane into a free one safely; a dense three-lane ring never clamps a position; runs with the same seed are identical | `traffic::hybrid` |
+| §7B pedestrian navigation — walk mode keeps footpaths and streets two-way at walking pace, drops motorways and `foot=no`; shortest routes equal a brute-force search on every pair of a small grid; a route follower visits every waypoint in order even when pushed past one; two crowds of 20 walk the fixture route through each other with no overlap, all arrive within 20% of walking alone, and reversing the insertion order of simultaneous entrants changes nothing | `traffic::orca`, `graph`, `compiler/tests/graph.rs` |
 | §7 road graph — on the fixture, the drive graph splits the JFK Expressway at its two junctions, keeps it one-way, implies the ramp's direction, reverses the Nassau Expressway, halves Rockaway Boulevard's lanes per direction, closes the roundabout as a loop, leaves out the bus lane closed to cars, and finds the expected 12 components; the taxi graph is one two-way component; an open CTM run accounts for every vehicle and a closed one circulates over every link without loss | `compiler/tests/graph.rs`, `graph` |
 | §8C — opposition surge and full-moon limb flattening vs Lambert | `photometry::hapke_opposition_and_limb_flattening` |
 | §8B — limb is the *brightest* part of the atmosphere, finite airmass (~35) at the horizon | `photometry::limb_is_brightest`, `photometry::chapman_function` |
@@ -171,7 +173,7 @@ manual dispatch, with downloads cached for a week.
 | §4 ARINC 424 decode, extrusion, grade fit, markings data, heightfield patching | Implemented; patching is baked into the terrain tiles and an optional patched DEM; decals and the runtime virtual heightfield are engine-side |
 | §5 Seed hash, Poisson levels, pier spacing, flatten falloff | Implemented; WFC/PCG graphs and bridge detection are engine-side |
 | §6 Calendar, declination, lapse rate, phenology, snow mask | Implemented; GPU buffer plumbing is engine-side |
-| §7 IDM, MOBIL, VAT addressing, CTM far-field with general junctions, routed demand, near-field vehicles with handoff, road graph from OSM, ORCA crowds | Implemented; demand is synthetic (by sink capacity), there is no intersection control (signals, yielding to crossing traffic), and turning is by routed shares rather than per-vehicle destinations; the ECS and the pedestrian navigation graph that feeds ORCA its preferred velocities are engine-side |
+| §7 IDM, MOBIL, VAT addressing, CTM far-field with general junctions, routed demand, near-field vehicles with handoff, road graph from OSM, ORCA crowds | Implemented; demand is synthetic (by sink capacity), there is no intersection control (signals, yielding to crossing traffic), and turning is by routed shares rather than per-vehicle destinations; pedestrians follow walk-graph routes but buildings are not yet obstacles; the ECS is engine-side |
 | §8A VSOP87D / ELP 2000-82B evaluators, nutation, apparent places, topocentric vectors, phase, libration | Implemented (see below); physical libration (≤ 0.04°) not modelled |
 | §8A Yale Bright Star Catalogue loader, packed buffer, Planckian colour | Implemented; the catalogue itself goes to V ≈ 7.96, deeper than the spec's "to 6.5" |
 | §6/§8A Time scales (UTC → UT1 / TT / TDB, ΔT) | Implemented; DUT1 is an input (IERS Bulletin A), leap-second table valid through 2026-12-28 |
@@ -233,7 +235,7 @@ cargo run -p nosim-compiler --release -- tiles --input features.parquet --output
 ```
 
 ```sh
-cargo run -p nosim-compiler --release -- graph --input splines.geoparquet --output graph/ [--mode drive|taxi] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>] [--capacity-split] [--assign-iterations <n>] [--min-exit-ratio <r>]]
+cargo run -p nosim-compiler --release -- graph --input splines.geoparquet --output graph/ [--mode drive|taxi|walk] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>] [--capacity-split] [--assign-iterations <n>] [--min-exit-ratio <r>]]
 ```
 
 `graph` turns a spline table into the directed graph the §7 traffic layer runs on, written
@@ -246,7 +248,10 @@ motorways and trunks and one elsewhere.
 
 - **Modes.** `drive` keeps roads open to motor vehicles: motorway down to service roads,
   without anything tagged `access`, `vehicle`, `motorcar` or `motor_vehicle` = `no`.
-  `taxi` keeps runways, taxiways, taxilanes and stands. The two never connect.
+  `taxi` keeps runways, taxiways, taxilanes and stands. `walk` keeps every road class but
+  motorways and trunks (footways, paths, steps, pedestrian streets, and the sidewalks of
+  ordinary streets), without anything tagged `foot` (or `access`) = `no`, `private` or
+  `use_sidepath`. Walk edges are always two-way, at 1.4 m/s. The modes never connect.
 - **Components.** Each node and edge carries its strongly connected component, 0 being
   the largest. `--largest-component` keeps only that one: every node in it can reach every
   other.
@@ -283,6 +288,24 @@ Routing is what makes the real network work:
 
 Without routes, traffic drifts into pockets that have no exit and fills them. Routed, it
 keeps to motorways, ramps and arterials, and one source that can reach no exit stays idle.
+
+**Pedestrians** (§7B). In walk mode, `--walk-from lon,lat --walk-to lon,lat` snaps both
+points to the nearest walk nodes and finds the shortest route between them. It then walks
+`--walkers` pedestrians each way along it, through each other.
+
+- **Avoidance.** Each pedestrian follows the route with `orca::Route`, which turns the
+  waypoints into ORCA's preferred velocity, and ORCA keeps everyone apart.
+- **Entry.** Pedestrians enter every 2 s per direction, once their entry spot is clear.
+- **Report.** The run reports arrivals, mean and slowest travel time against walking alone,
+  and the closest approach between two bodies. It fails on any overlap, or if someone has
+  not arrived by `--walk-seconds`.
+
+On the real KJFK walk graph (7,287 nodes, 19,314 edges), 50 people each way between
+Terminal 4 and a point 570 m east-north-east walk a 793 m route. All 100 arrive, in a mean
+552 s against 566 s alone, and no two ever overlap. `tools/check_road_graph.py` rebuilds
+the walk graph with networkx and finds the same nodes, edges and route length. Buildings
+are not yet obstacles (that needs OSM polygons, roadmap M4), so pedestrians are kept apart
+from each other but not from walls.
 
 **Near field.** `--near-field lon,lat,radius_m` runs the hybrid simulation instead. Inside the
 circle every vehicle is simulated individually on the graph's edges: IDM car following at

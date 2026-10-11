@@ -29,9 +29,9 @@ fn main() -> ExitCode {
             if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         Command::Graph(args) => match run_graph(&args) {
-            Ok((_, s, sim, hybrid)) => {
+            Ok(nosim_compiler::GraphRun { summary: s, sim, hybrid, walk, .. }) => {
                 println!(
-                    "{}: {} spline(s) used ({} other class, {} closed to motor vehicles) → {} segment(s)",
+                    "{}: {} spline(s) used ({} other class, {} closed to this mode) → {} segment(s)",
                     args.input.display(),
                     s.splines_used,
                     s.splines_other,
@@ -66,6 +66,34 @@ fn main() -> ExitCode {
                         100.0 * min
                     );
                     return ExitCode::FAILURE;
+                }
+                if let Some(w) = &walk {
+                    println!(
+                        "walk: route of {} edge(s) from OSM node {} to {}, {:.2} m ({:.0} m straight); {} pedestrian(s) both ways, {} arrived; mean {:.0} s, slowest {:.0} s, alone {:.0} s; closest approach {:.3} m between bodies",
+                        w.route_edges,
+                        w.route_ends_osm.0.map_or("-".to_owned(), |n| n.to_string()),
+                        w.route_ends_osm.1.map_or("-".to_owned(), |n| n.to_string()),
+                        w.route_length_m,
+                        w.straight_m,
+                        w.walkers,
+                        w.arrived,
+                        w.mean_time_s,
+                        w.max_time_s,
+                        w.free_time_s,
+                        w.min_clearance_m
+                    );
+                    if w.min_clearance_m < -1e-6 {
+                        eprintln!("error: two pedestrians overlapped by {:.3} m", -w.min_clearance_m);
+                        return ExitCode::FAILURE;
+                    }
+                    if w.arrived < w.walkers {
+                        eprintln!(
+                            "error: {} pedestrian(s) did not arrive within {} s",
+                            w.walkers - w.arrived,
+                            args.walk_seconds
+                        );
+                        return ExitCode::FAILURE;
+                    }
                 }
                 if let Some(h) = &hybrid {
                     println!(

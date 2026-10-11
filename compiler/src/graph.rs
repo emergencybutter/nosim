@@ -28,14 +28,18 @@ pub enum Mode {
     Drive,
     /// Aircraft movement lines: runways, taxiways, taxilanes, stands.
     Taxi,
+    /// Ways people walk: footways, paths, steps, pedestrian streets, and the sidewalks of
+    /// ordinary streets. Every edge is two-way at walking pace.
+    Walk,
 }
 
 impl Mode {
-    /// Parses `drive` / `taxi`.
+    /// Parses `drive` / `taxi` / `walk`.
     pub fn parse(s: &str) -> Option<Mode> {
         match s {
             "drive" => Some(Mode::Drive),
             "taxi" => Some(Mode::Taxi),
+            "walk" => Some(Mode::Walk),
             _ => None,
         }
     }
@@ -165,8 +169,21 @@ fn key(row: &SplineRow, i: usize) -> Key {
     }
 }
 
+/// `highway` classes a pedestrian may not use.
+pub const NO_WALK_CLASSES: &[&str] = &["motorway", "motorway_link", "trunk", "trunk_link", "raceway", "bus_guideway"];
+
+/// `foot` values that close a way to pedestrians (`use_sidepath`: a separately mapped
+/// sidewalk carries them instead).
+const NO_FOOT: &[&str] = &["no", "use_sidepath", "private"];
+
+/// Walking speed on every edge of a walk graph, m/s.
+pub const WALK_SPEED_MPS: f64 = 1.4;
+
 fn wanted(row: &SplineRow, mode: Mode) -> Result<(), bool> {
     match mode {
+        Mode::Walk if row.network == Network::Road && !NO_WALK_CLASSES.contains(&row.class.as_str()) => {
+            if row.foot.as_deref().is_some_and(|f| NO_FOOT.contains(&f)) { Err(true) } else { Ok(()) }
+        }
         Mode::Taxi if row.network == Network::Aeroway => Ok(()),
         Mode::Drive if row.network == Network::Road && DRIVE_CLASSES.contains(&row.class.as_str()) => {
             if row.access.as_deref().is_some_and(|a| NO_ACCESS.contains(&a)) { Err(true) } else { Ok(()) }
@@ -253,7 +270,7 @@ pub fn build(rows: &[SplineRow], mode: Mode, largest_only: bool) -> (Graph, Grap
                 continue; // repeated node
             }
             summary.segments += 1;
-            let lanes = if mode == Mode::Taxi { 1 } else { lanes_per_direction(r) };
+            let lanes = if mode == Mode::Drive { lanes_per_direction(r) } else { 1 };
             let edge = |from: u32, to: u32, points: Vec<(f64, f64)>| GraphEdge {
                 from,
                 to,
@@ -262,7 +279,7 @@ pub fn build(rows: &[SplineRow], mode: Mode, largest_only: bool) -> (Graph, Grap
                 class: r.class.clone(),
                 name: r.name.clone(),
                 reference: r.reference.clone(),
-                speed_mps: r.speed_mps,
+                speed_mps: if mode == Mode::Walk { WALK_SPEED_MPS } else { r.speed_mps },
                 lanes,
                 length_m,
                 bridge: r.bridge,
@@ -273,7 +290,8 @@ pub fn build(rows: &[SplineRow], mode: Mode, largest_only: bool) -> (Graph, Grap
                 points,
             };
             let reversed = || pts.iter().rev().copied().collect::<Vec<_>>();
-            match r.oneway {
+            // One-way rules do not bind pedestrians.
+            match if mode == Mode::Walk { 0 } else { r.oneway } {
                 1 => edges.push(edge(from, to, pts.clone())),
                 -1 => edges.push(edge(to, from, reversed())),
                 _ => {
@@ -917,6 +935,190 @@ pub fn simulate_hybrid(
     Ok(s)
 }
 
+/// The graph node nearest a point (by distance on the ellipsoid surface), if any.
+pub fn nearest_node(g: &Graph, lon: f64, lat: f64) -> Option<u32> {
+    use nosim::geodesy::{Geodetic, geodetic_to_ecef};
+    let p = geodetic_to_ecef(Geodetic::new(lat, lon, 0.0));
+    (0..g.nodes.len() as u32).min_by(|&a, &b| {
+        let da = geodetic_to_ecef(Geodetic::new(g.nodes[a as usize].lat, g.nodes[a as usize].lon, 0.0)).distance(p);
+        let db = geodetic_to_ecef(Geodetic::new(g.nodes[b as usize].lat, g.nodes[b as usize].lon, 0.0)).distance(p);
+        da.total_cmp(&db)
+    })
+}
+
+/// Shortest path by length from `from` to `to`: the edges in order and the total length.
+pub fn shortest_path(g: &Graph, from: u32, to: u32) -> Option<(Vec<u32>, f64)> {
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); g.nodes.len()];
+    for (k, e) in g.edges.iter().enumerate() {
+        out[e.from as usize].push(k as u32);
+    }
+    let cost: Vec<f64> = g.edges.iter().map(|e| e.length_m).collect();
+    let pred = dijkstra(g, &out, from, &cost);
+    if from == to {
+        return Some((Vec::new(), 0.0));
+    }
+    pred[to as usize]?;
+    let mut path = Vec::new();
+    let mut v = to;
+    while let Some(e) = pred[v as usize] {
+        path.push(e);
+        v = g.edges[e as usize].from;
+        if v == from {
+            break;
+        }
+    }
+    path.reverse();
+    let len = path.iter().map(|&e| g.edges[e as usize].length_m).sum();
+    Some((path, len))
+}
+
+/// Result of [`simulate_walk`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WalkSummary {
+    /// OSM node ids at the route's ends, when the graph has them.
+    pub route_ends_osm: (Option<i64>, Option<i64>),
+    /// Edges on the route.
+    pub route_edges: usize,
+    /// Route length, metres.
+    pub route_length_m: f64,
+    /// Straight-line distance between the route's ends, metres.
+    pub straight_m: f64,
+    /// Pedestrians started, both directions together.
+    pub walkers: usize,
+    /// Pedestrians that reached their destination.
+    pub arrived: usize,
+    /// Mean time to arrive from entry, seconds.
+    pub mean_time_s: f64,
+    /// Slowest arrival, seconds.
+    pub max_time_s: f64,
+    /// Time to walk the route alone at the preferred speed, seconds.
+    pub free_time_s: f64,
+    /// Smallest distance between two pedestrians' edges (centre distance minus both radii)
+    /// at any step, metres; negative would be an overlap.
+    pub min_clearance_m: f64,
+    /// Steps run.
+    pub steps: usize,
+}
+
+/// Walks `walkers_each_way` pedestrians from the node nearest `from` to the node nearest `to`
+/// along the shortest walk route, and as many the other way, through each other, with ORCA
+/// avoidance and [`nosim::traffic::orca::Route`] following. Pedestrians enter every 2 s per
+/// direction just behind their first waypoint, once the spot is clear, and leave within 1 m
+/// of their destination. Times are measured from each pedestrian's own entry. With
+/// `reverse_insertion`, pedestrians entering at the same moment are added in reverse order.
+pub fn simulate_walk(
+    g: &Graph,
+    from: (f64, f64),
+    to: (f64, f64),
+    walkers_each_way: usize,
+    seconds: f64,
+    reverse_insertion: bool,
+) -> Result<(WalkSummary, Vec<f64>), CompileError> {
+    use nosim::geodesy::{EnuFrame, Geodetic, geodetic_to_ecef};
+    use nosim::traffic::orca::{AgentParams, Route, Simulator, Vec2};
+    let (a, b) = match (nearest_node(g, from.0, from.1), nearest_node(g, to.0, to.1)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return Err(CompileError::Graph("walk graph is empty".into())),
+    };
+    let (path, length) =
+        shortest_path(g, a, b).ok_or_else(|| CompileError::Graph("no walk route between the two points".into()))?;
+    let mid = (
+        (g.nodes[a as usize].lon + g.nodes[b as usize].lon) / 2.0,
+        (g.nodes[a as usize].lat + g.nodes[b as usize].lat) / 2.0,
+    );
+    let frame = EnuFrame::at(Geodetic::new(mid.1, mid.0, 0.0));
+    let local = |lon: f64, lat: f64| {
+        let p = frame.to_enu(geodetic_to_ecef(Geodetic::new(lat, lon, 0.0)));
+        Vec2::new(p.x, p.y)
+    };
+    let mut forward: Vec<Vec2> = vec![local(g.nodes[a as usize].lon, g.nodes[a as usize].lat)];
+    for &e in &path {
+        for &(lon, lat) in &g.edges[e as usize].points[1..] {
+            forward.push(local(lon, lat));
+        }
+    }
+    let backward: Vec<Vec2> = forward.iter().rev().copied().collect();
+    let params = AgentParams::default();
+    let mut sim = Simulator::new(0.1);
+    // Pedestrians enter one every SPAWN_INTERVAL_S per direction, at a spot just behind the
+    // first waypoint, once that spot is clear: crowds arrive over time rather than packed.
+    const SPAWN_INTERVAL_S: f64 = 2.0;
+    let mut plans: Vec<(Vec2, Vec<Vec2>, f64)> = Vec::new();
+    for route in [&forward, &backward] {
+        let start = route[0];
+        let dir = if route.len() > 1 { (route[1] - start).normalized() } else { Vec2::new(1.0, 0.0) };
+        for i in 0..walkers_each_way {
+            plans.push((start - dir * 1.0, route.clone(), i as f64 * SPAWN_INTERVAL_S));
+        }
+    }
+    // Agents due at the same moment are added in plan order, or reversed.
+    let mut pending: Vec<usize> = (0..plans.len()).collect();
+    pending.sort_by(|&x, &y| {
+        plans[x].2.total_cmp(&plans[y].2).then(if reverse_insertion { y.cmp(&x) } else { x.cmp(&y) })
+    });
+    let mut walkers: Vec<Option<(usize, Route)>> = vec![None; plans.len()];
+    let mut times = vec![f64::INFINITY; plans.len()];
+    let steps = (seconds / sim.time_step()).round() as usize;
+    let mut s = WalkSummary {
+        route_ends_osm: (g.nodes[a as usize].osm_id, g.nodes[b as usize].osm_id),
+        route_edges: path.len(),
+        route_length_m: length,
+        straight_m: (forward[0] - forward[forward.len() - 1]).length(),
+        walkers: plans.len(),
+        free_time_s: length / params.max_speed,
+        min_clearance_m: f64::INFINITY,
+        steps,
+        ..Default::default()
+    };
+    for step in 0..steps {
+        let t = step as f64 * sim.time_step();
+        let mut still = Vec::new();
+        for &i in &pending {
+            let (spot, route, due) = &plans[i];
+            let clear = walkers
+                .iter()
+                .flatten()
+                .all(|(id, _)| (sim.agent(*id).expect("live").position - *spot).length() >= 2.0 * params.radius + 0.2);
+            if *due <= t && clear {
+                let id = sim.add_agent(*spot, params).map_err(|e| CompileError::Graph(format!("orca: {e:?}")))?;
+                walkers[i] = Some((id, Route::new(route.clone())));
+            } else {
+                still.push(i);
+            }
+        }
+        pending = still;
+        for (i, w) in walkers.iter_mut().enumerate() {
+            let Some((id, route)) = w else { continue };
+            let pos = sim.agent(*id).expect("live").position;
+            if route.arrived(pos, 1.0) {
+                times[i] = t - plans[i].2;
+                sim.remove_agent(*id);
+                *w = None;
+                continue;
+            }
+            let v = route.preferred_velocity(pos, params.max_speed, 1.0);
+            sim.set_preferred_velocity(*id, v).expect("live");
+        }
+        if pending.is_empty() && walkers.iter().all(Option::is_none) {
+            break;
+        }
+        sim.step();
+        let live: Vec<Vec2> = walkers.iter().flatten().map(|(id, _)| sim.agent(*id).expect("live").position).collect();
+        for i in 0..live.len() {
+            for j in i + 1..live.len() {
+                s.min_clearance_m = s.min_clearance_m.min((live[i] - live[j]).length() - 2.0 * params.radius);
+            }
+        }
+    }
+    // Arrival times (from each pedestrian's own start) in plan order, so runs with different
+    // insertion orders compare directly.
+    let done: Vec<f64> = times.iter().copied().filter(|t| t.is_finite()).collect();
+    s.arrived = done.len();
+    s.mean_time_s = if done.is_empty() { 0.0 } else { done.iter().sum::<f64>() / done.len() as f64 };
+    s.max_time_s = done.iter().copied().fold(0.0, f64::max);
+    Ok((s, times))
+}
+
 const EDGE_GEO: &str = r#"{"version":"1.0.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":["LineString"],"crs":null,"edges":"planar"}}}"#;
 const NODE_GEO: &str = r#"{"version":"1.0.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":["Point"],"crs":null,"edges":"planar"}}}"#;
 
@@ -1101,6 +1303,7 @@ mod tests {
             points,
             node_ids: Some(ids.to_vec()),
             access: None,
+            foot: None,
         }
     }
 
@@ -1311,5 +1514,71 @@ mod tests {
                 assert_eq!(*w, 0.0, "routed traffic turned into the pocket");
             }
         }
+    }
+
+    #[test]
+    fn walk_mode_keeps_footpaths_and_streets_both_ways() {
+        let mut motorway = row(1, 1, &[1, 2], None);
+        motorway.class = "motorway".into();
+        let mut closed = row(2, 0, &[2, 3], None);
+        closed.foot = Some("no".into());
+        let mut footway = row(3, 0, &[3, 4], None);
+        footway.class = "footway".into();
+        let one_way_street = row(4, 1, &[4, 5], Some(2)); // residential, one-way for cars
+        let (g, s) = build(&[motorway, closed, footway, one_way_street.clone()], Mode::Walk, false);
+        assert_eq!((s.splines_used, s.splines_no_access, s.splines_other), (2, 1, 1));
+        // Both kept ways are two-way on foot, one lane, at walking pace.
+        assert_eq!(g.edges.len(), 4);
+        assert!(g.edges.iter().all(|e| e.reverse.is_some() && e.lanes == 1 && e.speed_mps == WALK_SPEED_MPS));
+        // The same street in drive mode stays one-way.
+        let (d, _) = build(&[one_way_street], Mode::Drive, false);
+        assert_eq!(d.edges.len(), 1);
+        assert_eq!(Mode::parse("walk"), Some(Mode::Walk));
+    }
+
+    #[test]
+    fn shortest_path_matches_brute_force() {
+        // A small grid with some long edges; compare against enumerating simple paths.
+        let p = [(-73.80, 40.60), (-73.79, 40.60), (-73.78, 40.60), (-73.80, 40.61), (-73.79, 40.61), (-73.78, 40.61)];
+        let mut e = Vec::new();
+        for (a, b) in [(0, 1), (1, 2), (3, 4), (4, 5), (0, 3), (1, 4), (2, 5), (0, 4)] {
+            e.push((a, b, 1.4, 1));
+            e.push((b, a, 1.4, 1));
+        }
+        let g = hand_graph(&p, &e);
+        fn brute(g: &Graph, v: u32, to: u32, seen: &mut Vec<bool>, len: f64, best: &mut f64) {
+            if v == to {
+                *best = best.min(len);
+                return;
+            }
+            for e in g.edges.iter().filter(|e| e.from == v) {
+                if !seen[e.to as usize] {
+                    seen[e.to as usize] = true;
+                    brute(g, e.to, to, seen, len + e.length_m, best);
+                    seen[e.to as usize] = false;
+                }
+            }
+        }
+        for from in 0..6u32 {
+            for to in 0..6u32 {
+                let (path, len) = shortest_path(&g, from, to).unwrap();
+                let mut seen = vec![false; 6];
+                seen[from as usize] = true;
+                let mut best = f64::INFINITY;
+                brute(&g, from, to, &mut seen, 0.0, &mut best);
+                assert!((len - best).abs() < 1e-9, "{from}→{to}: {len} vs {best}");
+                // The path is connected from `from` to `to`.
+                let mut v = from;
+                for &k in &path {
+                    assert_eq!(g.edges[k as usize].from, v);
+                    v = g.edges[k as usize].to;
+                }
+                assert_eq!(v, to);
+            }
+        }
+        assert_eq!(nearest_node(&g, -73.7801, 40.6099), Some(5));
+        // Disconnected: no path.
+        let lone = hand_graph(&p[..2], &[]);
+        assert!(shortest_path(&lone, 0, 1).is_none());
     }
 }

@@ -173,6 +173,29 @@ fn hybrid_near_field_on_the_fixture() {
 }
 
 #[test]
+fn pedestrians_walk_the_route_both_ways_without_overlap() {
+    // The fixture's walk network leaves out the expressways; Terminal 4's road connects to
+    // the Nassau end through Lefferts Boulevard.
+    let (g, s) = graph::build(&splines(), Mode::Walk, false);
+    assert!(s.splines_used > 0 && g.edges.iter().all(|e| e.reverse.is_some()));
+    assert!(!g.edges.iter().any(|e| e.class.starts_with("motorway") || e.class.starts_with("trunk")));
+    let (from, to) = ((-73.783, 40.644), (-73.770, 40.633));
+    let (w, times) = graph::simulate_walk(&g, from, to, 20, 3600.0, false).unwrap();
+    assert_eq!((w.walkers, w.arrived), (40, 40));
+    assert!(w.min_clearance_m >= 0.0, "{}", w.min_clearance_m);
+    assert!(w.route_length_m >= w.straight_m && w.route_length_m < 2.0 * w.straight_m);
+    // Nobody is much slower than walking alone: the crowds pass each other.
+    assert!(w.max_time_s < 1.2 * w.free_time_s, "{} vs {}", w.max_time_s, w.free_time_s);
+    // Adding simultaneous entrants in the opposite order gives the same arrivals.
+    let (w2, times2) = graph::simulate_walk(&g, from, to, 20, 3600.0, true).unwrap();
+    assert_eq!(w, w2);
+    assert_eq!(times, times2);
+    // A walk off the network fails cleanly.
+    let empty = graph::Graph::default();
+    assert!(graph::simulate_walk(&empty, from, to, 1, 10.0, false).is_err());
+}
+
+#[test]
 fn cli() {
     let args = |s: &str| parse_args(s.split_whitespace().map(str::to_owned));
     match args(
@@ -188,7 +211,7 @@ fn cli() {
         }
         other => panic!("{other:?}"),
     }
-    assert!(args("graph --input a --output b --mode walk").is_err());
+    assert!(args("graph --input a --output b --mode swim").is_err());
     match args("graph --input a --output b --simulate 60 --capacity-split --assign-iterations 3 --min-exit-ratio 0.95")
         .unwrap()
     {
@@ -204,6 +227,17 @@ fn cli() {
         other => panic!("{other:?}"),
     }
     assert!(args("graph --input a --output b --near-field -73.78,40.64").is_err());
+    match args("graph --input a --output b --mode walk --walk-from -73.78,40.64 --walk-to -73.77,40.63 --walkers 5 --walk-seconds 600")
+        .unwrap()
+    {
+        Command::Graph(a) => {
+            assert_eq!(a.walk, Some(((-73.78, 40.64), (-73.77, 40.63))));
+            assert_eq!((a.walkers, a.walk_seconds), (5, 600.0));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(args("graph --input a --output b --mode walk --walk-from -73.78,40.64").is_err());
+    assert!(args("graph --input a --output b --walk-from -73.78,40.64 --walk-to -73.77,40.63").is_err()); // drive mode
     assert!(args("graph --input a --output b --near-field -73.78,40.64,0").is_err());
     assert!(args("graph --input a --output b --assign-iterations 0").is_err());
     assert!(args("graph --input a --output b --dt 0").is_err());
@@ -226,9 +260,12 @@ fn cli() {
         min_exit_ratio: None,
         near_field: None,
         near_substeps: 5,
+        walk: None,
+        walkers: 20,
+        walk_seconds: 1800.0,
     };
-    let (g, s, sim, hybrid) = run_graph(&a).unwrap();
-    assert!(hybrid.is_none());
+    let nosim_compiler::GraphRun { graph: g, summary: s, sim, hybrid, walk } = run_graph(&a).unwrap();
+    assert!(hybrid.is_none() && walk.is_none());
     // The package is clipped to its bounds, so the detached Van Wyck stretch north of it is gone.
     assert_eq!((s.nodes, s.edges), (18, 23));
     assert!(sim.unwrap().conservation_error.abs() < 1e-9);

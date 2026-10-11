@@ -223,6 +223,30 @@ pub struct GraphArgs {
     pub near_field: Option<graph::NearField>,
     /// Near-field substeps per CTM step.
     pub near_substeps: u32,
+    /// Walk two crowds between these points, `((lon, lat), (lon, lat))` (walk mode).
+    pub walk: Option<((f64, f64), (f64, f64))>,
+    /// Pedestrians in each direction.
+    pub walkers: usize,
+    /// Longest the walk may run, seconds.
+    pub walk_seconds: f64,
+}
+
+/// A longitude / latitude pair, degrees.
+pub type LonLat = (f64, f64);
+
+/// What `graph` built and ran.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphRun {
+    /// The graph written.
+    pub graph: graph::Graph,
+    /// How it was built.
+    pub summary: graph::GraphSummary,
+    /// The far-field run, with `--simulate`.
+    pub sim: Option<graph::SimSummary>,
+    /// The hybrid run, with `--simulate --near-field`.
+    pub hybrid: Option<graph::HybridSummary>,
+    /// The walk, with `--walk-from` and `--walk-to`.
+    pub walk: Option<graph::WalkSummary>,
 }
 
 /// `osm` subcommand options.
@@ -286,7 +310,7 @@ pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runwa
                          world-compiler tiles --input <features.parquet> --output <dir> [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]\n\
                          world-compiler raster --input <dem.tif> --output <dir> [--patch-runways <runways.parquet>] [--patch-roads <splines.geoparquet>] [--package <dir>] [--patched-dem <out.tif>] [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]\n\
                          world-compiler osm --input <extract.osm.pbf> --output <splines.geoparquet> [--bbox <west,south,east,north>] [--threads <n>]\n\
-                         world-compiler graph --input <splines.geoparquet> --output <dir> [--mode drive|taxi] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>] [--capacity-split] [--assign-iterations <n>] [--min-exit-ratio <r>] [--near-field <lon,lat,radius_m> [--near-substeps <n>]]]";
+                         world-compiler graph --input <splines.geoparquet> --output <dir> [--mode drive|taxi|walk] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>] [--capacity-split] [--assign-iterations <n>] [--min-exit-ratio <r>] [--near-field <lon,lat,radius_m> [--near-substeps <n>]]] [--walk-from <lon,lat> --walk-to <lon,lat> [--walkers <n>] [--walk-seconds <s>]]";
 
 /// Parses the command line (everything after the program name).
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, CompileError> {
@@ -554,9 +578,14 @@ fn parse_graph<I: Iterator<Item = String>>(mut it: I) -> Result<GraphArgs, Compi
         min_exit_ratio: None,
         near_field: None,
         near_substeps: 5,
+        walk: None,
+        walkers: 20,
+        walk_seconds: 1800.0,
     };
     let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
     let positive = |v: f64| v.is_finite() && v > 0.0;
+    // (from, to) as given so far.
+    let mut walk_points: [Option<LonLat>; 2] = [None, None];
     while let Some(flag) = it.next() {
         if flag == "--largest-component" {
             args.largest_component = true;
@@ -590,6 +619,30 @@ fn parse_graph<I: Iterator<Item = String>>(mut it: I) -> Result<GraphArgs, Compi
                     _ => return Err(bad(&flag, &value)),
                 };
             }
+            "--walk-from" | "--walk-to" => {
+                let v: Vec<f64> = value
+                    .split(',')
+                    .map(|x| x.trim().parse::<f64>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| bad(&flag, &value))?;
+                let p = match v[..] {
+                    [lon, lat] if (-180.0..=180.0).contains(&lon) && (-90.0..=90.0).contains(&lat) => (lon, lat),
+                    _ => return Err(bad(&flag, &value)),
+                };
+                let [mut from, mut to] = walk_points;
+                if flag == "--walk-from" {
+                    from = Some(p);
+                } else {
+                    to = Some(p);
+                }
+                walk_points = [from, to];
+                args.walk = from.zip(to);
+            }
+            "--walkers" => {
+                args.walkers =
+                    value.parse().ok().filter(|&n: &usize| (1..=5000).contains(&n)).ok_or_else(|| bad(&flag, &value))?
+            }
+            "--walk-seconds" => args.walk_seconds = num()?,
             "--near-substeps" => {
                 args.near_substeps =
                     value.parse().ok().filter(|&n: &u32| (1..=100).contains(&n)).ok_or_else(|| bad(&flag, &value))?
@@ -606,35 +659,38 @@ fn parse_graph<I: Iterator<Item = String>>(mut it: I) -> Result<GraphArgs, Compi
             _ => return Err(CompileError::Usage(format!("unknown flag {flag}\n{USAGE}"))),
         }
     }
+    if walk_points[0].is_some() != walk_points[1].is_some() {
+        return Err(CompileError::Usage(format!("--walk-from and --walk-to go together\n{USAGE}")));
+    }
+    if args.walk.is_some() && args.mode != graph::Mode::Walk {
+        return Err(CompileError::Usage(format!("--walk-from / --walk-to need --mode walk\n{USAGE}")));
+    }
     args.input = input.ok_or_else(|| CompileError::Usage(format!("--input is required\n{USAGE}")))?;
     args.output = output.ok_or_else(|| CompileError::Usage(format!("--output is required\n{USAGE}")))?;
     Ok(args)
 }
 
 /// Runs `graph`: builds and writes the graph, then optionally runs the CTM on it.
-pub fn run_graph(
-    args: &GraphArgs,
-) -> Result<(graph::Graph, graph::GraphSummary, Option<graph::SimSummary>, Option<graph::HybridSummary>), CompileError>
-{
+pub fn run_graph(args: &GraphArgs) -> Result<GraphRun, CompileError> {
     let rows = osm::read_splines(&args.input)?;
     let (g, summary) = graph::build(&rows, args.mode, args.largest_component);
     graph::write(&args.output, &g)?;
-    let Some(seconds) = args.simulate_s else { return Ok((g, summary, None, None)) };
-    let opts = graph::SimOptions {
-        dt_s: args.dt_s,
-        seconds,
-        demand_veh_per_s: args.demand_veh_per_h / 3600.0,
-        routed: args.routed,
-        assign_iterations: args.assign_iterations,
-    };
-    match args.near_field {
-        Some(near) => {
-            let h = graph::simulate_hybrid(&g, &opts, near, args.near_substeps)?;
-            Ok((g, summary, None, Some(h)))
-        }
-        None => {
-            let sim = graph::simulate(&g, &opts)?;
-            Ok((g, summary, Some(sim), None))
+    let mut run = GraphRun { graph: g, summary, sim: None, hybrid: None, walk: None };
+    if let Some(seconds) = args.simulate_s {
+        let opts = graph::SimOptions {
+            dt_s: args.dt_s,
+            seconds,
+            demand_veh_per_s: args.demand_veh_per_h / 3600.0,
+            routed: args.routed,
+            assign_iterations: args.assign_iterations,
+        };
+        match args.near_field {
+            Some(near) => run.hybrid = Some(graph::simulate_hybrid(&run.graph, &opts, near, args.near_substeps)?),
+            None => run.sim = Some(graph::simulate(&run.graph, &opts)?),
         }
     }
+    if let Some((from, to)) = args.walk {
+        run.walk = Some(graph::simulate_walk(&run.graph, from, to, args.walkers, args.walk_seconds, false)?.0);
+    }
+    Ok(run)
 }
