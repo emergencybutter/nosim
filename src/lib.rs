@@ -19,11 +19,13 @@
 //! | [`phenology`] | §6 four-season phase and snow mask |
 //! | [`traffic`] | §7 IDM, MOBIL, VAT addressing, CTM far field, hybrid near field, ORCA crowds |
 //! | [`photometry`] | §8B analytical limb, §8C Hapke regolith |
+//! | [`atmosphere`] | §8B precomputed atmospheric scattering tables (Bruneton) |
 //! | [`lod`] | §2 parent frame selection, §8 altitude-band governor, triangle budget |
 //! | [`flight`] | §2 / §8 translunar harness: Earth–Moon propagator, Apollo 11-like targeting, camera ride |
 
 pub mod arinc424;
 pub mod astro;
+pub mod atmosphere;
 pub mod ephem;
 pub mod flight;
 pub mod geodesy;

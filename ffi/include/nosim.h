@@ -1460,6 +1460,13 @@ enum NosimParentFrame nosim_parent_frame_for(double dist_to_earth_center_m,
 uint64_t nosim_triangle_budget(enum NosimAltitudeBand band, double altitude_m);
 
 /**
+ * Weight of the analytical limb shell at a camera altitude: 0 below `centre_km −
+ * half_width_km`, 1 above `centre_km + half_width_km`, smoothstep between, so the switch from
+ * the precomputed tables is continuous.
+ */
+double nosim_atmosphere_handover_weight(double altitude_km, double centre_km, double half_width_km);
+
+/**
  * Targets the Apollo 11-like translunar injection (1969-07-16, 334 km, 10.83 km/s, 110 km
  * periselene) and writes what it found to `out`.
  *

@@ -335,6 +335,8 @@ fn pure_value_apis() {
     assert_eq!(nosim_parent_frame_for(384_400e3, 1_800e3), NosimParentFrame::Mci);
     assert!(nosim_triangle_budget(NosimAltitudeBand::LowAltitude, 2.0) > 5_000_000);
     assert!(nosim_triangle_budget(NosimAltitudeBand::LowEarthOrbit, 150_000.0) < 100_000);
+    assert_eq!(nosim_atmosphere_handover_weight(100.0, 100.0, 10.0), 0.5);
+    assert_eq!(nosim_atmosphere_handover_weight(80.0, 100.0, 10.0), 0.0);
 }
 
 #[test]

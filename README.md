@@ -49,6 +49,9 @@ src/
                  polygon obstacles, 2D LP with safest-velocity fallback,
                  route following from the navigation graph (spec §7B)
   photometry.rs  Hapke regolith BRDF, Chapman function, limb shell    (spec §8B, §8C)
+  atmosphere.rs  Precomputed atmospheric scattering (Bruneton): transmittance, single
+                 and multiple scattering, irradiance; sky rendering from the tables; the
+                 limb shell calibrated at the hand-over                (spec §8B)
   lod.rs         Altitude-band LOD governor, ECI / MCI / ICRF choice, triangle budget
                  model                                                 (spec §2, §8)
   flight.rs      Translunar harness: Dormand–Prince 5(4), Earth–Moon point masses with
@@ -80,6 +83,7 @@ compiler/
                  GeoParquet (mod.rs); libosmium-compatible ring assembly (multipolygon.rs);
                  buildings, water, land use and coastline tables, building heights (areas.rs)
   src/bridges.rs Bridge detection: tagged decks, splines over water or DEM gorges, piers
+  src/atmosphere.rs Writes the atmosphere tables as raw f32 textures and atmosphere.json
   src/landcover.rs Land cover: categorical resampling (mode / nearest), class tiles,
                  per-class density masks with vegetation exclusions
   src/graph.rs   Road graph: splines split at shared nodes into directed edges, strongly
@@ -114,7 +118,10 @@ tools/           ephem_tables.py: reference evaluator + generator for the epheme
                  check_road_graph.py: cross-checks `graph` output against networkx;
                  check_osm_areas.py: cross-checks `areas` output against libosmium and PROJ;
                  make_landcover_fixture.py: writes the land-cover fixture through GDAL;
-                 check_landcover.py: cross-checks `landcover` output against GDAL
+                 check_landcover.py: cross-checks `landcover` output against GDAL;
+                 check_atmosphere.py: checks the atmosphere tables against quadrature,
+                 brute-force single scattering and a Monte Carlo path tracer;
+                 check_translunar.py: checks the translunar flight with SciPy and DE421
 docs/            Architecture specification; roadmap of the next milestones
 ```
 
@@ -184,6 +191,7 @@ manual dispatch, with downloads cached for a week.
 | §7B pedestrian navigation — walk mode keeps footpaths and streets two-way at walking pace, drops motorways and `foot=no`; shortest routes equal a brute-force search on every pair of a small grid; a route follower visits every waypoint in order even when pushed past one; two crowds of 20 walk the fixture route through each other with no overlap, all arrive within 20% of walking alone, and reversing the insertion order of simultaneous entrants changes nothing | `traffic::orca`, `graph`, `compiler/tests/graph.rs` |
 | §7 road graph — on the fixture, the drive graph splits the JFK Expressway at its two junctions, keeps it one-way, implies the ramp's direction, reverses the Nassau Expressway, halves Rockaway Boulevard's lanes per direction, closes the roundabout as a loop, leaves out the bus lane closed to cars, and finds the expected 12 components; the taxi graph is one two-way component; an open CTM run accounts for every vehicle and a closed one circulates over every link without loss | `compiler/tests/graph.rs`, `graph` |
 | §8C — opposition surge and full-moon limb flattening vs Lambert | `photometry::hapke_opposition_and_limb_flattening` |
+| §8B precomputed atmosphere — zenith transmittance equals the closed form; the texture parameterisations invert exactly; both phase functions integrate to one; the tables render a blue sky and a red sunset and positive indirect irradiance; the analytical shell calibrated at 100 km stays within 15% RMS of the tables and fades upwards; the hand-over weight is a smoothstep | `atmosphere`, `compiler/tests/atmosphere.rs` |
 | §8B — limb is the *brightest* part of the atmosphere, finite airmass (~35) at the horizon | `photometry::limb_is_brightest`, `photometry::chapman_function` |
 | §8 — LOD collapse past 100 km (terrain quadtree and raymarcher dropped) | `lod::policies` |
 | §10 Phase 5 — triangle budget over 5 million on the ground and under 100 thousand past 100 km | `lod::triangle_budget_collapses_past_100_km` |
@@ -204,6 +212,7 @@ manual dispatch, with downloads cached for a week.
 | §8A Yale Bright Star Catalogue loader, packed buffer, Planckian colour | Implemented; the catalogue itself goes to V ≈ 7.96, deeper than the spec's "to 6.5" |
 | §6/§8A Time scales (UTC → UT1 / TT / TDB, ΔT) | Implemented; DUT1 is an input (IERS Bulletin A), leap-second table valid through 2026-12-28 |
 | §8B/§8C Hapke BRDF, Chapman limb | Implemented as CPU reference for the shaders |
+| §8B precomputed scattering (Bruneton) | Implemented on the CPU (`nosim::atmosphere`, `world-compiler atmosphere`), with the analytical limb calibrated at the 100 km hand-over; the shaders that sample the tables are engine-side |
 | §8 LOD band policy, parent-frame selection, triangle budget model, translunar harness | Implemented; the harness's ECI is J2000 and its ECEF rotates by GMST alone (precession and nutation do not affect continuity) |
 | C ABI for the UE5 client | Implemented: every module above is reachable from C; proven by a compiled C smoke test |
 | §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler; raster processor; OSM ingestion) | Implemented for runways, packages, GeoParquet → MVT tiling with Morton ordering, geographic DEM → Terrain-RGB / normal maps / quantized mesh, and OSM PBF roads and aeroways → spline GeoParquet, matched way for way against libosmium on the New York extract; OSM buildings, water and land use from closed ways and multipolygon relations, matched area for area against libosmium; bridges; ESA WorldCover → class tiles and density masks, histogram matched against GDAL; turn restrictions, FlatGeobuf, H3, 3D Tiles, projected-CRS DEMs, BigTIFF and imagery rasters not started |
@@ -633,6 +642,61 @@ is a synthetic file in the real column layout (one `PA` record, eight `PG` recor
 reciprocal thresholds were placed geometrically, plus a continuation and a non-runway record
 the compiler must skip). Its headings follow the spec's worked example (04R at 044.3° true),
 not real JFK, where 4/22 lies at about 31° true.
+
+## Atmosphere tables
+
+`nosim::atmosphere` precomputes Bruneton & Neyret's (2008) atmospheric scattering tables on
+the CPU (roadmap M7). It follows the layout and Earth model of Bruneton's 2017 reference
+implementation, so a shader written against that implementation can sample them:
+
+```sh
+cargo run -p nosim-compiler --release -- atmosphere --output atmosphere/ [--sizes reference|small|tiny] [--orders <n>] [--handover-km <km>]
+```
+
+- **Tables.** Transmittance 256 × 64, scattering 32 × 128 × 32 × 8 (r, view zenith, sun
+  zenith, view–sun angle; Rayleigh and higher orders together), single Mie scattering in the
+  same layout, and indirect ground irradiance 64 × 16.
+- **Model.** Red, green and blue at 680, 550 and 440 nm. Rayleigh scattering has an 8 km
+  scale height. Mie has a 1.2 km scale height and g = 0.8. Ozone sits in a tent from 10 to
+  40 km. Ground albedo is 0.1, and there are four scattering orders.
+- **Output.** Each table is a raw little-endian `f32` RGB file. `atmosphere.json` gives the
+  layout, the parameters, the calibrated limb, and radiances rendered from the tables at 80
+  sample geometries.
+- **Run time.** The reference sizes take 134 s on 4 cores; `--sizes small` takes 22 s.
+
+`Tables::sky_radiance` renders a view ray as the reference's `GetSkyRadiance` does.
+`tools/check_atmosphere.py` checks the tables against independent computations:
+
+- Python lookups on the written files reproduce the compiler's sample radiances to 4e-16.
+- Transmittance matches SciPy's adaptive quadrature to 1e-4. The exception is horizontal rays
+  near the ground, which reach 0.27% where blue transmittance is about 1e-4.
+- Sky radiance is compared with a reference that integrates single scattering by brute force
+  along each ray and adds the higher orders from a Monte Carlo path tracer of the same
+  atmosphere (delta tracking, next-event estimation, Lambertian ground). Over 60 geometries
+  from the ground and from 10 km, the median difference is 1.5% and the worst 5.1%. The worst
+  case is looking straight at a sun in the zenith, where Mie's forward peak meets the table's
+  8 view–sun samples.
+- The Monte Carlo first order agrees with the brute force within 2.8 standard errors.
+
+The reference values are computed, not quoted: no published table matches this exact model,
+so the check uses two independent methods on the same atmosphere instead.
+
+**Hand-over to the analytical limb.** Above 100 km the client switches to the spec's limb
+shell, `I₀ · (1 − e^(−τ))` with the Chapman slant depth. `Tables::handover` calibrates it
+from the tables as seen from 100 km:
+
+- `I₀` is the single-scatter source `E_sun · P_R(ν)`, attenuated on its way to the tangent
+  point.
+- A zenith depth and scale height per channel, and an intensity factor per sun zenith angle
+  (0–84°), are fitted over tangent altitudes 0–50 km and three sun azimuths.
+
+The calibrated shell differs from the tables by 4.8 / 8.5 / 8.0% RMS per ray (red / green /
+blue). The radiance integrated over each limb profile differs by at most 4.3 / 12.2 /
+13.7%. The remainder is what a single-scatter shell cannot express: ozone's absorption in
+green, multiple scattering in blue, and the sun near the terminator.
+`atmosphere::handover_weight` (also in the C ABI) gives a smoothstep cross-fade, by default
+90–110 km, so the switch is continuous in altitude and the remaining difference is spread
+over 20 km.
 
 ## Translunar flight harness
 

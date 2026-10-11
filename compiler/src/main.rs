@@ -3,8 +3,8 @@
 use std::process::ExitCode;
 
 use nosim_compiler::{
-    Command, USAGE, parse_args, run_areas, run_arinc, run_bridges, run_graph, run_landcover, run_osm, run_raster,
-    run_tiles, run_validate, validate,
+    Command, USAGE, parse_args, run_areas, run_arinc, run_atmosphere, run_bridges, run_graph, run_landcover, run_osm,
+    run_raster, run_tiles, run_validate, validate,
 };
 
 fn main() -> ExitCode {
@@ -354,6 +354,58 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Atmosphere(args) => {
+            let start = std::time::Instant::now();
+            match run_atmosphere(&args) {
+                Ok((t, h)) => {
+                    let s = &t.sizes;
+                    println!(
+                        "{}: transmittance {}x{}, scattering {}x{}x{}x{}, irradiance {}x{}, {} orders, in {:.1} s",
+                        args.output.display(),
+                        s.transmittance.0,
+                        s.transmittance.1,
+                        s.scattering_nu,
+                        s.scattering_mu_s,
+                        s.scattering_mu,
+                        s.scattering_r,
+                        s.irradiance.0,
+                        s.irradiance.1,
+                        t.orders,
+                        start.elapsed().as_secs_f64()
+                    );
+                    let (zen, _) = t.sky_radiance(
+                        [0.0, 0.0, t.params.bottom_radius + 0.01],
+                        [0.0, 0.0, 1.0],
+                        [0.0, std::f64::consts::FRAC_1_SQRT_2, std::f64::consts::FRAC_1_SQRT_2],
+                    );
+                    println!("zenith sky radiance, sun 45° up: {:.5} {:.5} {:.5} W/m²/sr/nm", zen[0], zen[1], zen[2]);
+                    let pct =
+                        |v: [f64; 3]| format!("{:.1}% / {:.1}% / {:.1}%", v[0] * 100.0, v[1] * 100.0, v[2] * 100.0);
+                    println!(
+                        "limb hand-over at {} km, {} rays: shell vs tables RMS {}, integrated over each limb {} (worst), worst single ray {}",
+                        h.altitude_km,
+                        h.samples,
+                        pct(h.rms),
+                        pct(h.worst_integrated),
+                        pct(h.worst_ray)
+                    );
+                    println!(
+                        "  shell: tau {:.4} {:.4} {:.4}, scale height {:.2} {:.2} {:.2} km",
+                        h.shell.tau[0],
+                        h.shell.tau[1],
+                        h.shell.tau[2],
+                        h.shell.scale_height_km[0],
+                        h.shell.scale_height_km[1],
+                        h.shell.scale_height_km[2]
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::Raster(args) => match run_raster(&args) {
             Ok((storage, s, patch)) => {
                 if let Some(p) = &patch {

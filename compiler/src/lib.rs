@@ -6,6 +6,7 @@
 //! between authoritative data and contributor overrides.
 
 pub mod arinc;
+pub mod atmosphere;
 pub mod bridges;
 pub mod geoparquet;
 pub mod graph;
@@ -206,6 +207,8 @@ pub enum Command {
     Bridges(BridgesArgs),
     /// Resample a land-cover raster into class tiles and density masks.
     Landcover(LandcoverArgs),
+    /// Precompute the atmospheric scattering tables.
+    Atmosphere(AtmosphereArgs),
     /// Build a directed road graph from a spline table.
     Graph(GraphArgs),
 }
@@ -319,6 +322,19 @@ pub struct LandcoverArgs {
     pub packages: Option<PathBuf>,
 }
 
+/// `atmosphere` subcommand options.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AtmosphereArgs {
+    /// Directory for the tables and `atmosphere.json`.
+    pub output: PathBuf,
+    /// Table sizes.
+    pub sizes: nosim::atmosphere::Sizes,
+    /// Scattering orders.
+    pub orders: u32,
+    /// Hand-over altitude to the analytical limb, km.
+    pub handover_km: f64,
+}
+
 /// `raster` subcommand options.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RasterArgs {
@@ -372,6 +388,7 @@ pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runwa
                          world-compiler areas --input <extract.osm.pbf> --output <dir> [--bbox <west,south,east,north>] [--packages <dir>] [--threads <n>]\n\
                          world-compiler bridges --splines <splines.geoparquet> --areas <dir> --output <bridges.geoparquet> [--dem <dem.tif>] [--min-drop <m>] [--expect-over-water <name>=<m>]... [--threads <n>]\n\
                          world-compiler landcover --input <worldcover.tif> --output <dir> [--bbox <west,south,east,north>] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--packages <dir>] [--threads <n>]\n\
+                         world-compiler atmosphere --output <dir> [--sizes reference|small|tiny] [--orders <n>] [--handover-km <km>]\n\
                          world-compiler graph --input <splines.geoparquet> --output <dir> [--mode drive|taxi|walk] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>] [--capacity-split] [--assign-iterations <n>] [--min-exit-ratio <r>] [--near-field <lon,lat,radius_m> [--near-substeps <n>]]] [--walk-from <lon,lat> --walk-to <lon,lat> [--walkers <n>] [--walk-seconds <s>]]";
 
 /// Parses the command line (everything after the program name).
@@ -386,9 +403,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Co
         Some("areas") => parse_areas(it).map(Command::Areas),
         Some("bridges") => parse_bridges(it).map(Command::Bridges),
         Some("landcover") => parse_landcover(it).map(Command::Landcover),
+        Some("atmosphere") => parse_atmosphere(it).map(Command::Atmosphere),
         Some("graph") => parse_graph(it).map(Command::Graph),
         other => Err(CompileError::Usage(format!(
-            "expected subcommand `arinc`, `validate`, `tiles`, `raster`, `osm`, `areas`, `bridges`, `landcover` or `graph`, got {other:?}\n{USAGE}"
+            "expected subcommand `arinc`, `validate`, `tiles`, `raster`, `osm`, `areas`, `bridges`, `landcover`, `atmosphere` or `graph`, got {other:?}\n{USAGE}"
         ))),
     }
 }
@@ -760,6 +778,52 @@ pub fn run_landcover(args: &LandcoverArgs) -> Result<landcover::LandcoverSummary
     let grid = raster::geotiff::ClassGrid::load(&args.input, args.options.bbox)?;
     let vfs = args.packages.as_deref().map(mount_packages).transpose()?;
     landcover::process(&grid, &args.output, &args.options, vfs.as_ref())
+}
+
+fn parse_atmosphere<I: Iterator<Item = String>>(mut it: I) -> Result<AtmosphereArgs, CompileError> {
+    let mut args = AtmosphereArgs {
+        output: PathBuf::new(),
+        sizes: nosim::atmosphere::Sizes::REFERENCE,
+        orders: 4,
+        handover_km: 100.0,
+    };
+    let mut output = None;
+    let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
+    while let Some(flag) = it.next() {
+        let value = it.next().ok_or_else(|| CompileError::Usage(format!("{flag} needs a value\n{USAGE}")))?;
+        match flag.as_str() {
+            "--output" => output = Some(PathBuf::from(value)),
+            "--sizes" => {
+                args.sizes = match value.as_str() {
+                    "reference" => nosim::atmosphere::Sizes::REFERENCE,
+                    "small" => nosim::atmosphere::Sizes::SMALL,
+                    "tiny" => nosim::atmosphere::Sizes::TINY,
+                    _ => return Err(bad(&flag, &value)),
+                }
+            }
+            "--orders" => {
+                args.orders = value.parse().ok().filter(|o| (1..=10).contains(o)).ok_or_else(|| bad(&flag, &value))?
+            }
+            "--handover-km" => {
+                args.handover_km =
+                    value.parse().ok().filter(|v: &f64| *v > 60.0 && *v < 10_000.0).ok_or_else(|| bad(&flag, &value))?
+            }
+            _ => return Err(CompileError::Usage(format!("unknown flag {flag}\n{USAGE}"))),
+        }
+    }
+    args.output = output.ok_or_else(|| CompileError::Usage(format!("--output is required\n{USAGE}")))?;
+    Ok(args)
+}
+
+/// Runs `atmosphere`: precomputes the tables, calibrates the analytical limb at the hand-over
+/// altitude and writes everything (see [`atmosphere::write`]).
+pub fn run_atmosphere(
+    args: &AtmosphereArgs,
+) -> Result<(nosim::atmosphere::Tables, nosim::atmosphere::Handover), CompileError> {
+    let tables = nosim::atmosphere::Tables::precompute(nosim::atmosphere::Parameters::earth(), args.sizes, args.orders);
+    let handover = tables.handover(args.handover_km);
+    atmosphere::write(&args.output, &tables, &handover)?;
+    Ok((tables, handover))
 }
 
 fn parse_graph<I: Iterator<Item = String>>(mut it: I) -> Result<GraphArgs, CompileError> {

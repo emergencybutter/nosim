@@ -85,6 +85,9 @@ check() {
     "$wc" landcover --input fixtures/landcover/kjfk_classes.tif --output "$tmp/landcover" --packages fixtures/packages \
         --min-zoom 12 --max-zoom 14
 
+    say "atmosphere tables (small sizes) and the limb hand-over"
+    "$wc" atmosphere --output "$tmp/atmosphere" --sizes small
+
     say "translunar harness: Apollo 11-like flight and camera ride"
     cargo run --release --locked --example translunar -- --csv "$tmp/translunar.csv"
 
@@ -170,12 +173,16 @@ real_data() {
     cargo run --release --locked --example translunar -- --csv "$dir/translunar.csv"
     python3 tools/check_translunar.py "$dir/translunar.csv" "$de421"
 
+    say "atmosphere tables (reference sizes) vs quadrature, brute-force single scattering and Monte Carlo"
+    "$wc" atmosphere --output "$dir/atmosphere"
+    python3 -W ignore::scipy.integrate.IntegrationWarning tools/check_atmosphere.py "$dir/atmosphere"
+
     say "terrain patching on GLO-30 with real roads"
     "$wc" raster --input "$dem" --output "$dir/terrain" \
         --patch-runways fixtures/packages/org.contributor.infrastructure.kjfk/data/arinc_runways.parquet \
         --patch-roads "$dir/kjfk.geoparquet" --min-zoom 12 --max-zoom 13
     rm -rf "$dir/terrain" "$dir"/graph_* "$dir/areas" "$dir/nyc.geoparquet" "$dir/bridges.geoparquet" \
-        "$dir/landcover" "$dir/translunar.csv"
+        "$dir/landcover" "$dir/translunar.csv" "$dir/atmosphere"
 
     say "real-data checks passed"
 }

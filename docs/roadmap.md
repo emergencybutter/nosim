@@ -24,7 +24,7 @@ Against the spec's verification blueprint (§10):
 | 2 Aeronautical & spline layer | ARINC 424 parse, extrusion, grade fit, RW31L ± 1 ft, OSM splines, road graph, heightfield patching (M1) | Complete on the compiler side |
 | 3 Procedural gaps & synthesis | Seed hash, Poisson levels, pier spacing, flatten falloff, OSM polygons and building heights, bridge detection and piers (M4), WorldCover masks and Poisson-disk scattering (M5) | Complete on the compiler side |
 | 4 Environment & traffic | Calendar, phenology, IDM / MOBIL, CTM with general junctions, ORCA, routed demand, near-field vehicles (M2), pedestrian navigation graph (M3) | Buildings as ORCA obstacles, intersection control |
-| 5 Astronomy & translunar flight | VSOP87 / ELP 2000-82, BSC5, Hapke, LOD band policy, triangle budget, translunar harness (M6) | Atmosphere lookup tables |
+| 5 Astronomy & translunar flight | VSOP87 / ELP 2000-82, BSC5, Hapke, LOD band policy, triangle budget, translunar harness (M6), atmosphere tables (M7) | Complete on the engine-independent side |
 
 ## Working rules
 
@@ -232,7 +232,24 @@ This proves the coordinate and LOD story end to end without the engine.
 - The governor's band sequence and triangle-budget model collapse below 100k triangles past
   100 km, as §10 states.
 
-## M7 — Atmosphere lookup tables (§8B)
+## M7 — Atmosphere lookup tables (§8B) — done
+
+Done as `nosim::atmosphere` and `world-compiler atmosphere`; see the README.
+
+- Sky radiance from the tables matches an independent reference over 60 geometries, with a
+  median difference of 1.5% and a worst of 5.1% (looking at a zenith sun). The reference is
+  brute-force single scattering plus a Monte Carlo path tracer for the higher orders.
+- Transmittance matches quadrature to 1e-4 away from the horizon.
+- At the 100 km hand-over, the calibrated analytical limb differs from the tables by 4.8 /
+  8.5 / 8.0% RMS (red / green / blue). The brightness integrated over the limb differs by at
+  most 4.3 / 12.2 / 13.7%.
+- A smoothstep cross-fade over 90–110 km makes the switch continuous.
+
+Two departures from the acceptance as written:
+- The reference values are computed rather than published, because no published table
+  matches this model.
+- The limb is continuous through the cross-fade, not identical at a single altitude. The
+  shell's form cannot express ozone absorption or multiple scattering exactly.
 
 Bruneton's model needs precomputed transmittance and scattering textures. Computing them is
 CPU math that can live here.

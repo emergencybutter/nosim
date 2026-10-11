@@ -368,6 +368,8 @@ Scaling smoothly from runway pavement to translunar orbit requires an analytical
 
   > **Review note.** An earlier draft wrote `I_limb = I₀ · exp(-k·Δr / (H_R · cos θ))`. That expression goes to zero as `cos θ → 0`, i.e. it is darkest exactly at the limb, where the real atmosphere is brightest (longest scattering path). The Chapman form above is the one implemented in `src/photometry.rs`; at the horizon it gives ≈ 35 airmasses, matching observation.
 
+> **Implementation note (precomputed scattering).** `nosim::atmosphere` computes the Bruneton tables on the CPU in the 2017 reference layout (transmittance 256 × 64, scattering 32 × 128 × 32 × 8, irradiance 64 × 16, four orders) and `world-compiler atmosphere` writes them as raw `f32` textures with `atmosphere.json`. The analytical shell above 100 km keeps the form above, with `I₀ = E_sun · P_R(ν)` attenuated by the sunlight's own Chapman depth. Its depth, scale height and per-sun-angle intensity are calibrated from the tables at the hand-over, and `handover_weight` cross-fades between the two across 90–110 km.
+
 ### C. Lunar Geodesy & Hapke Photometric Regolith
 
 - **Surface Ingestion:** The Moon is instantiated as an independent geodetic sphere (`R_Moon = 1,737.4 km`) streaming USGS/NASA LRO LOLA DEMs and LROC WAC global albedo mosaics.

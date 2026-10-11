@@ -148,6 +148,7 @@ int main(int argc, char **argv) {
     CHECK(nosim_idm_free_acceleration(idm, 30.0) == 0.0);
     CHECK(nosim_band_for(150000.0) == NOSIM_ALTITUDE_BAND_LOW_EARTH_ORBIT);
     CHECK(nosim_triangle_budget(NOSIM_ALTITUDE_BAND_TRANSLUNAR, 1e7) < 100000);
+    CHECK(nosim_atmosphere_handover_weight(120.0, 100.0, 10.0) == 1.0);
 
     /* Translunar flight: target the Apollo 11-like injection and propagate it a day. */
     NosimTranslunar tl;

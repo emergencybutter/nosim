@@ -1697,6 +1697,14 @@ pub extern "C" fn nosim_triangle_budget(band: NosimAltitudeBand, altitude_m: f64
     lod::triangle_budget(b, altitude_m).total()
 }
 
+/// Weight of the analytical limb shell at a camera altitude: 0 below `centre_km −
+/// half_width_km`, 1 above `centre_km + half_width_km`, smoothstep between, so the switch from
+/// the precomputed tables is continuous.
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_atmosphere_handover_weight(altitude_km: f64, centre_km: f64, half_width_km: f64) -> f64 {
+    nosim::atmosphere::handover_weight(altitude_km, centre_km, half_width_km)
+}
+
 // ---- Translunar flight -----------------------------------------------------------------
 
 /// A targeted translunar flight.
