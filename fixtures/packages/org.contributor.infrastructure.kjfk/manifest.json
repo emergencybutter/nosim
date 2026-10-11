@@ -23,6 +23,7 @@
   "content": {
     "arinc_overrides": "data/arinc_runways.parquet",
     "spline_networks": "data/taxiways_and_roads.geoparquet",
+    "polygons": ["data/terminal_footprints.geoparquet"],
     "models": [
       {
         "id": "twa_flight_center",

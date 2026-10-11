@@ -1,5 +1,12 @@
 //! Minimal Well-Known Binary for the two geometry types the compiler emits.
 
+/// An open ring or a line of `(x, y)` points.
+pub type Ring = Vec<(f64, f64)>;
+/// Polygons, each an outer ring followed by its holes.
+pub type Polygons = Vec<Vec<Ring>>;
+/// A bounding box `(west, south, east, north)`.
+pub type BBox = (f64, f64, f64, f64);
+
 /// Polygon type code.
 const POLYGON: u32 = 3;
 /// LineString type code.
@@ -26,12 +33,53 @@ pub fn polygon(ring: &[(f64, f64)]) -> Vec<u8> {
     out
 }
 
+fn push_rings(out: &mut Vec<u8>, rings: &[Vec<(f64, f64)>]) {
+    out.push(1);
+    push_u32(out, POLYGON);
+    push_u32(out, rings.len() as u32);
+    for ring in rings {
+        push_u32(out, ring.len() as u32 + 1);
+        for &(x, y) in ring.iter().chain(ring.first()) {
+            push_f64(out, x);
+            push_f64(out, y);
+        }
+    }
+}
+
+/// Little-endian WKB for polygons with holes, each an outer ring followed by its holes (open
+/// rings): a Polygon when there is one, otherwise a MultiPolygon.
+pub fn polygons(parts: &[Vec<Vec<(f64, f64)>>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let [one] = parts {
+        push_rings(&mut out, one);
+    } else {
+        out.push(1);
+        push_u32(&mut out, MULTIPOLYGON);
+        push_u32(&mut out, parts.len() as u32);
+        for p in parts {
+            push_rings(&mut out, p);
+        }
+    }
+    out
+}
+
 /// Little-endian WKB point.
 pub fn point(p: (f64, f64)) -> Vec<u8> {
     let mut out = vec![1u8];
     push_u32(&mut out, 1);
     push_f64(&mut out, p.0);
     push_f64(&mut out, p.1);
+    out
+}
+
+/// Little-endian WKB multipoint.
+pub fn multipoint(points: &[(f64, f64)]) -> Vec<u8> {
+    let mut out = vec![1u8];
+    push_u32(&mut out, MULTIPOINT);
+    push_u32(&mut out, points.len() as u32);
+    for &p in points {
+        out.extend(point(p));
+    }
     out
 }
 
@@ -105,6 +153,41 @@ pub fn parse_polygon(bytes: &[u8]) -> Result<Vec<(f64, f64)>, WkbError> {
         ring.pop();
     }
     Ok(ring)
+}
+
+/// Polygons of a WKB Polygon or MultiPolygon with every ring exactly as stored (closing
+/// point included), for validation.
+pub fn parse_polygons_raw(bytes: &[u8]) -> Result<Polygons, WkbError> {
+    fn one(c: &mut Cursor<'_>) -> Result<Vec<Vec<(f64, f64)>>, WkbError> {
+        let rings = c.u32()?;
+        (0..rings)
+            .map(|_| {
+                let n = c.u32()?;
+                c.points(n)
+            })
+            .collect()
+    }
+    match bytes.first() {
+        None => return Err(WkbError::Truncated),
+        Some(0) => return Err(WkbError::BigEndian),
+        Some(_) => {}
+    }
+    let mut c = Cursor { bytes, pos: 1 };
+    match c.u32()? {
+        POLYGON => Ok(vec![one(&mut c)?]),
+        6 => {
+            let n = c.u32()?;
+            (0..n)
+                .map(|_| {
+                    let mut h = header(&c.bytes[c.pos..], POLYGON)?;
+                    let p = one(&mut h)?;
+                    c.pos += h.pos;
+                    Ok(p)
+                })
+                .collect()
+        }
+        _ => Err(WkbError::WrongType),
+    }
 }
 
 /// Points of a WKB linestring.
@@ -239,6 +322,21 @@ mod geometry_tests {
             out.extend_from_slice(p);
         }
         out
+    }
+
+    #[test]
+    fn polygons_with_holes_round_trip() {
+        let a = vec![vec![(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)], vec![(1.0, 1.0), (1.0, 2.0), (2.0, 2.0)]];
+        let b = vec![vec![(5.0, 5.0), (6.0, 5.0), (6.0, 6.0)]];
+        let one = polygons(std::slice::from_ref(&a));
+        assert_eq!(u32::from_le_bytes(one[1..5].try_into().unwrap()), POLYGON);
+        assert_eq!(parse_geometry(&one).unwrap(), Geometry::Polygons(vec![a.clone()]));
+        let two = polygons(&[a.clone(), b.clone()]);
+        assert_eq!(u32::from_le_bytes(two[1..5].try_into().unwrap()), MULTIPOLYGON);
+        let raw = parse_polygons_raw(&two).unwrap();
+        assert_eq!((raw.len(), raw[0].len(), raw[0][0].len()), (2, 2, 5));
+        assert_eq!(raw[0][0][0], raw[0][0][4]);
+        assert_eq!(parse_geometry(&two).unwrap(), Geometry::Polygons(vec![a, b]));
     }
 
     #[test]

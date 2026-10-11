@@ -11,9 +11,9 @@ proven, and what data it needs. Section numbers refer to
 Every box in the §1 pipeline has a first working version. The core covers §2–§8 as CPU
 reference math, and the C ABI exposes it to a C host. The compiler turns CIFP, GeoTIFF
 DEMs and OSM PBF into GeoParquet, MVT, Terrain-RGB, normal maps, quantized mesh, spline
-tables and a road graph. Readers have been checked against independent decoders on real
-data: GLO-30 against libtiff, the New York OSM extract against libosmium, and the road graph
-against networkx.
+tables, polygon tables, bridges and a road graph. Readers have been checked against
+independent decoders on real data: GLO-30 against libtiff, the New York OSM extract against
+libosmium (ways and areas), area sizes against PROJ, and the road graph against networkx.
 
 Against the spec's verification blueprint (§10):
 
@@ -21,8 +21,8 @@ Against the spec's verification blueprint (§10):
 |---|---|---|
 | 1 Coordinate & terrain spine | Floating origin, sub-millimetre check, quantized-mesh terrain | 3D Tiles streaming client (engine-side) |
 | 2 Aeronautical & spline layer | ARINC 424 parse, extrusion, grade fit, RW31L ± 1 ft, OSM splines, road graph, heightfield patching (M1) | Complete on the compiler side |
-| 3 Procedural gaps & synthesis | Seed hash, Poisson levels, pier spacing, flatten falloff | OSM polygons, bridge detection, WorldCover masks |
-| 4 Environment & traffic | Calendar, phenology, IDM / MOBIL, CTM with general junctions, ORCA | Routing and demand, near-field vehicles on the graph, pedestrian navigation graph |
+| 3 Procedural gaps & synthesis | Seed hash, Poisson levels, pier spacing, flatten falloff, OSM polygons and building heights, bridge detection and piers (M4) | WorldCover masks |
+| 4 Environment & traffic | Calendar, phenology, IDM / MOBIL, CTM with general junctions, ORCA, routed demand, near-field vehicles (M2), pedestrian navigation graph (M3) | Buildings as ORCA obstacles, intersection control |
 | 5 Astronomy & translunar flight | VSOP87 / ELP 2000-82, BSC5, Hapke, LOD band policy | Translunar trajectory harness, atmosphere lookup tables |
 
 ## Working rules
@@ -141,7 +141,22 @@ ORCA avoids collisions but needs preferred velocities from somewhere.
 guarantees still hold on the way: zero overlap, no wall penetration, results independent of
 insertion order.
 
-## M4 — Polygons from OSM: buildings, water, land use, bridges (Phase 3.1–3.2)
+## M4 — Polygons from OSM: buildings, water, land use, bridges (Phase 3.1–3.2) — done
+
+Done as `world-compiler areas` and `world-compiler bridges`, with polygon checks in
+`validate` and a `content.polygons` manifest field; see the README. On the New York extract:
+
+- Buildings, water and land use match libosmium's area handler exactly: the same 1,602,595
+  building, 2,772 water and 80,719 land-use area ids, the same ring counts, and areas within
+  5e-9. `area_m2` matches PROJ's equal-area projection to 3e-9.
+- The Throgs Neck and Verrazzano-Narrows decks span 2.7 km and 1.5 km of water. CI's
+  real-data job requires at least 1 km each.
+
+Water includes the sea side of the coastline, since OpenStreetMap draws the sea as lines
+rather than polygons. A bridge deck is a straight grade between the ground at its ends,
+because OpenStreetMap has no deck heights, so pier heights under tall suspension spans are
+understated. Gorge detection on a surface model like GLO-30 needs building footprints to
+mask streets, and tree canopy can still fool it.
 
 **Deliverables**
 - OSM relation reading and multipolygon assembly. Rings are joined from member ways,

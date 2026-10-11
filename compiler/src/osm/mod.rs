@@ -7,6 +7,8 @@
 //! simulation never parses tag strings: speeds in m/s with their provenance, one-way as a
 //! direction, widths in metres.
 
+pub mod areas;
+pub mod multipolygon;
 pub mod pbf;
 
 use std::collections::{HashMap, HashSet};
@@ -178,6 +180,21 @@ pub fn parse_width_m(v: &str) -> Option<f64> {
     }
 }
 
+/// Parses a length such as `height`: metres by default (`m` allowed), `ft` / `'` / `feet` for
+/// feet, and feet-and-inches as `12'6"`. The first of several `;`-separated values is used.
+/// `None` when not a positive number.
+pub fn parse_length_m(v: &str) -> Option<f64> {
+    let v = v.split(';').next()?.trim();
+    if let Some((ft, inch)) = v.split_once('\'') {
+        let inch = inch.trim().trim_end_matches('"').trim();
+        if !inch.is_empty() {
+            let (f, i): (f64, f64) = (ft.trim().parse().ok()?, inch.parse().ok()?);
+            return (f >= 0.0 && i >= 0.0 && f + i > 0.0).then_some(f * 0.3048 + i * 0.0254);
+        }
+    }
+    parse_width_m(v)
+}
+
 fn parse_oneway(way: &pbf::Way, network: Network, class: &str) -> i32 {
     match way.tag("oneway") {
         Some("yes" | "true" | "1") => 1,
@@ -264,28 +281,35 @@ pub struct OsmSummary {
     pub outside_bbox: usize,
 }
 
-/// Reads an `.osm.pbf` and returns its roads and aeroways.
-pub fn extract(path: &Path, opts: &OsmOptions) -> Result<(Vec<SplineRow>, OsmSummary), CompileError> {
+/// Reads an `.osm.pbf` into its `writingprogram` and its decompressed data blocks.
+pub(crate) fn load(path: &Path) -> Result<(Option<String>, Vec<Vec<u8>>), CompileError> {
     let bytes = std::fs::read(path).map_err(|e| CompileError::Io(path.to_path_buf(), e))?;
     let bad = |e: pbf::PbfError| CompileError::Osm(format!("{}: {e}", path.display()));
-    let blobs = pbf::blobs(&bytes).map_err(bad)?;
-    let mut summary = OsmSummary::default();
+    let mut writing_program = None;
     let mut data = Vec::new();
     let mut saw_header = false;
-    for (kind, payload) in &blobs {
+    for (kind, payload) in pbf::blobs(&bytes).map_err(bad)? {
         match kind.as_str() {
             "OSMHeader" => {
-                let h = pbf::header(payload).map_err(bad)?;
-                summary.writing_program = h.writing_program;
+                writing_program = pbf::header(&payload).map_err(bad)?.writing_program;
                 saw_header = true;
             }
-            "OSMData" => data.push(payload.as_slice()),
+            "OSMData" => data.push(payload),
             _ => {} // unknown blob types are skippable by the format's rules
         }
     }
     if !saw_header {
         return Err(CompileError::Osm(format!("{}: no OSMHeader block", path.display())));
     }
+    Ok((writing_program, data))
+}
+
+/// Reads an `.osm.pbf` and returns its roads and aeroways.
+pub fn extract(path: &Path, opts: &OsmOptions) -> Result<(Vec<SplineRow>, OsmSummary), CompileError> {
+    let (writing_program, blocks) = load(path)?;
+    let bad = |e: pbf::PbfError| CompileError::Osm(format!("{}: {e}", path.display()));
+    let mut summary = OsmSummary { writing_program, ..Default::default() };
+    let data: Vec<&[u8]> = blocks.iter().map(Vec::as_slice).collect();
     summary.blocks = data.len();
     let threads = thread_count(opts.threads);
 
@@ -294,7 +318,7 @@ pub fn extract(path: &Path, opts: &OsmOptions) -> Result<(Vec<SplineRow>, OsmSum
         let block = pbf::block(b).map_err(bad)?;
         let ways: Vec<(pbf::Way, Network, String)> =
             block.ways.iter().filter_map(|w| classify(w).map(|(n, c)| (w.clone(), n, c))).collect();
-        Ok((block.nodes.len(), block.ways.len(), block.relations_skipped, ways))
+        Ok((block.nodes.len(), block.ways.len(), block.relations.len(), ways))
     })?;
     let mut ways = Vec::new();
     for (nodes, all_ways, relations, kept) in per_block {
@@ -565,6 +589,11 @@ mod tests {
         assert!((parse_width_m("75 ft").unwrap() - 22.86).abs() < 1e-9);
         assert!((parse_width_m("75'").unwrap() - 22.86).abs() < 1e-9);
         assert_eq!(parse_width_m("wide"), None);
+        assert_eq!(parse_length_m("12;15"), Some(12.0));
+        assert!((parse_length_m("12'6\"").unwrap() - 3.81).abs() < 1e-9);
+        assert!((parse_length_m("40 ft").unwrap() - 12.192).abs() < 1e-9);
+        assert_eq!(parse_length_m("tall"), None);
+        assert_eq!(parse_length_m("0"), None);
     }
 
     #[test]

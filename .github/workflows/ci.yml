@@ -37,7 +37,7 @@ jobs:
         run: tools/ci.sh check
 
   real-data:
-    name: Real-data cross-checks (libtiff, libosmium, networkx)
+    name: Real-data cross-checks (libtiff, libosmium, networkx, PROJ)
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.real_data)
     needs: check
     runs-on: ubuntu-24.04
@@ -51,7 +51,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Python reference implementations
-        run: pip install osmium pyarrow networkx pillow
+        run: pip install osmium pyarrow networkx pillow shapely pyproj
       - name: Week number for the download cache
         id: week
         run: echo "key=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"

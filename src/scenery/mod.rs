@@ -126,6 +126,11 @@ pub struct Content {
     /// GeoParquet of taxiway / road splines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spline_networks: Option<String>,
+    /// GeoParquet polygon tables (building footprints, water, land use) in the layout
+    /// `world-compiler areas` writes. They add to the baseline layers inside the bounds;
+    /// pair them with an exclusion to replace the baseline instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub polygons: Vec<String>,
     /// Placed meshes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelPlacement>,
@@ -249,6 +254,9 @@ impl Manifest {
         }
         if let Some(p) = &self.content.spline_networks {
             files.push(("content.spline_networks".to_owned(), p.as_str()));
+        }
+        for (i, p) in self.content.polygons.iter().enumerate() {
+            files.push((format!("content.polygons[{i}]"), p.as_str()));
         }
         for (i, m) in self.content.models.iter().enumerate() {
             files.push((format!("content.models[{i}].mesh"), m.mesh.as_str()));
@@ -580,8 +588,9 @@ mod tests {
         assert_eq!(m.content.models[0].id, "twa_flight_center");
         assert_eq!(m.content.models[0].anchor_geodetic, [40.6458, -73.7778, 4.2]);
         assert_eq!(m.content.models[0].true_heading_deg, 134.2);
+        assert_eq!(m.content.polygons, vec!["data/terminal_footprints.geoparquet"]);
         assert_eq!(m.validate(), Ok(()));
-        assert_eq!(m.referenced_files().len(), 5);
+        assert_eq!(m.referenced_files().len(), 6);
     }
 
     #[test]

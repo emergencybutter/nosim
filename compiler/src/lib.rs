@@ -6,6 +6,7 @@
 //! between authoritative data and contributor overrides.
 
 pub mod arinc;
+pub mod bridges;
 pub mod geoparquet;
 pub mod graph;
 pub mod osm;
@@ -112,11 +113,8 @@ pub struct OverrideSummary {
     pub airports_overridden: Vec<(String, String, usize)>,
 }
 
-/// Mounts every package directory under `packages_dir` and, for each airport whose
-/// reference point a package covers with `arinc_overrides`, replaces the airport's rows with
-/// the package's own runway table. Airports the packages do not cover are untouched.
-pub fn apply_overrides(rows: &mut Vec<RunwayRow>, packages_dir: &Path) -> Result<OverrideSummary, CompileError> {
-    let mut summary = OverrideSummary::default();
+/// Mounts every package directory directly under `packages_dir`, in name order.
+pub fn mount_packages(packages_dir: &Path) -> Result<Vfs, CompileError> {
     let mut vfs = Vfs::new();
     let entries = std::fs::read_dir(packages_dir).map_err(|e| CompileError::Io(packages_dir.to_path_buf(), e))?;
     let mut dirs: Vec<PathBuf> =
@@ -124,9 +122,18 @@ pub fn apply_overrides(rows: &mut Vec<RunwayRow>, packages_dir: &Path) -> Result
     dirs.sort();
     for dir in dirs {
         let package = Package::load(&dir).map_err(|e| CompileError::Package(format!("{}: {e}", dir.display())))?;
-        summary.packages_mounted.push(package.id().to_owned());
         vfs.mount(Arc::new(package)).map_err(|e| CompileError::Package(e.to_string()))?;
     }
+    Ok(vfs)
+}
+
+/// Mounts every package directory under `packages_dir` and, for each airport whose
+/// reference point a package covers with `arinc_overrides`, replaces the airport's rows with
+/// the package's own runway table. Airports the packages do not cover are untouched.
+pub fn apply_overrides(rows: &mut Vec<RunwayRow>, packages_dir: &Path) -> Result<OverrideSummary, CompileError> {
+    let mut summary = OverrideSummary::default();
+    let vfs = mount_packages(packages_dir)?;
+    summary.packages_mounted = vfs.mounts().iter().map(|m| m.package.id().to_owned()).collect();
 
     // Airports in file order, keyed by the first threshold seen as the reference point.
     let mut airports: Vec<(String, f64, f64)> = Vec::new();
@@ -192,6 +199,10 @@ pub enum Command {
     Raster(RasterArgs),
     /// Extract roads and aeroways from an OpenStreetMap PBF.
     Osm(OsmArgs),
+    /// Assemble building, water and land-use polygons from an OpenStreetMap PBF.
+    Areas(AreasArgs),
+    /// Find bridges: tagged decks, splines over water, splines over DEM gorges.
+    Bridges(BridgesArgs),
     /// Build a directed road graph from a spline table.
     Graph(GraphArgs),
 }
@@ -260,6 +271,38 @@ pub struct OsmArgs {
     pub options: osm::OsmOptions,
 }
 
+/// `areas` subcommand options.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AreasArgs {
+    /// `.osm.pbf` to read.
+    pub input: PathBuf,
+    /// Directory for the polygon tables, the coastline and `problems.csv`.
+    pub output: PathBuf,
+    /// Extraction parameters.
+    pub options: osm::areas::AreaOptions,
+    /// Directory of scenery packages whose `procedural_buildings` exclusions apply.
+    pub packages: Option<PathBuf>,
+}
+
+/// `bridges` subcommand options.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BridgesArgs {
+    /// Spline table (as written by `osm`).
+    pub splines: PathBuf,
+    /// Directory written by `areas`: its water, coastline and land-use tables are read (piers
+    /// in the land use are dry), and its buildings when a DEM is given.
+    pub areas: PathBuf,
+    /// Optional DEM for gorge detection and pier heights (masked near the buildings in
+    /// `areas`, when it has them).
+    pub dem: Option<PathBuf>,
+    /// Bridge table to write.
+    pub output: PathBuf,
+    /// Detection parameters.
+    pub options: bridges::BridgeOptions,
+    /// `(name, metres)`: fail unless a deck of that name spans at least that much water.
+    pub expect: Vec<(String, f64)>,
+}
+
 /// `raster` subcommand options.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RasterArgs {
@@ -310,6 +353,8 @@ pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runwa
                          world-compiler tiles --input <features.parquet> --output <dir> [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]\n\
                          world-compiler raster --input <dem.tif> --output <dir> [--patch-runways <runways.parquet>] [--patch-roads <splines.geoparquet>] [--package <dir>] [--patched-dem <out.tif>] [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]\n\
                          world-compiler osm --input <extract.osm.pbf> --output <splines.geoparquet> [--bbox <west,south,east,north>] [--threads <n>]\n\
+                         world-compiler areas --input <extract.osm.pbf> --output <dir> [--bbox <west,south,east,north>] [--packages <dir>] [--threads <n>]\n\
+                         world-compiler bridges --splines <splines.geoparquet> --areas <dir> --output <bridges.geoparquet> [--dem <dem.tif>] [--min-drop <m>] [--expect-over-water <name>=<m>]... [--threads <n>]\n\
                          world-compiler graph --input <splines.geoparquet> --output <dir> [--mode drive|taxi|walk] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>] [--capacity-split] [--assign-iterations <n>] [--min-exit-ratio <r>] [--near-field <lon,lat,radius_m> [--near-substeps <n>]]] [--walk-from <lon,lat> --walk-to <lon,lat> [--walkers <n>] [--walk-seconds <s>]]";
 
 /// Parses the command line (everything after the program name).
@@ -321,9 +366,11 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Co
         Some("tiles") => parse_tiles(it).map(Command::Tiles),
         Some("raster") => parse_raster(it).map(Command::Raster),
         Some("osm") => parse_osm(it).map(Command::Osm),
+        Some("areas") => parse_areas(it).map(Command::Areas),
+        Some("bridges") => parse_bridges(it).map(Command::Bridges),
         Some("graph") => parse_graph(it).map(Command::Graph),
         other => Err(CompileError::Usage(format!(
-            "expected subcommand `arinc`, `validate`, `tiles`, `raster`, `osm` or `graph`, got {other:?}\n{USAGE}"
+            "expected subcommand `arinc`, `validate`, `tiles`, `raster`, `osm`, `areas`, `bridges` or `graph`, got {other:?}\n{USAGE}"
         ))),
     }
 }
@@ -516,6 +563,24 @@ pub fn run_raster(
     Ok((dem.storage.clone(), summary, Some(patched.summary.clone())))
 }
 
+/// `west,south,east,north` in degrees, ordered and in range.
+fn parse_bbox(value: &str) -> Option<(f64, f64, f64, f64)> {
+    let v: Vec<f64> = value.split(',').map(|x| x.trim().parse::<f64>()).collect::<Result<_, _>>().ok()?;
+    match v[..] {
+        [w, s, e, n]
+            if w < e
+                && s < n
+                && (-180.0..=180.0).contains(&w)
+                && (-180.0..=180.0).contains(&e)
+                && (-90.0..=90.0).contains(&s)
+                && (-90.0..=90.0).contains(&n) =>
+        {
+            Some((w, s, e, n))
+        }
+        _ => None,
+    }
+}
+
 fn parse_osm<I: Iterator<Item = String>>(mut it: I) -> Result<OsmArgs, CompileError> {
     let (mut input, mut output) = (None, None);
     let mut options = osm::OsmOptions::default();
@@ -526,26 +591,7 @@ fn parse_osm<I: Iterator<Item = String>>(mut it: I) -> Result<OsmArgs, CompileEr
             "--input" => input = Some(PathBuf::from(value)),
             "--output" => output = Some(PathBuf::from(value)),
             "--threads" => options.threads = value.parse().map_err(|_| bad(&flag, &value))?,
-            "--bbox" => {
-                let v: Vec<f64> = value
-                    .split(',')
-                    .map(|x| x.trim().parse::<f64>())
-                    .collect::<Result<_, _>>()
-                    .map_err(|_| bad(&flag, &value))?;
-                match v[..] {
-                    [w, s, e, n]
-                        if w < e
-                            && s < n
-                            && (-180.0..=180.0).contains(&w)
-                            && (-180.0..=180.0).contains(&e)
-                            && (-90.0..=90.0).contains(&s)
-                            && (-90.0..=90.0).contains(&n) =>
-                    {
-                        options.bbox = Some((w, s, e, n))
-                    }
-                    _ => return Err(bad(&flag, &value)),
-                }
-            }
+            "--bbox" => options.bbox = Some(parse_bbox(&value).ok_or_else(|| bad(&flag, &value))?),
             _ => return Err(CompileError::Usage(format!("unknown flag {flag}\n{USAGE}"))),
         }
     }
@@ -561,6 +607,107 @@ pub fn run_osm(args: &OsmArgs) -> Result<(Vec<osm::SplineRow>, osm::OsmSummary),
     let (rows, summary) = osm::extract(&args.input, &args.options)?;
     osm::write_splines(&args.output, &rows)?;
     Ok((rows, summary))
+}
+
+fn parse_areas<I: Iterator<Item = String>>(mut it: I) -> Result<AreasArgs, CompileError> {
+    let (mut input, mut output, mut packages) = (None, None, None);
+    let mut options = osm::areas::AreaOptions::default();
+    let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
+    while let Some(flag) = it.next() {
+        let value = it.next().ok_or_else(|| CompileError::Usage(format!("{flag} needs a value\n{USAGE}")))?;
+        match flag.as_str() {
+            "--input" => input = Some(PathBuf::from(value)),
+            "--output" => output = Some(PathBuf::from(value)),
+            "--packages" => packages = Some(PathBuf::from(value)),
+            "--threads" => options.threads = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--bbox" => options.bbox = Some(parse_bbox(&value).ok_or_else(|| bad(&flag, &value))?),
+            _ => return Err(CompileError::Usage(format!("unknown flag {flag}\n{USAGE}"))),
+        }
+    }
+    Ok(AreasArgs {
+        input: input.ok_or_else(|| CompileError::Usage(format!("--input is required\n{USAGE}")))?,
+        output: output.ok_or_else(|| CompileError::Usage(format!("--output is required\n{USAGE}")))?,
+        options,
+        packages,
+    })
+}
+
+/// Runs `areas`: assembles the polygons and writes every table into the output directory.
+pub fn run_areas(args: &AreasArgs) -> Result<(osm::areas::AreaSet, osm::areas::AreaSummary), CompileError> {
+    let vfs = args.packages.as_deref().map(mount_packages).transpose()?;
+    let (set, summary) = osm::areas::extract(&args.input, &args.options, vfs.as_ref())?;
+    osm::areas::write_all(&args.output, &set)?;
+    Ok((set, summary))
+}
+
+fn parse_bridges<I: Iterator<Item = String>>(mut it: I) -> Result<BridgesArgs, CompileError> {
+    let (mut splines, mut areas, mut dem, mut output) = (None, None, None, None);
+    let mut options = bridges::BridgeOptions::default();
+    let mut expect = Vec::new();
+    let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
+    while let Some(flag) = it.next() {
+        let value = it.next().ok_or_else(|| CompileError::Usage(format!("{flag} needs a value\n{USAGE}")))?;
+        match flag.as_str() {
+            "--splines" => splines = Some(PathBuf::from(value)),
+            "--areas" => areas = Some(PathBuf::from(value)),
+            "--dem" => dem = Some(PathBuf::from(value)),
+            "--output" => output = Some(PathBuf::from(value)),
+            "--threads" => options.threads = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--min-drop" => {
+                options.gorge_drop_m =
+                    value.parse().ok().filter(|v: &f64| v.is_finite() && *v > 0.0).ok_or_else(|| bad(&flag, &value))?
+            }
+            "--expect-over-water" => {
+                let (name, metres) = value.rsplit_once('=').ok_or_else(|| bad(&flag, &value))?;
+                let metres: f64 = metres
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|v: &f64| v.is_finite() && *v >= 0.0)
+                    .ok_or_else(|| bad(&flag, &value))?;
+                expect.push((name.trim().to_owned(), metres));
+            }
+            _ => return Err(CompileError::Usage(format!("unknown flag {flag}\n{USAGE}"))),
+        }
+    }
+    let need = |v: Option<PathBuf>, f: &str| v.ok_or_else(|| CompileError::Usage(format!("{f} is required\n{USAGE}")));
+    Ok(BridgesArgs {
+        splines: need(splines, "--splines")?,
+        areas: need(areas, "--areas")?,
+        dem,
+        output: need(output, "--output")?,
+        options,
+        expect,
+    })
+}
+
+/// Runs `bridges`: reads the splines, the water and coastline tables and the optional DEM,
+/// and writes the bridge table.
+pub fn run_bridges(args: &BridgesArgs) -> Result<(Vec<bridges::Bridge>, bridges::BridgeSummary), CompileError> {
+    let splines = osm::read_splines(&args.splines)?;
+    let water = osm::areas::read_polygons(&args.areas.join(osm::areas::Layer::Water.file_name()))?;
+    let coast = osm::areas::read_coastline(&args.areas.join("coastline.geoparquet"))?;
+    let dem = args.dem.as_deref().map(raster::geotiff::Dem::load).transpose()?;
+    let landuse = osm::areas::read_polygons(&args.areas.join(osm::areas::Layer::Landuse.file_name()))?;
+    let dry: Vec<osm::areas::AreaRow> = landuse.into_iter().filter(|r| r.key == "man_made").collect();
+    let index = bridges::Water::new(&water, &dry, &coast);
+    // The DEM is a surface model: mask it near buildings when the areas have them.
+    let buildings = args.areas.join(osm::areas::Layer::Building.file_name());
+    let footprints = match &dem {
+        Some(_) if buildings.is_file() => Some(bridges::Footprints::new(&osm::areas::read_polygons(&buildings)?)),
+        _ => None,
+    };
+    let (found, mut summary) = bridges::detect(
+        &splines,
+        &index,
+        dem.as_ref().map(|d| d as &dyn raster::HeightField),
+        footprints.as_ref(),
+        &args.options,
+    )?;
+    summary.water_polygons = water.len();
+    summary.coastline_pieces = coast.len();
+    bridges::write_bridges(&args.output, &found)?;
+    Ok((found, summary))
 }
 
 fn parse_graph<I: Iterator<Item = String>>(mut it: I) -> Result<GraphArgs, CompileError> {

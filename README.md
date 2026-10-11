@@ -58,8 +58,9 @@ ffi/
 compiler/
   src/arinc.rs   CIFP reading, reciprocal pairing, magnetic variation, extrusion
   src/geoparquet.rs  GeoParquet 1.0 writer / reader for the runway table
-  src/wkb.rs     Well-Known Binary: polygon / linestring writers, any 2D geometry reader
-  src/validate.rs  Package Validator: core audit plus override-table integrity checks
+  src/wkb.rs     Well-Known Binary: polygon (with holes), multipolygon, linestring and
+                 multipoint writers, any 2D geometry reader
+  src/validate.rs  Package Validator: core audit plus override, spline and polygon table checks
   src/tiler/     Vector Tiler: Web-Mercator XYZ addressing and Morton keys (mod.rs),
                  Sutherland–Hodgman / Liang–Barsky clipping (clip.rs), Douglas–Peucker
                  (simplify.rs), a Mapbox Vector Tile 2.1 encoder and decoder (mvt.rs),
@@ -69,31 +70,38 @@ compiler/
                  writer / reader (png.rs), greedy Delaunay TIN with gap filling (tin.rs),
                  Cesium quantized-mesh encoder / decoder (quantized_mesh.rs), runway and
                  road heightfield patching (patch.rs), float32 GeoTIFF writer
-  src/osm/       OpenStreetMap PBF reader: blobs, zlib, dense and plain nodes, ways (pbf.rs);
-                 road and aeroway extraction with tag normalisation, spline GeoParquet (mod.rs)
+  src/osm/       OpenStreetMap PBF reader: blobs, zlib, dense and plain nodes, ways, relations
+                 (pbf.rs); road and aeroway extraction with tag normalisation, spline
+                 GeoParquet (mod.rs); libosmium-compatible ring assembly (multipolygon.rs);
+                 buildings, water, land use and coastline tables, building heights (areas.rs)
+  src/bridges.rs Bridge detection: tagged decks, splines over water or DEM gorges, piers
   src/graph.rs   Road graph: splines split at shared nodes into directed edges, strongly
                  connected components, edge / node GeoParquet, CTM construction and run
   src/par.rs     Order-preserving parallel map over scoped threads, shared by raster and osm
   src/lib.rs     Override application through the VFS; CLI parsing; run_arinc / run_validate /
-                 run_tiles / run_raster / run_osm / run_graph
+                 run_tiles / run_raster / run_osm / run_areas / run_bridges / run_graph
   tests/         The Phase 2 pipeline end to end, including the §3 override loop; the tiler
                  from the KJFK runway table to decoded tiles on disk; the raster processor
                  from three GeoTIFF encodings to decoded PNG and mesh tiles; terrain patching
                  under the KJFK package's runways and roads; OSM extraction
                  from two libosmium encodings to the package's spline table; the road graph
-                 from that fixture to open and closed CTM runs
+                 from that fixture to open and closed CTM runs; polygons, heights,
+                 exclusions, the validator's polygon checks and bridges (areas.rs)
 fixtures/        The spec's KJFK example package (scenery tests) — its arinc_runways.parquet
                  and taxiways_and_roads.geoparquet are real tables compiled from the CIFP and
-                 OSM samples, so the package validates and overrides end to end; the BSC5 catalogue
+                 OSM samples (and terminal_footprints.geoparquet from the area sample), so the
+                 package validates and overrides end to end; the BSC5 catalogue
                  compiled to nosim's packed form plus a 22-line text excerpt (starfield tests);
                  three synthetic GeoTIFF DEMs of one analytic surface (raster tests); a
-                 synthetic KJFK road and taxiway network as two OSM PBF encodings (osm tests)
+                 synthetic KJFK road and taxiway network as two OSM PBF encodings (osm tests);
+                 a synthetic area and bridge extract (areas tests)
 examples/        compile_bsc5: turns the CDS catalogue text into the packed star buffer
 tools/           ephem_tables.py: reference evaluator + generator for the ephemeris tables;
                  make_dem_fixtures.py: writes the DEM fixtures (standard library only);
                  make_osm_fixture.py: writes the OSM fixtures through libosmium (pyosmium);
                  check_osm_extract.py: cross-checks `osm` output against libosmium;
-                 check_road_graph.py: cross-checks `graph` output against networkx
+                 check_road_graph.py: cross-checks `graph` output against networkx;
+                 check_osm_areas.py: cross-checks `areas` output against libosmium and PROJ
 docs/            Architecture specification; roadmap of the next milestones
 ```
 
@@ -157,6 +165,8 @@ manual dispatch, with downloads cached for a week.
 | §7B — ORCA: a head-on pair and six agents in opposing corridor streams pass with zero overlap; a block is never penetrated (stops at the face alone, routes around with waypoints); walls hold from both sides; a 24-agent circle crossing arrives with overlap bounded by the infeasible-crush fallback; results are deterministic and independent of insertion order | `traffic::orca` |
 | §7 — CTM: vehicles conserved and bounded, free-flow platoon moves exactly one cell per step, steady demand gives density `q / v_f` in every cell, a closed exit sends a shockwave upstream at the wave speed, merges split capacity by priority, a blocked diverge branch holds the whole node (FIFO), spawn count at the near-field boundary equals the exited flow; the general junction equals the merge with one exit and the diverge with one entrance, and on 2,000 random intersections never exceeds a supply or a demand, keeps each approach's turns in proportion, and holds an input back only behind a full exit; links shorter than one step stay conserved and below jam | `traffic::ctm` |
 | §7 near-field vehicles and handoff — on a far/near/far corridor every step conserves vehicles to 1e-9, never lets two overlap, and free-flowing vehicles drive near `v₀`; with the far exit closed the near edge holds a standing queue at the IDM jam gap and the queue spills back into the incoming CTM link; turning choices match their weights (3:1 → 75% ± 5%); MOBIL spreads a packed lane into a free one safely; a dense three-lane ring never clamps a position; runs with the same seed are identical | `traffic::hybrid` |
+| §5 / Phase 3 polygons — closed ways and multipolygon relations assemble as libosmium does: pieces join into rings, a courtyard becomes a hole, two outers stay two, a hole touching its outer twice splits the area in two, a boundary listed twice cancels; rings come out counter-clockwise outside and clockwise inside; a missing member, an open ring, a bow-tie and a three-node way are listed with reasons and locations; `height` (metres, feet, feet-and-inches), `min_height`, `building:levels` and `building:min_level` normalise to metres, and untagged buildings get §5 Poisson levels from their building type or the land use under them, the same every run; the KJFK package's `procedural_buildings` mask removes the two terminals inside the perimeter; the validator catches a clockwise outer ring, a wrong area and a hole outside its outer ring | `compiler/tests/areas.rs`, `osm::multipolygon`, `osm::areas` |
+| §5 bridge detection — two bridge ways drawn in opposite directions join into one deck over the lake; the bridge across the strait measures the sea between two coastlines; an untagged causeway is a missing bridge exactly over the water; the tunnel and the footway onto a pier are not bridges; piers fall evenly at ≤ 35 m and never on an abutment; over a DEM valley the span reaches rim to rim and piers are cast 40 m down to the valley floor; a building at the rim masks it | `compiler/tests/areas.rs`, `bridges` |
 | §7B pedestrian navigation — walk mode keeps footpaths and streets two-way at walking pace, drops motorways and `foot=no`; shortest routes equal a brute-force search on every pair of a small grid; a route follower visits every waypoint in order even when pushed past one; two crowds of 20 walk the fixture route through each other with no overlap, all arrive within 20% of walking alone, and reversing the insertion order of simultaneous entrants changes nothing | `traffic::orca`, `graph`, `compiler/tests/graph.rs` |
 | §7 road graph — on the fixture, the drive graph splits the JFK Expressway at its two junctions, keeps it one-way, implies the ramp's direction, reverses the Nassau Expressway, halves Rockaway Boulevard's lanes per direction, closes the roundabout as a loop, leaves out the bus lane closed to cars, and finds the expected 12 components; the taxi graph is one two-way component; an open CTM run accounts for every vehicle and a closed one circulates over every link without loss | `compiler/tests/graph.rs`, `graph` |
 | §8C — opposition surge and full-moon limb flattening vs Lambert | `photometry::hapke_opposition_and_limb_flattening` |
@@ -171,7 +181,7 @@ manual dispatch, with downloads cached for a week.
 | §2 Coordinate hierarchy, ENU, floating origin | Implemented |
 | §3 Package manifest, validator, exclusion masks, mount table | Implemented; reading the referenced GeoParquet / glTF payloads is the consumer's job |
 | §4 ARINC 424 decode, extrusion, grade fit, markings data, heightfield patching | Implemented; patching is baked into the terrain tiles and an optional patched DEM; decals and the runtime virtual heightfield are engine-side |
-| §5 Seed hash, Poisson levels, pier spacing, flatten falloff | Implemented; WFC/PCG graphs and bridge detection are engine-side |
+| §5 Seed hash, Poisson levels, pier spacing, flatten falloff, building heights, bridge detection and pier placement | Implemented; bridge decks are a straight grade between the ground at their ends (OSM has no deck heights), and the terrain cut-out, WFC/PCG graphs and roof typologies are engine-side |
 | §6 Calendar, declination, lapse rate, phenology, snow mask | Implemented; GPU buffer plumbing is engine-side |
 | §7 IDM, MOBIL, VAT addressing, CTM far-field with general junctions, routed demand, near-field vehicles with handoff, road graph from OSM, ORCA crowds | Implemented; demand is synthetic (by sink capacity), there is no intersection control (signals, yielding to crossing traffic), and turning is by routed shares rather than per-vehicle destinations; pedestrians follow walk-graph routes but buildings are not yet obstacles; the ECS is engine-side |
 | §8A VSOP87D / ELP 2000-82B evaluators, nutation, apparent places, topocentric vectors, phase, libration | Implemented (see below); physical libration (≤ 0.04°) not modelled |
@@ -180,7 +190,7 @@ manual dispatch, with downloads cached for a week.
 | §8B/§8C Hapke BRDF, Chapman limb | Implemented as CPU reference for the shaders |
 | §8 LOD band policy, parent-frame selection | Implemented |
 | C ABI for the UE5 client | Implemented: every module above is reachable from C; proven by a compiled C smoke test |
-| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler; raster processor; OSM ingestion) | Implemented for runways, packages, GeoParquet → MVT tiling with Morton ordering, geographic DEM → Terrain-RGB / normal maps / quantized mesh, and OSM PBF roads and aeroways → spline GeoParquet, matched way for way against libosmium on the New York extract; OSM buildings, water and land use, relations (turn restrictions, multipolygons), FlatGeobuf, H3, 3D Tiles, projected-CRS DEMs, BigTIFF and imagery / land-cover rasters not started |
+| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler; raster processor; OSM ingestion) | Implemented for runways, packages, GeoParquet → MVT tiling with Morton ordering, geographic DEM → Terrain-RGB / normal maps / quantized mesh, and OSM PBF roads and aeroways → spline GeoParquet, matched way for way against libosmium on the New York extract; OSM buildings, water and land use from closed ways and multipolygon relations, matched area for area against libosmium; bridges; turn restrictions, FlatGeobuf, H3, 3D Tiles, projected-CRS DEMs, BigTIFF and imagery / land-cover rasters not started |
 
 What comes next, milestone by milestone, is in [docs/roadmap.md](docs/roadmap.md).
 
@@ -392,6 +402,86 @@ million ways and 33,518 relations in 2,215 blocks):
 
 The real data is not committed: OpenStreetMap data is licensed under the ODbL, so the
 package fixture stays synthetic.
+
+```sh
+cargo run -p nosim-compiler --release -- areas --input extract.osm.pbf --output areas/ [--bbox <west,south,east,north>] [--packages <dir>] [--threads <n>]
+```
+
+`areas` assembles polygons from closed ways and from `multipolygon` / `boundary` relations
+and writes them as GeoParquet tables, one per layer:
+
+- `buildings.geoparquet`: `building=*` other than `no`. `height_m` comes from `height`
+  (metres, feet or feet-and-inches), else `building:levels` × 3 m, else an estimate:
+  §5 `Clamp(Poisson(λ_zone), min, max)` levels, seeded by the footprint's position, with
+  the zone from the building type (a house is suburban, apartments urban, an office
+  commercial, a warehouse industrial) or, for plain `building=yes`, from the `landuse`
+  under it. `height_source` says which, and `min_height_m` comes from `min_height` or
+  `building:min_level`. With `--packages`, buildings whose centroid a package masks for
+  `procedural_buildings` are removed, as the KJFK package does inside the airport
+  perimeter.
+- `water.geoparquet`: `natural=water`, `waterway=riverbank|dock` and
+  `landuse=reservoir|basin`, with `water=*` as the subtype.
+- `landuse.geoparquet`: other `landuse`, park-like `leisure`, land-cover `natural`, and
+  piers and breakwaters.
+- `coastline.geoparquet`: `natural=coastline` as lines (land on the left).
+- `problems.csv`: every area that could not be built, with the reason and a location.
+
+Each row carries libosmium's area id (2 × way id, or 2 × relation id + 1), the deciding key
+and value, `name`, outer and inner ring counts, and `area_m2` on the WGS84 ellipsoid. The
+geometry is a Polygon or MultiPolygon, outer rings counter-clockwise, holes clockwise.
+
+Assembly follows libosmium's area assembler rather than trusting roles. Ways are cut into
+segments, and segments present twice cancel. An odd number of segments meeting at a point
+means an open ring, and segments meeting away from a shared endpoint mean a
+self-intersection; either fails the area. Rings are joined and nested, and nesting depth
+decides which are outer. Where rings touch they are retraced as region boundaries, so a
+hole touching its outer ring at two points splits the area into two outer rings, as
+libosmium does. A relation with a member way or node missing from the extract fails, as in
+libosmium. `validate` checks a package's `content.polygons` tables: rings closed with three
+distinct points, winding, holes inside their outer ring, `area_m2` against the geometry,
+usable heights, and rows inside the bounds.
+
+```sh
+cargo run -p nosim-compiler --release -- bridges --splines splines.geoparquet --areas areas/ --output bridges.geoparquet [--dem <dem.tif>] [--min-drop <m>] [--expect-over-water <name>=<m>]... [--threads <n>]
+```
+
+`bridges` implements §5 bridge detection on a spline table and the `areas` output:
+
+- Tagged `bridge` splines are joined end to end into decks: consecutive ways with the same
+  name and layer, where no third bridge way meets them.
+- An untagged spline that crosses water, other than a tunnel, gets a span over each stretch
+  of water: a missing bridge. Water is the water polygons plus the sea side of the
+  coastline. Piers and breakwaters are dry.
+- With `--dem`, an untagged spline also gets a span wherever the ground falls more than
+  `--min-drop` (default 15 m) below both rims, more steeply than an 8% grade. GLO-30 is a
+  surface model, so samples within 20 m of a building footprint are ignored.
+
+Every deck gets §5 pier stations (35 m nominal, even, never on an abutment). With a DEM,
+each pier is cast down from a deck that runs straight between the ground at its two ends,
+to the ground or the water surface. The table holds the source, OSM ids, deck line, length,
+length over water, pier stations and pier points, and the ground under each pier.
+`--expect-over-water` fails the run unless a deck of that name spans at least that much
+water.
+
+Verified on real data with BBBike's New York extract:
+
+- `areas` on the whole extract builds 1,602,595 buildings, 2,772 water areas and 80,719 land
+  use areas in 43 s on 4 cores, 5,353 of them from relations. 59 failed: 47 relations with
+  members outside the extract, 6 open ways, 3 self-intersecting boundaries and 3 ways of
+  three nodes.
+- `tools/check_osm_areas.py` runs libosmium's area handler on the same file with the same
+  selection. Every layer has the same area ids, and every area has the same outer and inner
+  ring counts. Planar areas agree to 5e-9, and `area_m2` agrees with PROJ's ellipsoidal
+  equal-area projection to 3e-9. No ring is wound the wrong way. Height sources:
+  1,085,179 tagged, 8,270 from levels, 509,146 estimated.
+- `bridges` over the whole extract, in 8 s, finds 8,813 tagged decks (1,241 partly over
+  water), 118 untagged spans over water (mostly footways at the water's edge and roads onto
+  piers drawn as lines), and 19,682 piers. The Throgs Neck Bridge decks span 2.7 km of water
+  and the Verrazzano-Narrows decks 1.5 km. Under the Throgs Neck piers GLO-30, an
+  independent source, is at the water surface (0 m) over the same stretches.
+- With GLO-30, gorge detection found 37 spans in Midtown Manhattan until building
+  footprints masked the surface model; 2 remain, on wooded slopes, where tree canopy fools
+  the same test.
 
 ```sh
 cargo run -p nosim-compiler --release -- raster --input dem.tif --output terrain/ [--patch-runways <runways.parquet>] [--patch-roads <splines.geoparquet>] [--package <dir>] [--patched-dem <out.tif>] [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]

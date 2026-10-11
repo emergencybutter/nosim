@@ -63,7 +63,131 @@ pub fn validate_package(dir: &Path) -> AuditReport {
             check_splines(&mut report, rel, &path, &manifest);
         }
     }
+    for (i, rel) in manifest.content.polygons.iter().enumerate() {
+        let path = dir.join(rel);
+        if path.is_file() {
+            let field = format!("content.polygons[{i}] {rel}");
+            check_polygons(&mut report, &field, &path, &manifest);
+        }
+    }
     report
+}
+
+/// Reads every geometry of a polygon table as stored.
+fn raw_geometries(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+    use arrow::array::AsArray;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .and_then(|b| b.build())
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for batch in reader {
+        let b = batch.map_err(|e| e.to_string())?;
+        let g = b.column_by_name("geometry").ok_or("no geometry column")?.as_binary::<i32>().clone();
+        out.extend((0..b.num_rows()).map(|k| g.value(k).to_vec()));
+    }
+    Ok(out)
+}
+
+/// `content.polygons`: readable in the `areas` layout, rings closed with at least three
+/// distinct points, outer rings counter-clockwise and holes clockwise inside them, areas
+/// consistent with the geometry, buildings with sane heights, and inside the bounds.
+fn check_polygons(report: &mut AuditReport, field: &str, path: &Path, manifest: &Manifest) {
+    let rows = match osm::areas::read_polygons(path) {
+        Ok(rows) => rows,
+        Err(e) => {
+            report.errors.push(format!("{field}: not a readable polygon table ({e})"));
+            return;
+        }
+    };
+    let raw = match raw_geometries(path) {
+        Ok(g) => g,
+        Err(e) => {
+            report.errors.push(format!("{field}: {e}"));
+            return;
+        }
+    };
+    if rows.is_empty() {
+        report.warnings.push(format!("{field}: table has no rows"));
+    }
+    let b = &manifest.bounds;
+    let mut outside = Vec::new();
+    for (r, blob) in rows.iter().zip(&raw) {
+        let id = format!("area {}", r.area_id);
+        let Ok(polygons) = crate::wkb::parse_polygons_raw(blob) else {
+            report.errors.push(format!("{field}: {id} geometry is not a Polygon or MultiPolygon"));
+            continue;
+        };
+        for (pi, p) in polygons.iter().enumerate() {
+            for (ri, ring) in p.iter().enumerate() {
+                let what = if ri == 0 { "outer ring".to_owned() } else { format!("inner ring {ri}") };
+                if ring.len() < 2 || ring.first() != ring.last() {
+                    report.errors.push(format!("{field}: {id} polygon {pi} {what} is not closed"));
+                    continue;
+                }
+                let open = &ring[..ring.len() - 1];
+                let mut distinct = open.to_vec();
+                distinct.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+                distinct.dedup();
+                if distinct.len() < 3 {
+                    report
+                        .errors
+                        .push(format!("{field}: {id} polygon {pi} {what} has fewer than three distinct points"));
+                    continue;
+                }
+                let a2 = crate::wkb::signed_area2(open);
+                if ri == 0 && a2 <= 0.0 {
+                    report.errors.push(format!("{field}: {id} polygon {pi} outer ring is not counter-clockwise"));
+                }
+                if ri > 0 && a2 >= 0.0 {
+                    report.errors.push(format!("{field}: {id} polygon {pi} {what} is not clockwise"));
+                }
+                if ri > 0 {
+                    // A hole lies inside its outer ring: every vertex inside or on it, so the
+                    // midpoint of some edge strictly inside.
+                    let outer = &p[0][..p[0].len() - 1];
+                    let inside = (0..open.len()).any(|k| {
+                        let (u, v) = (open[k], open[(k + 1) % open.len()]);
+                        osm::areas::contains(&[vec![outer.to_vec()]], ((u.0 + v.0) / 2.0, (u.1 + v.1) / 2.0))
+                    });
+                    if !inside {
+                        report.errors.push(format!("{field}: {id} polygon {pi} {what} lies outside its outer ring"));
+                    }
+                }
+            }
+        }
+        let measured = osm::areas::ellipsoid_area_m2(&r.polygons);
+        if (measured - r.area_m2).abs() > 1e-6 * measured.abs().max(1.0) {
+            report
+                .errors
+                .push(format!("{field}: {id} geometry is {measured:.3} m² but area_m2 says {:.3} m²", r.area_m2));
+        }
+        if let Some(bld) = &r.building
+            && !(bld.height_m.is_finite() && bld.height_m > 0.0 && bld.min_height_m >= 0.0)
+        {
+            report.errors.push(format!(
+                "{field}: {id} height {} m / min_height {} m is not usable",
+                bld.height_m, bld.min_height_m
+            ));
+        } else if let Some(bld) = &r.building
+            && bld.min_height_m >= bld.height_m
+        {
+            report.warnings.push(format!(
+                "{field}: {id} min_height {} m is not below its height {} m",
+                bld.min_height_m, bld.height_m
+            ));
+        }
+        if !r.polygons.iter().flat_map(|p| p.first()).flatten().any(|&(lon, lat)| b.contains(lat, lon)) {
+            outside.push(r.area_id.to_string());
+        }
+    }
+    if !outside.is_empty() {
+        report.warnings.push(format!(
+            "{field}: {} area(s) lie wholly outside the package bounds and can never apply: {}",
+            outside.len(),
+            outside.join(", ")
+        ));
+    }
 }
 
 /// `content.spline_networks`: readable, well-formed, and at least partly inside the bounds.

@@ -1,7 +1,7 @@
 //! An OpenStreetMap PBF reader: blob framing, raw and zlib blobs, the header block's
 //! required features, string tables, plain and dense nodes, and ways (with node references,
-//! and with inline locations when the file carries `LocationsOnWays`). Relations, changesets
-//! and metadata are skipped.
+//! and with inline locations when the file carries `LocationsOnWays`), and relations with their
+//! members and roles. Changesets and metadata are skipped.
 //!
 //! Format: a sequence of `[u32 BE length][BlobHeader][Blob]`; each data blob holds one
 //! `PrimitiveBlock` whose coordinates are `offset + granularity · value` nanodegrees.
@@ -57,6 +57,46 @@ impl Way {
     }
 }
 
+/// What a relation member refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemberType {
+    /// A node.
+    Node,
+    /// A way.
+    Way,
+    /// Another relation.
+    Relation,
+}
+
+/// One relation member.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Member {
+    /// Node, way or relation.
+    pub kind: MemberType,
+    /// OSM id of the member.
+    pub id: i64,
+    /// Role, such as `outer` or `inner`; empty when none.
+    pub role: String,
+}
+
+/// A relation: ordered members with roles, and tags.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Relation {
+    /// OSM id.
+    pub id: i64,
+    /// Members in order.
+    pub members: Vec<Member>,
+    /// Tags.
+    pub tags: Vec<(String, String)>,
+}
+
+impl Relation {
+    /// Value of a tag.
+    pub fn tag(&self, key: &str) -> Option<&str> {
+        self.tags.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+}
+
 /// One decoded data block.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Block {
@@ -64,8 +104,8 @@ pub struct Block {
     pub nodes: Vec<Node>,
     /// Ways.
     pub ways: Vec<Way>,
-    /// Relations seen and skipped.
-    pub relations_skipped: usize,
+    /// Relations.
+    pub relations: Vec<Relation>,
 }
 
 /// What the header block declared.
@@ -348,10 +388,7 @@ pub fn block(b: &[u8]) -> Result<Block, PbfError> {
                 (1, 2) => out.nodes.push(plain_node(q.bytes()?, &ctx)?),
                 (2, 2) => dense_nodes(q.bytes()?, &ctx, &mut out.nodes)?,
                 (3, 2) => out.ways.push(way(q.bytes()?, &ctx)?),
-                (4, 2) => {
-                    q.bytes()?;
-                    out.relations_skipped += 1;
-                }
+                (4, 2) => out.relations.push(relation(q.bytes()?, &ctx)?),
                 (_, w) => q.skip(w)?,
             }
         }
@@ -444,6 +481,42 @@ fn way(b: &[u8], ctx: &Ctx) -> Result<Way, PbfError> {
     Ok(Way { id, refs, locations, tags: ctx.tags(&keys, &vals)? })
 }
 
+fn relation(b: &[u8], ctx: &Ctx) -> Result<Relation, PbfError> {
+    let mut id = None;
+    let (mut keys, mut vals, mut roles, mut ids, mut types) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut p = Pb::new(b);
+    while !p.done() {
+        match p.key()? {
+            (1, 0) => id = Some(p.varint()? as i64),
+            (2, w) => repeated(&mut p, w, &mut keys)?,
+            (3, w) => repeated(&mut p, w, &mut vals)?,
+            (8, w) => repeated(&mut p, w, &mut roles)?,
+            (9, w) => repeated(&mut p, w, &mut ids)?,
+            (10, w) => repeated(&mut p, w, &mut types)?,
+            (_, w) => p.skip(w)?,
+        }
+    }
+    let id = id.ok_or_else(|| PbfError("relation without id".into()))?;
+    if roles.len() != ids.len() || types.len() != ids.len() {
+        return err(format!("relation {id}: member roles, ids and types differ in length"));
+    }
+    let members = delta_decode(&ids)
+        .into_iter()
+        .zip(roles.iter().zip(&types))
+        .map(|(mid, (&role, &kind))| {
+            let kind = match kind {
+                0 => MemberType::Node,
+                1 => MemberType::Way,
+                2 => MemberType::Relation,
+                k => return err(format!("relation {id}: member type {k}")),
+            };
+            Ok(Member { kind, id: mid, role: ctx.s(role)?.to_owned() })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Relation { id, members, tags: ctx.tags(&keys, &vals)? })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,9 +558,9 @@ mod tests {
 
     #[test]
     fn hand_built_block() {
-        // String table: "", "highway", "residential", "name", "Elm".
+        // String table: "", "highway", "residential", "name", "Elm", "type", "multipolygon", "outer".
         let mut st = Vec::new();
-        for s in ["", "highway", "residential", "name", "Elm"] {
+        for s in ["", "highway", "residential", "name", "Elm", "type", "multipolygon", "outer"] {
             field(1, s.as_bytes(), &mut st);
         }
         // Dense nodes 10, 11, 13 at granularity 100 (default): lat/lon in 1e-7 degree units.
@@ -523,9 +596,23 @@ mod tests {
             varint(zz(d), &mut refs);
         }
         field(8, &refs, &mut w);
+        // Relation 9: way 7 as "outer", node 11 with no role; type=multipolygon.
+        let mut r = Vec::new();
+        varint(1 << 3, &mut r);
+        varint(9, &mut r);
+        field(2, &[5], &mut r);
+        field(3, &[6], &mut r);
+        field(8, &[7, 0], &mut r);
+        let mut mids = Vec::new();
+        for d in [7i64, 4] {
+            varint(zz(d), &mut mids);
+        }
+        field(9, &mids, &mut r);
+        field(10, &[1, 0], &mut r);
         let mut group = Vec::new();
         field(2, &dense, &mut group);
         field(3, &w, &mut group);
+        field(4, &r, &mut group);
         let mut block_bytes = Vec::new();
         field(1, &st, &mut block_bytes);
         field(2, &group, &mut block_bytes);
@@ -540,6 +627,16 @@ mod tests {
         assert_eq!(b.ways[0].refs, vec![10, 11, 13]);
         assert_eq!(b.ways[0].tag("highway"), Some("residential"));
         assert!(b.ways[0].locations.is_none());
+        assert_eq!(b.relations.len(), 1);
+        let r = &b.relations[0];
+        assert_eq!((r.id, r.tag("type")), (9, Some("multipolygon")));
+        assert_eq!(
+            r.members,
+            vec![
+                Member { kind: MemberType::Way, id: 7, role: "outer".into() },
+                Member { kind: MemberType::Node, id: 11, role: String::new() },
+            ]
+        );
     }
 
     #[test]

@@ -91,10 +91,11 @@ pub fn audit_package(dir: &Path) -> AuditReport {
         && manifest.content.models.is_empty()
         && manifest.content.arinc_overrides.is_none()
         && manifest.content.spline_networks.is_none()
+        && manifest.content.polygons.is_empty()
     {
-        report
-            .warnings
-            .push("package contributes nothing: no exclusions, models, ARINC overrides or spline networks".into());
+        report.warnings.push(
+            "package contributes nothing: no exclusions, models, ARINC overrides, spline networks or polygons".into(),
+        );
     }
     report
 }

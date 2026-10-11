@@ -4,6 +4,7 @@
 #   tools/ci.sh check               format, lints, docs, tests, generated-file drift, CLI runs
 #   tools/ci.sh real-data <dir>     download GLO-30 and BBBike New York into <dir> (kept as a
 #                                   cache) and cross-check against libtiff, libosmium, networkx
+#                                   and PROJ
 #
 # Run from the repository root. Every step must pass; the first failure stops the script.
 set -euo pipefail
@@ -63,6 +64,8 @@ check() {
     cmp "$tmp/runways.parquet" "$pkg/data/arinc_runways.parquet"
     "$wc" osm --input fixtures/osm/kjfk_sample.osm.pbf --output "$tmp/splines.geoparquet" --bbox "$bbox"
     cmp "$tmp/splines.geoparquet" "$pkg/data/taxiways_and_roads.geoparquet"
+    "$wc" areas --input fixtures/osm/areas_sample.osm.pbf --output "$tmp/terminals" --bbox -73.790,40.640,-73.770,40.650
+    cmp "$tmp/terminals/buildings.geoparquet" "$pkg/data/terminal_footprints.geoparquet"
 
     say "command-line runs on the fixtures"
     "$wc" validate --strict fixtures/packages
@@ -75,6 +78,10 @@ check() {
     "$wc" graph --input "$tmp/plain.geoparquet" --output "$tmp/taxi" --mode taxi --largest-component
     "$wc" graph --input "$tmp/plain.geoparquet" --output "$tmp/walk" --mode walk \
         --walk-from -73.783,40.644 --walk-to -73.770,40.633 --walkers 10 --walk-seconds 3600
+    "$wc" areas --input fixtures/osm/areas_sample.osm.pbf --output "$tmp/areas" --packages fixtures/packages
+    "$wc" osm --input fixtures/osm/areas_sample.osm.pbf --output "$tmp/area_roads.geoparquet"
+    "$wc" bridges --splines "$tmp/area_roads.geoparquet" --areas "$tmp/areas" --output "$tmp/bridges.geoparquet" \
+        --expect-over-water "Lake Bridge=800" --expect-over-water "Strait Bridge=800"
 
     say "check passed"
 }
@@ -106,6 +113,16 @@ real_data() {
     "$wc" osm --input "$pbf" --output "$dir/kjfk.geoparquet" --bbox "$bbox"
     python3 tools/check_osm_extract.py "$pbf" "$dir/kjfk.geoparquet" --bbox="$bbox"
 
+    say "polygons vs libosmium's area handler (New York City)"
+    local nyc="-74.26,40.49,-73.70,40.92"
+    "$wc" areas --input "$pbf" --output "$dir/areas" --bbox "$nyc"
+    python3 tools/check_osm_areas.py "$pbf" "$dir/areas" --bbox="$nyc"
+
+    say "bridges: the Verrazzano-Narrows and the Throgs Neck span water"
+    "$wc" osm --input "$pbf" --output "$dir/nyc.geoparquet" --bbox "$nyc"
+    "$wc" bridges --splines "$dir/nyc.geoparquet" --areas "$dir/areas" --dem "$dem" --output "$dir/bridges.geoparquet" \
+        --expect-over-water "Verrazzano-Narrows Bridge=1000" --expect-over-water "Throgs Neck Bridge=1000"
+
     say "road graphs vs networkx (KJFK drive and taxi)"
     for mode in drive taxi; do
         "$wc" graph --input "$dir/kjfk.geoparquet" --output "$dir/graph_$mode" --mode "$mode"
@@ -134,7 +151,7 @@ real_data() {
     "$wc" raster --input "$dem" --output "$dir/terrain" \
         --patch-runways fixtures/packages/org.contributor.infrastructure.kjfk/data/arinc_runways.parquet \
         --patch-roads "$dir/kjfk.geoparquet" --min-zoom 12 --max-zoom 13
-    rm -rf "$dir/terrain" "$dir"/graph_*
+    rm -rf "$dir/terrain" "$dir"/graph_* "$dir/areas" "$dir/nyc.geoparquet" "$dir/bridges.geoparquet"
 
     say "real-data checks passed"
 }

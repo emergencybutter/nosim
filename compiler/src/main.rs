@@ -3,7 +3,8 @@
 use std::process::ExitCode;
 
 use nosim_compiler::{
-    Command, USAGE, parse_args, run_arinc, run_graph, run_osm, run_raster, run_tiles, run_validate, validate,
+    Command, USAGE, parse_args, run_areas, run_arinc, run_bridges, run_graph, run_osm, run_raster, run_tiles,
+    run_validate, validate,
 };
 
 fn main() -> ExitCode {
@@ -205,6 +206,106 @@ fn main() -> ExitCode {
                     println!("{} spline(s) outside the bounding box dropped", s.outside_bbox);
                 }
                 ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Areas(args) => match run_areas(&args) {
+            Ok((set, s)) => {
+                println!(
+                    "{}: {} block(s), {} node(s), {} way(s), {} relation(s); written by {}",
+                    args.input.display(),
+                    s.blocks,
+                    s.nodes,
+                    s.ways,
+                    s.relations,
+                    s.writing_program.as_deref().unwrap_or("an unnamed program")
+                );
+                println!(
+                    "candidates: {} closed way(s), {} multipolygon / boundary relation(s); {} area(s) from relations",
+                    s.candidate_ways, s.candidate_relations, s.relations_built
+                );
+                let count = |l: &str| s.built.get(l).copied().unwrap_or(0);
+                println!(
+                    "{}: {} building(s), {} water, {} land use, {} coastline piece(s)",
+                    args.output.display(),
+                    count("building"),
+                    count("water"),
+                    count("landuse"),
+                    s.coastline_rows
+                );
+                let heights: Vec<String> = s.heights.iter().map(|(k, v)| format!("{v} {k}")).collect();
+                if !heights.is_empty() {
+                    println!("building heights: {}", heights.join(", "));
+                }
+                for (package, n) in &s.excluded {
+                    println!("{n} building(s) removed by {package}'s procedural_buildings exclusion");
+                }
+                if s.area_no > 0 {
+                    println!("{} way(s) skipped: tagged area=no, or pier and breakwater lines", s.area_no);
+                }
+                if s.outside_bbox > 0 {
+                    println!("{} area(s) outside the bounding box dropped", s.outside_bbox);
+                }
+                if !set.problems.is_empty() {
+                    let kinds: Vec<String> = s.failed.iter().map(|(k, v)| format!("{v} {k}")).collect();
+                    eprintln!(
+                        "warning: {} area(s) could not be built ({}); listed in {}",
+                        set.problems.len(),
+                        kinds.join(", "),
+                        args.output.join("problems.csv").display()
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Bridges(args) => match run_bridges(&args) {
+            Ok((found, s)) => {
+                println!(
+                    "{} spline(s), {} tagged bridge spline(s), {} tunnel(s); water: {} polygon(s), {} coastline piece(s)",
+                    s.splines, s.tagged_splines, s.tunnels, s.water_polygons, s.coastline_pieces
+                );
+                println!(
+                    "{}: {} tagged deck(s) ({} over water), {} untagged span(s) over water, {} over DEM gorges; {} pier(s)",
+                    args.output.display(),
+                    s.tagged_decks,
+                    s.tagged_over_water,
+                    s.water_spans,
+                    s.dem_spans,
+                    s.piers
+                );
+                let mut longest: Vec<&nosim_compiler::bridges::Bridge> =
+                    found.iter().filter(|b| b.over_water_m > 0.0).collect();
+                longest.sort_by(|a, b| b.over_water_m.total_cmp(&a.over_water_m));
+                for b in longest.iter().take(5) {
+                    println!(
+                        "  {} {} (way {}{}): {:.0} m deck, {:.0} m over water, {} pier(s){}",
+                        b.source.as_str(),
+                        b.name.as_deref().unwrap_or("(unnamed)"),
+                        b.osm_ids[0],
+                        if b.osm_ids.len() > 1 { format!(" +{}", b.osm_ids.len() - 1) } else { String::new() },
+                        b.length_m,
+                        b.over_water_m,
+                        b.piers.len(),
+                        b.max_pier_m.map(|h| format!(", tallest {h:.1} m")).unwrap_or_default()
+                    );
+                }
+                let missed = nosim_compiler::bridges::unmet(&found, &args.expect);
+                for m in &missed {
+                    eprintln!("error: expected bridge not found over water: {m}");
+                }
+                for (name, metres) in &args.expect {
+                    if !missed.iter().any(|m| m.starts_with(&format!("{name}:"))) {
+                        println!("expected: {name} spans at least {metres:.0} m of water");
+                    }
+                }
+                if missed.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
             }
             Err(e) => {
                 eprintln!("error: {e}");
