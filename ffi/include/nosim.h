@@ -132,6 +132,54 @@ typedef enum NosimParentFrame {
 } NosimParentFrame;
 
 /**
+ * Which network a graph carries.
+ */
+typedef enum NosimGraphMode {
+  /**
+   * Roads open to cars.
+   */
+  NOSIM_GRAPH_MODE_DRIVE = 0,
+  /**
+   * Taxiways and runways.
+   */
+  NOSIM_GRAPH_MODE_TAXI = 1,
+  /**
+   * Footways, paths and street sidewalks, two-way.
+   */
+  NOSIM_GRAPH_MODE_WALK = 2,
+} NosimGraphMode;
+
+/**
+ * Tile layers the compiler writes.
+ */
+typedef enum NosimTileLayer {
+  /**
+   * `terrain-rgb/z/x/y.png`, Web Mercator.
+   */
+  NOSIM_TILE_LAYER_TERRAIN_RGB = 0,
+  /**
+   * `normals/z/x/y.png`, Web Mercator.
+   */
+  NOSIM_TILE_LAYER_NORMALS = 1,
+  /**
+   * `mesh/z/x/y.terrain`, quantized mesh on the geographic TMS grid (y from the south).
+   */
+  NOSIM_TILE_LAYER_MESH = 2,
+  /**
+   * `classes/z/x/y.png`, land-cover classes, Web Mercator.
+   */
+  NOSIM_TILE_LAYER_LANDCOVER_CLASSES = 3,
+  /**
+   * `masks/<name>/z/x/y.png`, land-cover density, Web Mercator.
+   */
+  NOSIM_TILE_LAYER_LANDCOVER_MASK = 4,
+  /**
+   * `z/x/y.pbf`, vector tiles, Web Mercator.
+   */
+  NOSIM_TILE_LAYER_VECTOR = 5,
+} NosimTileLayer;
+
+/**
  * A far-field road segment (opaque).
  */
 typedef struct NosimCtmLink NosimCtmLink;
@@ -140,6 +188,11 @@ typedef struct NosimCtmLink NosimCtmLink;
  * Floating render origin (opaque).
  */
 typedef struct NosimFloatingOrigin NosimFloatingOrigin;
+
+/**
+ * A directed road graph.
+ */
+typedef struct NosimGraph NosimGraph;
 
 /**
  * A crowd simulation (opaque).
@@ -153,9 +206,19 @@ typedef struct NosimOrcaSim NosimOrcaSim;
 typedef struct NosimPackage NosimPackage;
 
 /**
+ * A spline table (`content.spline_networks`, or the output of `world-compiler osm`).
+ */
+typedef struct NosimSplineTable NosimSplineTable;
+
+/**
  * Loaded star catalogue (opaque).
  */
 typedef struct NosimStarCatalog NosimStarCatalog;
+
+/**
+ * A far-field CTM run on a graph, stepped by the caller.
+ */
+typedef struct NosimTraffic NosimTraffic;
 
 /**
  * Prioritised mount table (opaque).
@@ -685,6 +748,186 @@ typedef struct NosimTranslunar {
    */
   double periselene_m;
 } NosimTranslunar;
+
+/**
+ * One spline's attributes.
+ */
+typedef struct NosimSpline {
+  /**
+   * OSM way id.
+   */
+  int64_t osm_id;
+  /**
+   * Piece of the way.
+   */
+  int32_t part;
+  /**
+   * True for an aeroway, false for a road.
+   */
+  bool aeroway;
+  /**
+   * Target speed, m/s.
+   */
+  double speed_mps;
+  /**
+   * Lanes (0 when untagged).
+   */
+  int32_t lanes;
+  /**
+   * 1 along the points, −1 against, 0 both ways.
+   */
+  int32_t oneway;
+  /**
+   * Width, metres (0 when untagged).
+   */
+  double width_m;
+  /**
+   * On a bridge.
+   */
+  bool bridge;
+  /**
+   * In a tunnel.
+   */
+  bool tunnel;
+  /**
+   * OSM layer.
+   */
+  int32_t layer;
+  /**
+   * Length, metres.
+   */
+  double length_m;
+  /**
+   * Number of points.
+   */
+  size_t point_count;
+} NosimSpline;
+
+/**
+ * A graph vertex.
+ */
+typedef struct NosimGraphNode {
+  /**
+   * OSM node id (0 when unknown).
+   */
+  int64_t osm_id;
+  /**
+   * Longitude, degrees.
+   */
+  double lon;
+  /**
+   * Latitude, degrees.
+   */
+  double lat;
+  /**
+   * Edges entering.
+   */
+  uint32_t in_degree;
+  /**
+   * Edges leaving.
+   */
+  uint32_t out_degree;
+  /**
+   * Strongly connected component, 0 the largest.
+   */
+  uint32_t component;
+} NosimGraphNode;
+
+/**
+ * A directed edge; CTM link `k` of a traffic run is edge `k`.
+ */
+typedef struct NosimGraphEdge {
+  /**
+   * Upstream node.
+   */
+  uint32_t from;
+  /**
+   * Downstream node.
+   */
+  uint32_t to;
+  /**
+   * OSM way.
+   */
+  int64_t osm_id;
+  /**
+   * Target speed, m/s.
+   */
+  double speed_mps;
+  /**
+   * Lanes in this direction.
+   */
+  uint32_t lanes;
+  /**
+   * Length, metres.
+   */
+  double length_m;
+  /**
+   * Opposite direction's edge, or −1.
+   */
+  int64_t reverse;
+} NosimGraphEdge;
+
+/**
+ * How a traffic run is built.
+ */
+typedef struct NosimTrafficOptions {
+  /**
+   * Time step, seconds.
+   */
+  double dt_s;
+  /**
+   * Demand at every source, vehicles per hour.
+   */
+  double demand_veh_per_h;
+  /**
+   * Route the demand along shortest travel-time paths (true) or split by capacity.
+   */
+  bool routed;
+  /**
+   * Successive-averages iterations when routing.
+   */
+  uint32_t assign_iterations;
+} NosimTrafficOptions;
+
+/**
+ * Running totals of a traffic run.
+ */
+typedef struct NosimTrafficTotals {
+  /**
+   * Steps run.
+   */
+  uint64_t steps;
+  /**
+   * Vehicles that entered at sources.
+   */
+  double entered;
+  /**
+   * Vehicles that left at sinks.
+   */
+  double exited;
+  /**
+   * Vehicles on the network.
+   */
+  double on_network;
+} NosimTrafficTotals;
+
+/**
+ * A tile address.
+ */
+typedef struct NosimTile {
+  /**
+   * Zoom.
+   */
+  uint8_t z;
+  /**
+   * Column.
+   */
+  uint32_t x;
+  /**
+   * Row (Web Mercator: from the north; geographic TMS: from the south).
+   */
+  uint32_t y;
+} NosimTile;
 
 /**
  * One instant on every scale the simulator needs.
@@ -1487,6 +1730,198 @@ enum NosimStatus nosim_flight_propagate(double jd0_tdb,
                                         const double *state,
                                         double dt_s,
                                         double *out);
+
+/**
+ * Loads a spline table (GeoParquet). NULL on failure (see `nosim_last_error`).
+ *
+ * # Safety
+ * `path` must be NULL or a NUL-terminated string.
+ */
+struct NosimSplineTable *nosim_spline_table_load(const char *path);
+
+/**
+ * Releases a spline table. NULL is ignored.
+ *
+ * # Safety
+ * `t` must be NULL or a live handle, freed once.
+ */
+void nosim_spline_table_free(struct NosimSplineTable *t);
+
+/**
+ * Number of splines (0 for NULL).
+ *
+ * # Safety
+ * `t` must be NULL or live.
+ */
+size_t nosim_spline_table_count(const struct NosimSplineTable *t);
+
+/**
+ * Attributes of spline `i`.
+ *
+ * # Safety
+ * `t` must be NULL or live; `out` must be NULL or writable.
+ */
+enum NosimStatus nosim_spline_table_get(const struct NosimSplineTable *t,
+                                        size_t i,
+                                        struct NosimSpline *out);
+
+/**
+ * Class (`highway` / `aeroway` value) of spline `i`; returns the size needed including the
+ * NUL, 0 for a bad handle or index.
+ *
+ * # Safety
+ * `t` must be NULL or live; `buf` must be NULL or point to `cap` bytes.
+ */
+size_t nosim_spline_table_class(const struct NosimSplineTable *t, size_t i, char *buf, size_t cap);
+
+/**
+ * Points of spline `i` as `lon, lat` pairs (degrees) into `lonlat` (room for `capacity`
+ * points). Returns the point count; at most `capacity` are written.
+ *
+ * # Safety
+ * `t` must be NULL or live; `lonlat` must point to `2 · capacity` doubles.
+ */
+size_t nosim_spline_table_points(const struct NosimSplineTable *t,
+                                 size_t i,
+                                 double *lonlat,
+                                 size_t capacity);
+
+/**
+ * Builds a graph from a spline table: splines split at shared nodes into directed edges, and
+ * with `largest_component` only the largest strongly connected component kept.
+ *
+ * # Safety
+ * `t` must be NULL or live.
+ */
+struct NosimGraph *nosim_graph_build(const struct NosimSplineTable *t,
+                                     enum NosimGraphMode mode,
+                                     bool largest_component);
+
+/**
+ * Loads a graph written by `world-compiler graph` (`edges.geoparquet` and
+ * `nodes.geoparquet` in `dir`). NULL on failure.
+ *
+ * # Safety
+ * `dir` must be NULL or a NUL-terminated string.
+ */
+struct NosimGraph *nosim_graph_load(const char *dir);
+
+/**
+ * Releases a graph. NULL is ignored.
+ *
+ * # Safety
+ * `g` must be NULL or a live handle, freed once.
+ */
+void nosim_graph_free(struct NosimGraph *g);
+
+/**
+ * Node count (0 for NULL).
+ *
+ * # Safety
+ * `g` must be NULL or live.
+ */
+size_t nosim_graph_node_count(const struct NosimGraph *g);
+
+/**
+ * Edge count (0 for NULL).
+ *
+ * # Safety
+ * `g` must be NULL or live.
+ */
+size_t nosim_graph_edge_count(const struct NosimGraph *g);
+
+/**
+ * Node `i`.
+ *
+ * # Safety
+ * `g` must be NULL or live; `out` must be NULL or writable.
+ */
+enum NosimStatus nosim_graph_node(const struct NosimGraph *g, size_t i, struct NosimGraphNode *out);
+
+/**
+ * Edge `i`.
+ *
+ * # Safety
+ * `g` must be NULL or live; `out` must be NULL or writable.
+ */
+enum NosimStatus nosim_graph_edge(const struct NosimGraph *g, size_t i, struct NosimGraphEdge *out);
+
+/**
+ * The options `world-compiler graph --simulate` uses: 1 s, 300 veh/h, routed, 5 iterations.
+ */
+struct NosimTrafficOptions nosim_traffic_options_default(void);
+
+/**
+ * Builds the CTM for a graph. NULL on failure.
+ *
+ * # Safety
+ * `g` must be NULL or live.
+ */
+struct NosimTraffic *nosim_traffic_new(const struct NosimGraph *g,
+                                       struct NosimTrafficOptions options);
+
+/**
+ * Releases a traffic run. NULL is ignored.
+ *
+ * # Safety
+ * `t` must be NULL or a live handle, freed once.
+ */
+void nosim_traffic_free(struct NosimTraffic *t);
+
+/**
+ * Advances `steps` steps and writes the running totals to `out` (which may be NULL).
+ *
+ * # Safety
+ * `t` must be NULL or live; `out` must be NULL or writable.
+ */
+enum NosimStatus nosim_traffic_step(struct NosimTraffic *t,
+                                    uint32_t steps,
+                                    struct NosimTrafficTotals *out);
+
+/**
+ * Puts up to `vehicles` on graph edge `edge` at fraction `at` of its length (0 its start, 1
+ * its end), counted as entered: the far field's side of a near-field handoff. Returns how
+ * many fitted (0 for a bad handle or index).
+ *
+ * # Safety
+ * `t` must be NULL or live.
+ */
+double nosim_traffic_inject(struct NosimTraffic *t, size_t edge, double at, double vehicles);
+
+/**
+ * Vehicles on graph edge `edge` (negative for a bad handle or index).
+ *
+ * # Safety
+ * `t` must be NULL or live.
+ */
+double nosim_traffic_edge_vehicles(const struct NosimTraffic *t, size_t edge);
+
+/**
+ * The tile of `layer` containing a point at zoom `z`.
+ */
+struct NosimTile nosim_tile_at(enum NosimTileLayer layer,
+                               double lon_deg,
+                               double lat_deg,
+                               uint8_t z);
+
+/**
+ * Geographic bounds of a tile of `layer`.
+ */
+struct NosimBounds nosim_tile_bounds(enum NosimTileLayer layer, struct NosimTile tile);
+
+/**
+ * Path of a tile relative to the compiler's output directory, e.g. `terrain-rgb/12/1205/1539.png`;
+ * `mask` names the mask for `LandcoverMask` and is ignored otherwise. Returns the size needed
+ * including the NUL.
+ *
+ * # Safety
+ * `mask` must be NULL or a NUL-terminated string; `buf` must be NULL or point to `cap` bytes.
+ */
+size_t nosim_tile_path(enum NosimTileLayer layer,
+                       const char *mask,
+                       struct NosimTile tile,
+                       char *buf,
+                       size_t cap);
 
 /**
  * ΔT = TT − UT1, seconds, at a UTC instant. `dut1_seconds` is UT1 − UTC from IERS

@@ -472,3 +472,75 @@ fn orca_sim_handle() {
         nosim_orca_free(ptr::null_mut());
     }
 }
+
+#[test]
+fn client_hand_off() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures");
+    let pkg = CString::new(
+        fixtures
+            .join("packages/org.contributor.infrastructure.kjfk/data/taxiways_and_roads.geoparquet")
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    unsafe {
+        let t = nosim_spline_table_load(pkg.as_ptr());
+        assert!(!t.is_null());
+        let n = nosim_spline_table_count(t);
+        assert!(n > 10);
+        let mut sp = NosimSpline::default();
+        assert_eq!(nosim_spline_table_get(t, 0, &mut sp), NosimStatus::Ok);
+        let mut pts = vec![0.0; 2 * sp.point_count];
+        assert_eq!(nosim_spline_table_points(t, 0, pts.as_mut_ptr(), sp.point_count), sp.point_count);
+        let mut buf = [0 as c_char; 32];
+        assert!(nosim_spline_table_class(t, 0, buf.as_mut_ptr(), buf.len()) > 1);
+        // Taxi graph: one two-way component of aeroways.
+        let g = nosim_graph_build(t, NosimGraphMode::Taxi, true);
+        assert!(nosim_graph_edge_count(g) > 0);
+        let mut e = NosimGraphEdge::default();
+        assert_eq!(nosim_graph_edge(g, 0, &mut e), NosimStatus::Ok);
+        assert!(e.reverse >= 0);
+        assert_eq!(nosim_graph_edge(g, usize::MAX, &mut e), NosimStatus::InvalidArgument);
+        let traffic = nosim_traffic_new(g, nosim_traffic_options_default());
+        assert!(!traffic.is_null());
+        assert_eq!(nosim_traffic_inject(traffic, 0, 0.5, 0.25), 0.25);
+        let mut tot = NosimTrafficTotals::default();
+        assert_eq!(nosim_traffic_step(traffic, 10, &mut tot), NosimStatus::Ok);
+        assert_eq!(tot.steps, 10);
+        assert!((tot.entered - tot.exited - tot.on_network).abs() < 1e-12);
+        assert_eq!(nosim_traffic_edge_vehicles(traffic, usize::MAX), -1.0);
+        let bad = NosimTrafficOptions { dt_s: 0.0, ..nosim_traffic_options_default() };
+        assert!(nosim_traffic_new(g, bad).is_null());
+        nosim_traffic_free(traffic);
+        nosim_graph_free(g);
+        nosim_spline_table_free(t);
+        // NULL and missing files.
+        assert!(nosim_spline_table_load(ptr::null()).is_null());
+        let missing = CString::new("/nonexistent/x.geoparquet").unwrap();
+        assert!(nosim_spline_table_load(missing.as_ptr()).is_null());
+        assert!(nosim_graph_build(ptr::null(), NosimGraphMode::Drive, false).is_null());
+        assert!(nosim_graph_load(missing.as_ptr()).is_null());
+        assert!(nosim_traffic_new(ptr::null(), nosim_traffic_options_default()).is_null());
+        assert_eq!(nosim_traffic_step(ptr::null_mut(), 1, ptr::null_mut()), NosimStatus::NullPointer);
+        assert_eq!(nosim_spline_table_count(ptr::null()), 0);
+    }
+    // Tiles: KJFK at z10 is Web-Mercator 302/385 (the tiler's test), and the mesh tile is on
+    // the geographic grid, y counted from the south.
+    let t = nosim_tile_at(NosimTileLayer::TerrainRgb, -73.7789, 40.6398, 10);
+    assert_eq!((t.x, t.y), (302, 385));
+    let m = nosim_tile_at(NosimTileLayer::Mesh, -73.7789, 40.6398, 10);
+    let b = nosim_tile_bounds(NosimTileLayer::Mesh, m);
+    assert!(b.min_lat <= 40.6398 && 40.6398 < b.max_lat && b.min_lon <= -73.7789 && -73.7789 < b.max_lon);
+    assert!((b.max_lat - b.min_lat - 180.0 / 1024.0).abs() < 1e-12);
+    let mut buf = [0 as c_char; 64];
+    let mask = CString::new("grass").unwrap();
+    let n = unsafe { nosim_tile_path(NosimTileLayer::LandcoverMask, mask.as_ptr(), t, buf.as_mut_ptr(), buf.len()) };
+    let path = unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
+    assert_eq!((n, path), (27, "masks/grass/10/302/385.png"));
+    let n = unsafe { nosim_tile_path(NosimTileLayer::Mesh, ptr::null(), m, buf.as_mut_ptr(), buf.len()) };
+    assert!(n > 0 && unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap().ends_with(".terrain"));
+    assert_eq!(
+        unsafe { nosim_tile_path(NosimTileLayer::LandcoverMask, ptr::null(), t, buf.as_mut_ptr(), buf.len()) },
+        0
+    );
+}

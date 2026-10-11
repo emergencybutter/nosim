@@ -13,6 +13,10 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 nosim = { path = ".." }
+nosim-compiler = { path = "../compiler" }
+
+[dev-dependencies]
+nosim-compiler = { path = "../compiler" }
 
 [build-dependencies]
 cbindgen = "0.29"

@@ -263,7 +263,21 @@ CPU math that can live here.
 sampled view and sun angles. Radiance is continuous with the analytical limb at the
 transition.
 
-## M8 — Client hand-off through the C ABI
+## M8 — Client hand-off through the C ABI — done
+
+Done in `nosim-ffi`, which now links the compiler crate; see the README's C ABI section. The
+ABI covers spline tables, graphs (built or loaded), a stepwise routed CTM with injection,
+and tile addressing for every layer the compiler writes. It also resolves content through the
+VFS, which it already did.
+
+The C smoke test loads the KJFK package, resolves its spline table through the VFS, builds
+the drive graph and runs the CTM for 60 s. Its totals equal the Rust run's bit for bit.
+
+Two things to know:
+- The package's roads have no sources inside its bounds, so the test seeds vehicles near the
+  end of every edge rather than relying on demand.
+- `simulate` now runs on the same stepwise `Traffic` object the ABI uses, and its totals are
+  unchanged.
 
 **Deliverables**
 - C functions to mount packages and resolve content through the VFS, read spline and graph
@@ -292,5 +306,5 @@ Each becomes a milestone when a consumer needs it.
    source choice and possibly a licence review.
 3. **Real data in the repository.** It stays out, because OpenStreetMap is ODbL. If a real-data
    regression fixture is wanted, it needs an attribution and share-alike decision.
-4. **Client timing.** M8 is worth more once an Unreal project consumes the ABI. It can move
-   earlier if the client starts sooner.
+4. **Client timing.** M8 is done; the next step on this side is whatever the Unreal project
+   finds missing once it consumes the ABI.

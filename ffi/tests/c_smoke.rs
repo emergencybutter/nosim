@@ -77,5 +77,33 @@ fn c_program_links_and_runs() {
         String::from_utf8_lossy(&run.stdout),
         String::from_utf8_lossy(&run.stderr)
     );
-    assert!(String::from_utf8_lossy(&run.stdout).contains("passed"));
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains("passed"));
+
+    // M8 acceptance: the C program's 60 s CTM run on the KJFK package's drive graph (half a
+    // vehicle seeded near the end of every edge, default options) has exactly the totals of the same run
+    // in Rust.
+    let line = stdout.lines().find(|l| l.starts_with("traffic totals: ")).expect("traffic line");
+    eprintln!("C: {line}");
+    let c: Vec<&str> = line["traffic totals: ".len()..].split_whitespace().collect();
+    let pkg =
+        manifest.join("../fixtures/packages/org.contributor.infrastructure.kjfk/data/taxiways_and_roads.geoparquet");
+    let rows = nosim_compiler::osm::read_splines(&pkg).unwrap();
+    let (g, _) = nosim_compiler::graph::build(&rows, nosim_compiler::graph::Mode::Drive, false);
+    let mut t = nosim_compiler::graph::Traffic::new(&g, &nosim_compiler::graph::SimOptions::default()).unwrap();
+    for k in 0..g.edges.len() {
+        t.inject(k, 0.95, 0.5);
+    }
+    for _ in 0..60 {
+        t.step();
+    }
+    let s = t.totals();
+    assert_eq!(c[0].parse::<usize>().unwrap(), g.nodes.len());
+    assert_eq!(c[1].parse::<usize>().unwrap(), g.edges.len());
+    assert_eq!(c[2].parse::<usize>().unwrap(), s.steps);
+    let bits = |v: &str| v.parse::<f64>().unwrap().to_bits();
+    assert_eq!(bits(c[3]), s.entered.to_bits(), "entered: C {} vs Rust {}", c[3], s.entered);
+    assert_eq!(bits(c[4]), s.exited.to_bits(), "exited: C {} vs Rust {}", c[4], s.exited);
+    assert_eq!(bits(c[5]), s.on_network.to_bits(), "on network: C {} vs Rust {}", c[5], s.on_network);
+    assert!(s.entered > 0.0 && s.exited > 0.0);
 }

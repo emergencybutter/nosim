@@ -730,46 +730,124 @@ pub struct SimSummary {
     pub per_class: Vec<ClassStats>,
 }
 
+/// A far-field CTM built from a graph and run a step at a time: what [`simulate`] runs, and
+/// what a client drives through the C ABI.
+pub struct Traffic {
+    built: ctm::GraphNetwork,
+    stranded_sources: usize,
+    entered: f64,
+    exited: f64,
+    steps: usize,
+}
+
+/// Running totals of a [`Traffic`] run.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TrafficTotals {
+    /// Steps run.
+    pub steps: usize,
+    /// Vehicles that entered at sources.
+    pub entered: f64,
+    /// Vehicles that left at sinks.
+    pub exited: f64,
+    /// Vehicles on the network.
+    pub on_network: f64,
+}
+
+impl Traffic {
+    /// Builds the CTM from `g` with `o`'s step, demand and routing (`o.seconds` is not used).
+    pub fn new(g: &Graph, o: &SimOptions) -> Result<Traffic, CompileError> {
+        let mut stranded_sources = 0;
+        let built = if o.routed {
+            let a = assign(g, o.demand_veh_per_s, o.assign_iterations);
+            stranded_sources = a.stranded_sources;
+            let rate: HashMap<u32, f64> = a.source_rate.iter().copied().collect();
+            let mut built = to_ctm_routed(g, o.dt_s, &a)?;
+            for &(node, link) in &built.sources.clone() {
+                let v = g.edges[link].from;
+                built.network.set_rate(node, rate.get(&v).copied().unwrap_or(0.0));
+            }
+            built
+        } else {
+            let mut built = to_ctm(g, o.dt_s)?;
+            for &(node, _) in &built.sources.clone() {
+                built.network.set_rate(node, o.demand_veh_per_s);
+            }
+            built
+        };
+        Ok(Traffic { built, stranded_sources, entered: 0.0, exited: 0.0, steps: 0 })
+    }
+
+    /// Advances one step; returns the vehicles that entered and left during it.
+    pub fn step(&mut self) -> (f64, f64) {
+        let flows = self.built.network.step();
+        let entered: f64 = self.built.sources.iter().map(|&(_, l)| flows[l].entered).sum();
+        let exited: f64 = self.built.sinks.iter().map(|&(_, l)| flows[l].exited).sum();
+        self.entered += entered;
+        self.exited += exited;
+        self.steps += 1;
+        (entered, exited)
+    }
+
+    /// Puts up to `vehicles` on graph edge `k` at fraction `at` of its length (0 its start,
+    /// 1 its end), as near-field handoff and spawning do, counting them as entered; returns
+    /// how many fitted in that cell.
+    pub fn inject(&mut self, k: usize, at: f64, vehicles: f64) -> f64 {
+        if k >= self.built.network.links().len() {
+            return 0.0;
+        }
+        let link = self.built.network.link_mut(k);
+        let cells = link.cell_count();
+        let cell = ((at.clamp(0.0, 1.0) * cells as f64) as usize).min(cells - 1);
+        let left = link.inject(cell, vehicles);
+        let added = vehicles.max(0.0) - left;
+        self.entered += added;
+        added
+    }
+
+    /// Totals so far.
+    pub fn totals(&self) -> TrafficTotals {
+        TrafficTotals {
+            steps: self.steps,
+            entered: self.entered,
+            exited: self.exited,
+            on_network: self.built.network.total_vehicles(),
+        }
+    }
+
+    /// The network, for inspection (link `k` is graph edge `k`).
+    pub fn network(&self) -> &ctm::Network {
+        &self.built.network
+    }
+
+    /// Vehicles on graph edge `k`.
+    pub fn edge_vehicles(&self, k: usize) -> Option<f64> {
+        self.built.network.links().get(k).map(|l| l.vehicles().iter().sum())
+    }
+
+    /// Sources, sinks, junctions and links shorter than one step.
+    pub fn shape(&self) -> (usize, usize, usize, usize) {
+        (self.built.sources.len(), self.built.sinks.len(), self.built.junctions, self.built.short_links)
+    }
+}
+
 /// Runs the CTM with the same demand at every source and every sink free.
 pub fn simulate(g: &Graph, o: &SimOptions) -> Result<SimSummary, CompileError> {
     let mut s = SimSummary { routed: o.routed, ..Default::default() };
-    let mut built = if o.routed {
-        let a = assign(g, o.demand_veh_per_s, o.assign_iterations);
-        s.stranded_sources = a.stranded_sources;
-        let rate: HashMap<u32, f64> = a.source_rate.iter().copied().collect();
-        let mut built = to_ctm_routed(g, o.dt_s, &a)?;
-        for &(node, link) in &built.sources.clone() {
-            let v = g.edges[link].from;
-            built.network.set_rate(node, rate.get(&v).copied().unwrap_or(0.0));
-        }
-        built
-    } else {
-        let mut built = to_ctm(g, o.dt_s)?;
-        for &(node, _) in &built.sources.clone() {
-            built.network.set_rate(node, o.demand_veh_per_s);
-        }
-        built
-    };
+    let mut traffic = Traffic::new(g, o)?;
+    s.stranded_sources = traffic.stranded_sources;
     let steps = (o.seconds / o.dt_s).round() as usize;
     s.steps = steps;
-    s.sources = built.sources.len();
-    s.sinks = built.sinks.len();
-    s.junctions = built.junctions;
-    s.short_links = built.short_links;
+    (s.sources, s.sinks, s.junctions, s.short_links) = traffic.shape();
     let mut classes: std::collections::BTreeMap<String, ClassStats> = std::collections::BTreeMap::new();
     let class_of: Vec<String> = g.edges.iter().map(|e| e.class.clone()).collect();
     let (mut steady_in, mut steady_out) = (0.0, 0.0);
     for step in 0..steps {
-        let flows = built.network.step();
-        let entered: f64 = built.sources.iter().map(|&(_, l)| flows[l].entered).sum();
-        let exited: f64 = built.sinks.iter().map(|&(_, l)| flows[l].exited).sum();
-        s.entered += entered;
-        s.exited += exited;
+        let (entered, exited) = traffic.step();
         if step >= steps / 2 {
             steady_in += entered;
             steady_out += exited;
         }
-        for (k, l) in built.network.links().iter().enumerate() {
+        for (k, l) in traffic.network().links().iter().enumerate() {
             let jam = l.diagram().jam_density_per_lane;
             let (mut on, mut moved) = (0.0, 0.0);
             for c in 0..l.cell_count() {
@@ -786,11 +864,13 @@ pub fn simulate(g: &Graph, o: &SimOptions) -> Result<SimSummary, CompileError> {
             }
         }
     }
-    s.on_network = built.network.total_vehicles();
+    let t = traffic.totals();
+    (s.entered, s.exited) = (t.entered, t.exited);
+    s.on_network = t.on_network;
     s.conservation_error = s.entered - s.exited - s.on_network;
     s.exit_ratio = if steady_in > 0.0 { steady_out / steady_in } else { 1.0 };
     let (mut weighted, mut free, mut vehicles) = (0.0, 0.0, 0.0);
-    for l in built.network.links() {
+    for l in traffic.network().links() {
         let jam = l.diagram().jam_density_per_lane;
         if (0..l.cell_count()).any(|c| l.density(c) >= 0.9 * jam) {
             s.jammed_links += 1;

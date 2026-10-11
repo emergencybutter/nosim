@@ -1776,6 +1776,555 @@ pub unsafe extern "C" fn nosim_flight_propagate(
     NosimStatus::Ok
 }
 
+// ---- Spline and graph tables, traffic, tiles (client hand-off) ---------------------------
+
+/// A spline table (`content.spline_networks`, or the output of `world-compiler osm`).
+pub struct NosimSplineTable {
+    rows: Vec<nosim_compiler::osm::SplineRow>,
+}
+
+/// One spline's attributes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimSpline {
+    /// OSM way id.
+    pub osm_id: i64,
+    /// Piece of the way.
+    pub part: i32,
+    /// True for an aeroway, false for a road.
+    pub aeroway: bool,
+    /// Target speed, m/s.
+    pub speed_mps: f64,
+    /// Lanes (0 when untagged).
+    pub lanes: i32,
+    /// 1 along the points, −1 against, 0 both ways.
+    pub oneway: i32,
+    /// Width, metres (0 when untagged).
+    pub width_m: f64,
+    /// On a bridge.
+    pub bridge: bool,
+    /// In a tunnel.
+    pub tunnel: bool,
+    /// OSM layer.
+    pub layer: i32,
+    /// Length, metres.
+    pub length_m: f64,
+    /// Number of points.
+    pub point_count: usize,
+}
+
+/// Loads a spline table (GeoParquet). NULL on failure (see `nosim_last_error`).
+///
+/// # Safety
+/// `path` must be NULL or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_spline_table_load(path: *const c_char) -> *mut NosimSplineTable {
+    // SAFETY: documented contract.
+    let Ok(path) = (unsafe { read_cstr(path) }) else { return ptr::null_mut() };
+    match nosim_compiler::osm::read_splines(std::path::Path::new(path)) {
+        Ok(rows) => Box::into_raw(Box::new(NosimSplineTable { rows })),
+        Err(e) => {
+            fail(NosimStatus::Io, e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Releases a spline table. NULL is ignored.
+///
+/// # Safety
+/// `t` must be NULL or a live handle, freed once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_spline_table_free(t: *mut NosimSplineTable) {
+    if !t.is_null() {
+        // SAFETY: handle came from Box::into_raw.
+        drop(unsafe { Box::from_raw(t) });
+    }
+}
+
+/// Number of splines (0 for NULL).
+///
+/// # Safety
+/// `t` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_spline_table_count(t: *const NosimSplineTable) -> usize {
+    // SAFETY: documented contract.
+    unsafe { opt_ref(t) }.map_or(0, |t| t.rows.len())
+}
+
+/// Attributes of spline `i`.
+///
+/// # Safety
+/// `t` must be NULL or live; `out` must be NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_spline_table_get(
+    t: *const NosimSplineTable,
+    i: usize,
+    out: *mut NosimSpline,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let (Some(t), Some(out)) = (unsafe { opt_ref(t) }, unsafe { opt_mut(out) }) else {
+        return fail(NosimStatus::NullPointer, "table or out is NULL");
+    };
+    let Some(r) = t.rows.get(i) else { return fail(NosimStatus::InvalidArgument, "spline index out of range") };
+    *out = NosimSpline {
+        osm_id: r.osm_id,
+        part: r.part,
+        aeroway: r.network == nosim_compiler::osm::Network::Aeroway,
+        speed_mps: r.speed_mps,
+        lanes: r.lanes.unwrap_or(0),
+        oneway: r.oneway,
+        width_m: r.width_m.unwrap_or(0.0),
+        bridge: r.bridge,
+        tunnel: r.tunnel,
+        layer: r.layer,
+        length_m: r.length_m,
+        point_count: r.points.len(),
+    };
+    NosimStatus::Ok
+}
+
+/// Class (`highway` / `aeroway` value) of spline `i`; returns the size needed including the
+/// NUL, 0 for a bad handle or index.
+///
+/// # Safety
+/// `t` must be NULL or live; `buf` must be NULL or point to `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_spline_table_class(
+    t: *const NosimSplineTable,
+    i: usize,
+    buf: *mut c_char,
+    cap: usize,
+) -> usize {
+    // SAFETY: documented contract.
+    match unsafe { opt_ref(t) }.and_then(|t| t.rows.get(i)) {
+        // SAFETY: documented contract.
+        Some(r) => unsafe { write_cstr(buf, cap, &r.class) },
+        None => 0,
+    }
+}
+
+/// Points of spline `i` as `lon, lat` pairs (degrees) into `lonlat` (room for `capacity`
+/// points). Returns the point count; at most `capacity` are written.
+///
+/// # Safety
+/// `t` must be NULL or live; `lonlat` must point to `2 · capacity` doubles.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_spline_table_points(
+    t: *const NosimSplineTable,
+    i: usize,
+    lonlat: *mut f64,
+    capacity: usize,
+) -> usize {
+    // SAFETY: documented contract.
+    let Some(r) = (unsafe { opt_ref(t) }).and_then(|t| t.rows.get(i)) else { return 0 };
+    if !lonlat.is_null() {
+        for (k, &(lon, lat)) in r.points.iter().take(capacity).enumerate() {
+            // SAFETY: k < capacity and the caller provides 2 · capacity doubles.
+            unsafe {
+                *lonlat.add(2 * k) = lon;
+                *lonlat.add(2 * k + 1) = lat;
+            }
+        }
+    }
+    r.points.len()
+}
+
+/// Which network a graph carries.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NosimGraphMode {
+    /// Roads open to cars.
+    Drive = 0,
+    /// Taxiways and runways.
+    Taxi = 1,
+    /// Footways, paths and street sidewalks, two-way.
+    Walk = 2,
+}
+
+/// A directed road graph.
+pub struct NosimGraph {
+    inner: nosim_compiler::graph::Graph,
+}
+
+/// A graph vertex.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimGraphNode {
+    /// OSM node id (0 when unknown).
+    pub osm_id: i64,
+    /// Longitude, degrees.
+    pub lon: f64,
+    /// Latitude, degrees.
+    pub lat: f64,
+    /// Edges entering.
+    pub in_degree: u32,
+    /// Edges leaving.
+    pub out_degree: u32,
+    /// Strongly connected component, 0 the largest.
+    pub component: u32,
+}
+
+/// A directed edge; CTM link `k` of a traffic run is edge `k`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimGraphEdge {
+    /// Upstream node.
+    pub from: u32,
+    /// Downstream node.
+    pub to: u32,
+    /// OSM way.
+    pub osm_id: i64,
+    /// Target speed, m/s.
+    pub speed_mps: f64,
+    /// Lanes in this direction.
+    pub lanes: u32,
+    /// Length, metres.
+    pub length_m: f64,
+    /// Opposite direction's edge, or −1.
+    pub reverse: i64,
+}
+
+/// Builds a graph from a spline table: splines split at shared nodes into directed edges, and
+/// with `largest_component` only the largest strongly connected component kept.
+///
+/// # Safety
+/// `t` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_graph_build(
+    t: *const NosimSplineTable,
+    mode: NosimGraphMode,
+    largest_component: bool,
+) -> *mut NosimGraph {
+    // SAFETY: documented contract.
+    let Some(t) = (unsafe { opt_ref(t) }) else {
+        fail(NosimStatus::NullPointer, "table is NULL");
+        return ptr::null_mut();
+    };
+    let mode = match mode {
+        NosimGraphMode::Drive => nosim_compiler::graph::Mode::Drive,
+        NosimGraphMode::Taxi => nosim_compiler::graph::Mode::Taxi,
+        NosimGraphMode::Walk => nosim_compiler::graph::Mode::Walk,
+    };
+    let (inner, _) = nosim_compiler::graph::build(&t.rows, mode, largest_component);
+    Box::into_raw(Box::new(NosimGraph { inner }))
+}
+
+/// Loads a graph written by `world-compiler graph` (`edges.geoparquet` and
+/// `nodes.geoparquet` in `dir`). NULL on failure.
+///
+/// # Safety
+/// `dir` must be NULL or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_graph_load(dir: *const c_char) -> *mut NosimGraph {
+    // SAFETY: documented contract.
+    let Ok(dir) = (unsafe { read_cstr(dir) }) else { return ptr::null_mut() };
+    match nosim_compiler::graph::read(std::path::Path::new(dir)) {
+        Ok(inner) => Box::into_raw(Box::new(NosimGraph { inner })),
+        Err(e) => {
+            fail(NosimStatus::Io, e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Releases a graph. NULL is ignored.
+///
+/// # Safety
+/// `g` must be NULL or a live handle, freed once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_graph_free(g: *mut NosimGraph) {
+    if !g.is_null() {
+        // SAFETY: handle came from Box::into_raw.
+        drop(unsafe { Box::from_raw(g) });
+    }
+}
+
+/// Node count (0 for NULL).
+///
+/// # Safety
+/// `g` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_graph_node_count(g: *const NosimGraph) -> usize {
+    // SAFETY: documented contract.
+    unsafe { opt_ref(g) }.map_or(0, |g| g.inner.nodes.len())
+}
+
+/// Edge count (0 for NULL).
+///
+/// # Safety
+/// `g` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_graph_edge_count(g: *const NosimGraph) -> usize {
+    // SAFETY: documented contract.
+    unsafe { opt_ref(g) }.map_or(0, |g| g.inner.edges.len())
+}
+
+/// Node `i`.
+///
+/// # Safety
+/// `g` must be NULL or live; `out` must be NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_graph_node(g: *const NosimGraph, i: usize, out: *mut NosimGraphNode) -> NosimStatus {
+    // SAFETY: documented contract.
+    let (Some(g), Some(out)) = (unsafe { opt_ref(g) }, unsafe { opt_mut(out) }) else {
+        return fail(NosimStatus::NullPointer, "graph or out is NULL");
+    };
+    let Some(n) = g.inner.nodes.get(i) else { return fail(NosimStatus::InvalidArgument, "node index out of range") };
+    *out = NosimGraphNode {
+        osm_id: n.osm_id.unwrap_or(0),
+        lon: n.lon,
+        lat: n.lat,
+        in_degree: n.in_degree,
+        out_degree: n.out_degree,
+        component: n.component,
+    };
+    NosimStatus::Ok
+}
+
+/// Edge `i`.
+///
+/// # Safety
+/// `g` must be NULL or live; `out` must be NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_graph_edge(g: *const NosimGraph, i: usize, out: *mut NosimGraphEdge) -> NosimStatus {
+    // SAFETY: documented contract.
+    let (Some(g), Some(out)) = (unsafe { opt_ref(g) }, unsafe { opt_mut(out) }) else {
+        return fail(NosimStatus::NullPointer, "graph or out is NULL");
+    };
+    let Some(e) = g.inner.edges.get(i) else { return fail(NosimStatus::InvalidArgument, "edge index out of range") };
+    *out = NosimGraphEdge {
+        from: e.from,
+        to: e.to,
+        osm_id: e.osm_id,
+        speed_mps: e.speed_mps,
+        lanes: e.lanes,
+        length_m: e.length_m,
+        reverse: e.reverse.map_or(-1, i64::from),
+    };
+    NosimStatus::Ok
+}
+
+/// How a traffic run is built.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NosimTrafficOptions {
+    /// Time step, seconds.
+    pub dt_s: f64,
+    /// Demand at every source, vehicles per hour.
+    pub demand_veh_per_h: f64,
+    /// Route the demand along shortest travel-time paths (true) or split by capacity.
+    pub routed: bool,
+    /// Successive-averages iterations when routing.
+    pub assign_iterations: u32,
+}
+
+/// The options `world-compiler graph --simulate` uses: 1 s, 300 veh/h, routed, 5 iterations.
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_traffic_options_default() -> NosimTrafficOptions {
+    NosimTrafficOptions { dt_s: 1.0, demand_veh_per_h: 300.0, routed: true, assign_iterations: 5 }
+}
+
+/// Running totals of a traffic run.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimTrafficTotals {
+    /// Steps run.
+    pub steps: u64,
+    /// Vehicles that entered at sources.
+    pub entered: f64,
+    /// Vehicles that left at sinks.
+    pub exited: f64,
+    /// Vehicles on the network.
+    pub on_network: f64,
+}
+
+/// A far-field CTM run on a graph, stepped by the caller.
+pub struct NosimTraffic {
+    inner: nosim_compiler::graph::Traffic,
+}
+
+/// Builds the CTM for a graph. NULL on failure.
+///
+/// # Safety
+/// `g` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_traffic_new(g: *const NosimGraph, options: NosimTrafficOptions) -> *mut NosimTraffic {
+    // SAFETY: documented contract.
+    let Some(g) = (unsafe { opt_ref(g) }) else {
+        fail(NosimStatus::NullPointer, "graph is NULL");
+        return ptr::null_mut();
+    };
+    if !(options.dt_s > 0.0 && options.dt_s.is_finite() && options.demand_veh_per_h >= 0.0) {
+        fail(NosimStatus::InvalidArgument, "dt_s must be positive and demand non-negative");
+        return ptr::null_mut();
+    }
+    let o = nosim_compiler::graph::SimOptions {
+        dt_s: options.dt_s,
+        seconds: 0.0,
+        demand_veh_per_s: options.demand_veh_per_h / 3600.0,
+        routed: options.routed,
+        assign_iterations: options.assign_iterations as usize,
+    };
+    match nosim_compiler::graph::Traffic::new(&g.inner, &o) {
+        Ok(inner) => Box::into_raw(Box::new(NosimTraffic { inner })),
+        Err(e) => {
+            fail(NosimStatus::InvalidArgument, e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Releases a traffic run. NULL is ignored.
+///
+/// # Safety
+/// `t` must be NULL or a live handle, freed once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_traffic_free(t: *mut NosimTraffic) {
+    if !t.is_null() {
+        // SAFETY: handle came from Box::into_raw.
+        drop(unsafe { Box::from_raw(t) });
+    }
+}
+
+/// Advances `steps` steps and writes the running totals to `out` (which may be NULL).
+///
+/// # Safety
+/// `t` must be NULL or live; `out` must be NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_traffic_step(
+    t: *mut NosimTraffic,
+    steps: u32,
+    out: *mut NosimTrafficTotals,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let Some(t) = (unsafe { opt_mut(t) }) else { return fail(NosimStatus::NullPointer, "traffic is NULL") };
+    for _ in 0..steps {
+        t.inner.step();
+    }
+    // SAFETY: documented contract.
+    if let Some(out) = unsafe { opt_mut(out) } {
+        let s = t.inner.totals();
+        *out = NosimTrafficTotals {
+            steps: s.steps as u64,
+            entered: s.entered,
+            exited: s.exited,
+            on_network: s.on_network,
+        };
+    }
+    NosimStatus::Ok
+}
+
+/// Puts up to `vehicles` on graph edge `edge` at fraction `at` of its length (0 its start, 1
+/// its end), counted as entered: the far field's side of a near-field handoff. Returns how
+/// many fitted (0 for a bad handle or index).
+///
+/// # Safety
+/// `t` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_traffic_inject(t: *mut NosimTraffic, edge: usize, at: f64, vehicles: f64) -> f64 {
+    // SAFETY: documented contract.
+    unsafe { opt_mut(t) }.map_or(0.0, |t| t.inner.inject(edge, at, vehicles))
+}
+
+/// Vehicles on graph edge `edge` (negative for a bad handle or index).
+///
+/// # Safety
+/// `t` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_traffic_edge_vehicles(t: *const NosimTraffic, edge: usize) -> f64 {
+    // SAFETY: documented contract.
+    unsafe { opt_ref(t) }.and_then(|t| t.inner.edge_vehicles(edge)).unwrap_or(-1.0)
+}
+
+/// Tile layers the compiler writes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NosimTileLayer {
+    /// `terrain-rgb/z/x/y.png`, Web Mercator.
+    TerrainRgb = 0,
+    /// `normals/z/x/y.png`, Web Mercator.
+    Normals = 1,
+    /// `mesh/z/x/y.terrain`, quantized mesh on the geographic TMS grid (y from the south).
+    Mesh = 2,
+    /// `classes/z/x/y.png`, land-cover classes, Web Mercator.
+    LandcoverClasses = 3,
+    /// `masks/<name>/z/x/y.png`, land-cover density, Web Mercator.
+    LandcoverMask = 4,
+    /// `z/x/y.pbf`, vector tiles, Web Mercator.
+    Vector = 5,
+}
+
+/// A tile address.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NosimTile {
+    /// Zoom.
+    pub z: u8,
+    /// Column.
+    pub x: u32,
+    /// Row (Web Mercator: from the north; geographic TMS: from the south).
+    pub y: u32,
+}
+
+/// The tile of `layer` containing a point at zoom `z`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_tile_at(layer: NosimTileLayer, lon_deg: f64, lat_deg: f64, z: u8) -> NosimTile {
+    let z = z.min(30);
+    if layer == NosimTileLayer::Mesh {
+        let span = nosim_compiler::raster::quantized_mesh::GeoTile::span_deg(z);
+        let (nx, ny) = (2u64 << z, 1u64 << z);
+        let x = (((lon_deg + 180.0) / span).floor().max(0.0) as u64).min(nx - 1) as u32;
+        let y = (((lat_deg + 90.0) / span).floor().max(0.0) as u64).min(ny - 1) as u32;
+        NosimTile { z, x, y }
+    } else {
+        let t = nosim_compiler::tiler::TileId::containing(lon_deg, lat_deg, z);
+        NosimTile { z: t.z, x: t.x, y: t.y }
+    }
+}
+
+/// Geographic bounds of a tile of `layer`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_tile_bounds(layer: NosimTileLayer, tile: NosimTile) -> NosimBounds {
+    let (w, s, e, n) = if layer == NosimTileLayer::Mesh {
+        nosim_compiler::raster::quantized_mesh::GeoTile { z: tile.z, x: tile.x, y: tile.y }.bounds()
+    } else {
+        nosim_compiler::tiler::TileId { z: tile.z, x: tile.x, y: tile.y }.bounds()
+    };
+    NosimBounds { min_lat: s, max_lat: n, min_lon: w, max_lon: e }
+}
+
+/// Path of a tile relative to the compiler's output directory, e.g. `terrain-rgb/12/1205/1539.png`;
+/// `mask` names the mask for `LandcoverMask` and is ignored otherwise. Returns the size needed
+/// including the NUL.
+///
+/// # Safety
+/// `mask` must be NULL or a NUL-terminated string; `buf` must be NULL or point to `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_tile_path(
+    layer: NosimTileLayer,
+    mask: *const c_char,
+    tile: NosimTile,
+    buf: *mut c_char,
+    cap: usize,
+) -> usize {
+    let zxy = format!("{}/{}/{}", tile.z, tile.x, tile.y);
+    let path = match layer {
+        NosimTileLayer::TerrainRgb => format!("terrain-rgb/{zxy}.png"),
+        NosimTileLayer::Normals => format!("normals/{zxy}.png"),
+        NosimTileLayer::Mesh => format!("mesh/{zxy}.terrain"),
+        NosimTileLayer::LandcoverClasses => format!("classes/{zxy}.png"),
+        NosimTileLayer::LandcoverMask => {
+            // SAFETY: documented contract.
+            let Ok(name) = (unsafe { read_cstr(mask) }) else { return 0 };
+            format!("masks/{name}/{zxy}.png")
+        }
+        NosimTileLayer::Vector => format!("{zxy}.pbf"),
+    };
+    // SAFETY: documented contract.
+    unsafe { write_cstr(buf, cap, &path) }
+}
+
 // ---- Time scales -----------------------------------------------------------------------
 
 /// One instant on every scale the simulator needs.

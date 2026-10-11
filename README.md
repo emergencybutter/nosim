@@ -214,7 +214,7 @@ manual dispatch, with downloads cached for a week.
 | §8B/§8C Hapke BRDF, Chapman limb | Implemented as CPU reference for the shaders |
 | §8B precomputed scattering (Bruneton) | Implemented on the CPU (`nosim::atmosphere`, `world-compiler atmosphere`), with the analytical limb calibrated at the 100 km hand-over; the shaders that sample the tables are engine-side |
 | §8 LOD band policy, parent-frame selection, triangle budget model, translunar harness | Implemented; the harness's ECI is J2000 and its ECEF rotates by GMST alone (precession and nutation do not affect continuity) |
-| C ABI for the UE5 client | Implemented: every module above is reachable from C; proven by a compiled C smoke test |
+| C ABI for the UE5 client | Implemented: every core module, plus spline and graph tables, the routed CTM and tile addressing from the compiler, is reachable from C; a compiled C program reproduces the Rust traffic totals bit for bit |
 | §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler; raster processor; OSM ingestion) | Implemented for runways, packages, GeoParquet → MVT tiling with Morton ordering, geographic DEM → Terrain-RGB / normal maps / quantized mesh, and OSM PBF roads and aeroways → spline GeoParquet, matched way for way against libosmium on the New York extract; OSM buildings, water and land use from closed ways and multipolygon relations, matched area for area against libosmium; bridges; ESA WorldCover → class tiles and density masks, histogram matched against GDAL; turn restrictions, FlatGeobuf, H3, 3D Tiles, projected-CRS DEMs, BigTIFF and imagery rasters not started |
 
 What comes next, milestone by milestone, is in [docs/roadmap.md](docs/roadmap.md).
@@ -254,6 +254,32 @@ if (Target.Platform == UnrealTargetPlatform.Win64) {
 Build the library with the matching Rust target (`cargo build -p nosim-ffi --release
 --target x86_64-pc-windows-msvc`, etc.) and copy `ffi/include/nosim.h` next to it. The header
 is C11 and `extern "C"`-wrapped for C++.
+
+**Client hand-off (roadmap M8).** The ABI also reaches the compiler's tables, so a client
+needs no Parquet reader of its own:
+
+- **Packages:** `nosim_package_load`, `nosim_vfs_mount` and `nosim_vfs_resolve` mount
+  packages and find the file that supplies content at a point.
+- **Spline tables:** `nosim_spline_table_load`, `_get`, `_class` and `_points` read a spline
+  table.
+- **Graphs:** `nosim_graph_build` (drive, taxi or walk) or `nosim_graph_load` gives a graph,
+  read back with `_node` and `_edge`.
+- **Traffic:** `nosim_traffic_new` builds the far-field CTM with routed demand.
+  `nosim_traffic_step` advances it and reports totals, `nosim_traffic_inject` adds vehicles
+  at a point along an edge (the far field's side of a near-field handoff), and
+  `nosim_traffic_edge_vehicles` reads it back.
+- **Tiles:** `nosim_tile_at`, `nosim_tile_bounds` and `nosim_tile_path` locate terrain-RGB,
+  normal-map, quantized-mesh, land-cover and vector tiles in the compiler's output.
+
+The C smoke test loads the KJFK package and resolves its spline table through the VFS. It
+builds the drive graph (18 nodes, 23 edges) and seeds half a vehicle near the end of every
+edge, since nothing flows in inside the package bounds. After 60 s it prints the totals:
+11.5 entered, 1.0000000000000002 exited, 10.499999999999998 on the network. The Rust test
+runs the same sequence through `nosim_compiler::graph::Traffic`, the code `graph --simulate`
+uses, and requires the three totals to match bit for bit.
+
+Linking the compiler's tables in brings Arrow and Parquet with them: the release static
+library is about 100 MB and the shared library 11 MB.
 
 ## World compiler
 

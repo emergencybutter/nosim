@@ -84,6 +84,65 @@ int main(int argc, char **argv) {
     NosimModelPlacement model;
     CHECK(nosim_vfs_models_in(vfs, tile, &model, 1) == 1);
     CHECK(strcmp(model.id, "twa_flight_center") == 0);
+
+    /* Client hand-off: the package's spline table through the VFS, its drive graph, and the
+     * far-field CTM for 60 s. The totals are printed at full precision for the Rust side to
+     * compare with its own run. */
+    n = nosim_vfs_resolve(vfs, NOSIM_CONTENT_KIND_SPLINE_NETWORKS, 40.6458, -73.7778, path, sizeof path);
+    CHECK(n > 0 && n <= sizeof path && strstr(path, "taxiways_and_roads.geoparquet") != NULL);
+    NosimSplineTable *splines = nosim_spline_table_load(path);
+    if (!splines) fprintf(stderr, "splines: %s\n", nosim_last_error());
+    CHECK(splines != NULL);
+    size_t spline_count = nosim_spline_table_count(splines);
+    CHECK(spline_count > 10);
+    NosimSpline sp;
+    CHECK(nosim_spline_table_get(splines, 0, &sp) == NOSIM_STATUS_OK && sp.point_count >= 2 && sp.length_m > 0.0);
+    double pts[64];
+    CHECK(nosim_spline_table_points(splines, 0, pts, 32) == sp.point_count);
+    CHECK(pts[0] < -73.0 && pts[0] > -74.0 && pts[1] > 40.0 && pts[1] < 41.0);
+    char cls[64];
+    CHECK(nosim_spline_table_class(splines, 0, cls, sizeof cls) > 1);
+    CHECK(nosim_spline_table_get(splines, spline_count, &sp) == NOSIM_STATUS_INVALID_ARGUMENT);
+    NosimGraph *graph = nosim_graph_build(splines, NOSIM_GRAPH_MODE_DRIVE, false);
+    CHECK(graph != NULL && nosim_graph_edge_count(graph) > 0 && nosim_graph_node_count(graph) > 0);
+    NosimGraphEdge edge;
+    CHECK(nosim_graph_edge(graph, 0, &edge) == NOSIM_STATUS_OK && edge.length_m > 0.0);
+    CHECK(edge.from < nosim_graph_node_count(graph) && edge.to < nosim_graph_node_count(graph));
+    NosimGraphNode node;
+    CHECK(nosim_graph_node(graph, edge.from, &node) == NOSIM_STATUS_OK && node.out_degree > 0);
+    NosimTraffic *traffic = nosim_traffic_new(graph, nosim_traffic_options_default());
+    CHECK(traffic != NULL);
+    /* The package's roads have no inflow inside its bounds, so seed half a vehicle near the
+     * end of every edge. */
+    for (size_t e = 0; e < nosim_graph_edge_count(graph); e++) CHECK(nosim_traffic_inject(traffic, e, 0.95, 0.5) == 0.5);
+    NosimTrafficTotals totals;
+    for (int s = 0; s < 60; s++) CHECK(nosim_traffic_step(traffic, 1, &totals) == NOSIM_STATUS_OK);
+    CHECK(totals.steps == 60 && totals.entered == 0.5 * (double)nosim_graph_edge_count(graph));
+    CHECK(totals.exited > 0.0 && totals.on_network < totals.entered);
+    CHECK(fabs(totals.entered - totals.exited - totals.on_network) < 1e-9);
+    double on_edges = 0.0;
+    for (size_t e = 0; e < nosim_graph_edge_count(graph); e++) on_edges += nosim_traffic_edge_vehicles(traffic, e);
+    CHECK(fabs(on_edges - totals.on_network) < 1e-9);
+    printf("traffic totals: %zu %zu %llu %.17g %.17g %.17g\n", nosim_graph_node_count(graph),
+           nosim_graph_edge_count(graph), (unsigned long long)totals.steps, totals.entered, totals.exited,
+           totals.on_network);
+    nosim_traffic_free(traffic);
+    nosim_graph_free(graph);
+    nosim_spline_table_free(splines);
+
+    /* Raster tiles: the KJFK reference point's tiles and their paths. */
+    NosimTile t12 = nosim_tile_at(NOSIM_TILE_LAYER_TERRAIN_RGB, -73.7789, 40.6398, 12);
+    NosimBounds tb = nosim_tile_bounds(NOSIM_TILE_LAYER_TERRAIN_RGB, t12);
+    CHECK(tb.min_lon <= -73.7789 && tb.max_lon >= -73.7789 && tb.min_lat <= 40.6398 && tb.max_lat >= 40.6398);
+    char tpath[128];
+    CHECK(nosim_tile_path(NOSIM_TILE_LAYER_TERRAIN_RGB, NULL, t12, tpath, sizeof tpath) > 0);
+    CHECK(strcmp(tpath, "terrain-rgb/12/1208/1541.png") == 0);
+    NosimTile m12 = nosim_tile_at(NOSIM_TILE_LAYER_MESH, -73.7789, 40.6398, 12);
+    tb = nosim_tile_bounds(NOSIM_TILE_LAYER_MESH, m12);
+    CHECK(tb.min_lat <= 40.6398 && tb.max_lat >= 40.6398 && tb.max_lat - tb.min_lat < 0.05);
+    CHECK(nosim_tile_path(NOSIM_TILE_LAYER_LANDCOVER_MASK, "trees", m12, tpath, sizeof tpath) > 0);
+    CHECK(strncmp(tpath, "masks/trees/12/", 15) == 0);
+
     nosim_vfs_free(vfs);
     nosim_package_free(pkg);
 
