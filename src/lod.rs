@@ -96,6 +96,85 @@ pub const fn policy_for(band: AltitudeBand) -> BandPolicy {
     }
 }
 
+/// Resident triangles by component, from a model of what each band keeps (see
+/// [`triangle_budget`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TriangleBudget {
+    /// Terrain quadtree tiles.
+    pub terrain: u64,
+    /// Runways, roads, decals.
+    pub micro_vectors: u64,
+    /// Vehicles and crowds.
+    pub agents: u64,
+    /// Global quad-sphere or single spheroid.
+    pub globe: u64,
+    /// Atmosphere geometry: a full-screen pass for the raymarcher, a limb shell otherwise.
+    pub atmosphere: u64,
+}
+
+impl TriangleBudget {
+    /// Everything resident.
+    pub fn total(&self) -> u64 {
+        self.terrain + self.micro_vectors + self.agents + self.globe + self.atmosphere
+    }
+}
+
+/// Triangles in one terrain tile: a 128 × 128 quad grid.
+pub const TERRAIN_TILE_TRIANGLES: u64 = 2 * 128 * 128;
+/// Terrain tiles resident per quadtree ring (a ring doubles the tile size of the one inside).
+pub const TERRAIN_TILES_PER_RING: u64 = 16;
+/// Samples along a terrain tile edge at the band's DEM resolution.
+pub const TERRAIN_TILE_SAMPLES: f64 = 256.0;
+/// Shortest terrain draw distance, even from the ground.
+pub const MIN_TERRAIN_VIEW_M: f64 = 50_000.0;
+/// Runway, road and decal triangles while micro-vectors render.
+pub const MICRO_VECTOR_TRIANGLES: u64 = 750_000;
+/// Vehicle and crowd triangles while agents are simulated.
+pub const AGENT_TRIANGLES: u64 = 1_000_000;
+/// The global quad-sphere: an octahedron subdivided six times.
+pub const QUADSPHERE_TRIANGLES: u64 = 8 * 4u64.pow(6);
+/// The single spheroid: an octahedron subdivided five times.
+pub const SPHEROID_TRIANGLES: u64 = 8 * 4u64.pow(5);
+/// The analytical limb shell.
+pub const LIMB_SHELL_TRIANGLES: u64 = 8 * 4u64.pow(4);
+
+/// Distance to the horizon from `altitude_m` above a sphere of the Earth's equatorial radius.
+pub fn horizon_distance_m(altitude_m: f64) -> f64 {
+    let h = altitude_m.max(0.0);
+    (2.0 * crate::geodesy::WGS84_A * h + h * h).sqrt()
+}
+
+/// Triangle budget for a band at an altitude. The terrain quadtree keeps
+/// [`TERRAIN_TILES_PER_RING`] tiles per ring out to the horizon (or [`MIN_TERRAIN_VIEW_M`]),
+/// the innermost ring's tiles spanning [`TERRAIN_TILE_SAMPLES`] DEM samples; the other
+/// components are on or off with the band's policy. On the ground this is over 5 million
+/// triangles; past 100 km, where the quadtree, micro-vectors and agents are gone, it is a
+/// globe and a limb shell, under 100 thousand (spec §10 Phase 5).
+pub fn triangle_budget(band: AltitudeBand, altitude_m: f64) -> TriangleBudget {
+    let p = policy_for(band);
+    let terrain = if p.stream_terrain_quadtree && p.dem_resolution_m > 0.0 {
+        let tile0 = p.dem_resolution_m * TERRAIN_TILE_SAMPLES;
+        let view = horizon_distance_m(altitude_m).max(MIN_TERRAIN_VIEW_M);
+        let rings = (view / tile0).log2().ceil().max(0.0) as u64 + 1;
+        rings * TERRAIN_TILES_PER_RING * TERRAIN_TILE_TRIANGLES
+    } else {
+        0
+    };
+    TriangleBudget {
+        terrain,
+        micro_vectors: if p.render_micro_vectors { MICRO_VECTOR_TRIANGLES } else { 0 },
+        agents: if p.simulate_microscopic_agents { AGENT_TRIANGLES } else { 0 },
+        globe: if p.bind_global_quadsphere {
+            QUADSPHERE_TRIANGLES
+        } else if p.single_spheroid_mesh {
+            SPHEROID_TRIANGLES
+        } else {
+            0
+        },
+        atmosphere: if p.raymarch_atmosphere { 2 } else { LIMB_SHELL_TRIANGLES },
+    }
+}
+
 /// Which inertial frame the camera hangs under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParentFrame {
@@ -153,6 +232,24 @@ mod tests {
 
         let deep = policy_for(AltitudeBand::Translunar);
         assert!(deep.single_spheroid_mesh && !deep.bind_global_quadsphere && !deep.stream_terrain_quadtree);
+    }
+
+    #[test]
+    fn triangle_budget_collapses_past_100_km() {
+        // Spec §10 Phase 5: more than 5 million triangles on the ground, under 100 thousand
+        // past 100 km.
+        let ground = triangle_budget(band_for(2.0), 2.0);
+        assert!(ground.total() > 5_000_000, "{ground:?}");
+        for alt in [0.0, 1_000.0, 10_000.0, 19_999.0, 20_000.0, 60_000.0, 99_999.0] {
+            let b = triangle_budget(band_for(alt), alt);
+            assert!(b.total() > 1_000_000, "{alt}: {b:?}");
+        }
+        for alt in [100_000.0, 400_000.0, 999_999.0, 1_000_000.0, 384_400_000.0] {
+            let b = triangle_budget(band_for(alt), alt);
+            assert!(b.total() < 100_000, "{alt}: {b:?}");
+            assert_eq!((b.terrain, b.micro_vectors, b.agents), (0, 0, 0));
+        }
+        assert!(horizon_distance_m(100_000.0) > 1_100_000.0 && horizon_distance_m(-5.0) == 0.0);
     }
 
     #[test]

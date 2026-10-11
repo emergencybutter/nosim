@@ -333,6 +333,37 @@ fn pure_value_apis() {
     assert_eq!(nosim_band_for(50_000.0), NosimAltitudeBand::Stratosphere);
     assert!(!nosim_policy_for(NosimAltitudeBand::LowEarthOrbit).stream_terrain_quadtree);
     assert_eq!(nosim_parent_frame_for(384_400e3, 1_800e3), NosimParentFrame::Mci);
+    assert!(nosim_triangle_budget(NosimAltitudeBand::LowAltitude, 2.0) > 5_000_000);
+    assert!(nosim_triangle_budget(NosimAltitudeBand::LowEarthOrbit, 150_000.0) < 100_000);
+}
+
+#[test]
+fn translunar_flight() {
+    let mut t = NosimTranslunar::default();
+    assert_eq!(unsafe { nosim_flight_apollo11(&mut t) }, NosimStatus::Ok);
+    assert!((t.periselene_m - 1_847_400.0).abs() < 10.0, "{}", t.periselene_m);
+    assert!(t.soi_entry_s > 2.0 * 86_400.0 && t.soi_entry_s < 3.0 * 86_400.0);
+    // Propagating the injection state to periselene lands within a few metres of it, and back.
+    let mut end = [0.0; 6];
+    assert_eq!(
+        unsafe { nosim_flight_propagate(t.jd0_tdb, t.injection.as_ptr(), t.periselene_s, end.as_mut_ptr()) },
+        NosimStatus::Ok
+    );
+    let mut back = [0.0; 6];
+    let jd1 = t.jd0_tdb + t.periselene_s / 86_400.0;
+    assert_eq!(
+        unsafe { nosim_flight_propagate(jd1, end.as_ptr(), -t.periselene_s, back.as_mut_ptr()) },
+        NosimStatus::Ok
+    );
+    let d =
+        ((back[0] - t.injection[0]).powi(2) + (back[1] - t.injection[1]).powi(2) + (back[2] - t.injection[2]).powi(2))
+            .sqrt();
+    assert!(d < 100.0, "round trip {d} m");
+    assert_eq!(unsafe { nosim_flight_apollo11(ptr::null_mut()) }, NosimStatus::NullPointer);
+    assert_eq!(
+        unsafe { nosim_flight_propagate(t.jd0_tdb, ptr::null(), 1.0, end.as_mut_ptr()) },
+        NosimStatus::NullPointer
+    );
 }
 
 #[test]

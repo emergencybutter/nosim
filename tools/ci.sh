@@ -2,9 +2,9 @@
 # The gate, as one script for CI and for local runs.
 #
 #   tools/ci.sh check               format, lints, docs, tests, generated-file drift, CLI runs
-#   tools/ci.sh real-data <dir>     download GLO-30, BBBike New York and ESA WorldCover into
-#                                   <dir> (kept as a cache) and cross-check against libtiff,
-#                                   libosmium, networkx, PROJ and GDAL
+#   tools/ci.sh real-data <dir>     download GLO-30, BBBike New York, ESA WorldCover and JPL
+#                                   DE421 into <dir> (kept as a cache) and cross-check against
+#                                   libtiff, libosmium, networkx, PROJ, GDAL, SciPy and DE421
 #
 # Run from the repository root. Every step must pass; the first failure stops the script.
 set -euo pipefail
@@ -85,6 +85,9 @@ check() {
     "$wc" landcover --input fixtures/landcover/kjfk_classes.tif --output "$tmp/landcover" --packages fixtures/packages \
         --min-zoom 12 --max-zoom 14
 
+    say "translunar harness: Apollo 11-like flight and camera ride"
+    cargo run --release --locked --example translunar -- --csv "$tmp/translunar.csv"
+
     say "check passed"
 }
 
@@ -105,6 +108,10 @@ real_data() {
         "https://download.bbbike.org/osm/bbbike/NewYork/NewYork.osm.pbf" \
         "https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf"
 
+    local de421="$dir/de421.bsp"
+    [ -s "$de421" ] || fetch "$de421" \
+        "https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/planets/a_old_versions/de421.bsp" \
+        "https://ssd.jpl.nasa.gov/ftp/eph/planets/bsp/de421.bsp"
     [ -s "$worldcover" ] || fetch "$worldcover" \
         "https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/$wc_tile.tif"
 
@@ -159,12 +166,16 @@ real_data() {
         --min-zoom 10 --max-zoom 16
     python3 tools/check_landcover.py "$worldcover" "$dir/landcover" --bbox="$bbox"
 
+    say "translunar flight vs SciPy's DOP853 and JPL DE421"
+    cargo run --release --locked --example translunar -- --csv "$dir/translunar.csv"
+    python3 tools/check_translunar.py "$dir/translunar.csv" "$de421"
+
     say "terrain patching on GLO-30 with real roads"
     "$wc" raster --input "$dem" --output "$dir/terrain" \
         --patch-runways fixtures/packages/org.contributor.infrastructure.kjfk/data/arinc_runways.parquet \
         --patch-roads "$dir/kjfk.geoparquet" --min-zoom 12 --max-zoom 13
     rm -rf "$dir/terrain" "$dir"/graph_* "$dir/areas" "$dir/nyc.geoparquet" "$dir/bridges.geoparquet" \
-        "$dir/landcover"
+        "$dir/landcover" "$dir/translunar.csv"
 
     say "real-data checks passed"
 }

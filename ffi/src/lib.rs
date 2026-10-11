@@ -26,7 +26,7 @@ use nosim::geodesy::{self, EnuFrame, FloatingOrigin, Geodetic, Vec3};
 use nosim::scenery::vfs::Vfs;
 use nosim::scenery::{Bounds, ContentKind, Package};
 use nosim::starfield::Catalog;
-use nosim::{astro, ephem, lod, phenology, photometry, procedural, starfield, traffic};
+use nosim::{astro, ephem, flight, lod, phenology, photometry, procedural, starfield, traffic};
 
 // ---- Status and errors -----------------------------------------------------------------
 
@@ -1683,6 +1683,89 @@ pub extern "C" fn nosim_parent_frame_for(dist_to_earth_center_m: f64, dist_to_mo
         lod::ParentFrame::Eci => NosimParentFrame::Eci,
         lod::ParentFrame::Mci => NosimParentFrame::Mci,
     }
+}
+
+/// Resident triangles a band keeps at an altitude (the governor's budget model).
+#[unsafe(no_mangle)]
+pub extern "C" fn nosim_triangle_budget(band: NosimAltitudeBand, altitude_m: f64) -> u64 {
+    let b = match band {
+        NosimAltitudeBand::LowAltitude => lod::AltitudeBand::LowAltitude,
+        NosimAltitudeBand::Stratosphere => lod::AltitudeBand::Stratosphere,
+        NosimAltitudeBand::LowEarthOrbit => lod::AltitudeBand::LowEarthOrbit,
+        NosimAltitudeBand::Translunar => lod::AltitudeBand::Translunar,
+    };
+    lod::triangle_budget(b, altitude_m).total()
+}
+
+// ---- Translunar flight -----------------------------------------------------------------
+
+/// A targeted translunar flight.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimTranslunar {
+    /// TDB Julian Date of injection.
+    pub jd0_tdb: f64,
+    /// Injection state, geocentric J2000: x, y, z (m), vx, vy, vz (m/s).
+    pub injection: [f64; 6],
+    /// Seconds from injection to the Moon's sphere of influence.
+    pub soi_entry_s: f64,
+    /// Seconds from injection to periselene.
+    pub periselene_s: f64,
+    /// Periselene distance from the Moon's centre, m.
+    pub periselene_m: f64,
+}
+
+/// Targets the Apollo 11-like translunar injection (1969-07-16, 334 km, 10.83 km/s, 110 km
+/// periselene) and writes what it found to `out`.
+///
+/// # Safety
+/// `out` must be NULL or point to writable memory for one `NosimTranslunar`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_flight_apollo11(out: *mut NosimTranslunar) -> NosimStatus {
+    if out.is_null() {
+        return fail(NosimStatus::NullPointer, "out is NULL");
+    }
+    let t = flight::apollo11_like();
+    let r = NosimTranslunar {
+        jd0_tdb: t.jd0_tdb,
+        injection: t.injection,
+        soi_entry_s: t.soi_entry_s,
+        periselene_s: t.periselene_s,
+        periselene_m: t.periselene_m,
+    };
+    // SAFETY: checked non-null; the caller provides writable storage.
+    unsafe { *out = r };
+    NosimStatus::Ok
+}
+
+/// Propagates a geocentric J2000 state (m, m/s) under the Earth and the Moon for `dt_s`
+/// seconds from `jd0_tdb` (negative runs backwards), writing the final state to `out`.
+///
+/// # Safety
+/// `state` must point to six readable doubles and `out` to six writable doubles (they may be
+/// the same), or be NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_flight_propagate(
+    jd0_tdb: f64,
+    state: *const f64,
+    dt_s: f64,
+    out: *mut f64,
+) -> NosimStatus {
+    if state.is_null() || out.is_null() {
+        return fail(NosimStatus::NullPointer, "state or out is NULL");
+    }
+    if !(jd0_tdb.is_finite() && dt_s.is_finite()) {
+        return fail(NosimStatus::InvalidArgument, "jd0_tdb and dt_s must be finite");
+    }
+    let mut y = [0.0; 6];
+    // SAFETY: checked non-null; the caller provides six doubles.
+    unsafe { ptr::copy_nonoverlapping(state, y.as_mut_ptr(), 6) };
+    let model = flight::EarthMoon::new(jd0_tdb, 0.0, dt_s);
+    let nodes = flight::dopri5(|t, s| model.derivative(t, s), 0.0, y, dt_s, flight::Tolerance::default(), |_| false);
+    let end = nodes.last().expect("at least the start").y;
+    // SAFETY: checked non-null; the caller provides six writable doubles.
+    unsafe { ptr::copy_nonoverlapping(end.as_ptr(), out, 6) };
+    NosimStatus::Ok
 }
 
 // ---- Time scales -----------------------------------------------------------------------

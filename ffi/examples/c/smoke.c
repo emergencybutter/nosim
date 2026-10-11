@@ -147,6 +147,15 @@ int main(int argc, char **argv) {
     NosimIdmParams idm = nosim_idm_params_default(30.0);
     CHECK(nosim_idm_free_acceleration(idm, 30.0) == 0.0);
     CHECK(nosim_band_for(150000.0) == NOSIM_ALTITUDE_BAND_LOW_EARTH_ORBIT);
+    CHECK(nosim_triangle_budget(NOSIM_ALTITUDE_BAND_TRANSLUNAR, 1e7) < 100000);
+
+    /* Translunar flight: target the Apollo 11-like injection and propagate it a day. */
+    NosimTranslunar tl;
+    CHECK(nosim_flight_apollo11(&tl) == NOSIM_STATUS_OK);
+    CHECK(tl.soi_entry_s > 2.0 * 86400.0 && tl.soi_entry_s < 3.0 * 86400.0);
+    double day[6];
+    CHECK(nosim_flight_propagate(tl.jd0_tdb, tl.injection, 86400.0, day) == NOSIM_STATUS_OK);
+    CHECK(sqrt(day[0] * day[0] + day[1] * day[1] + day[2] * day[2]) > 1.5e8);
     CHECK(nosim_threshold_bar_count(150.0) == 12);
     CHECK(nosim_package_load(NULL) == NULL);
     CHECK(nosim_last_error() != NULL);

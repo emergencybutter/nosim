@@ -24,7 +24,7 @@ Against the spec's verification blueprint (§10):
 | 2 Aeronautical & spline layer | ARINC 424 parse, extrusion, grade fit, RW31L ± 1 ft, OSM splines, road graph, heightfield patching (M1) | Complete on the compiler side |
 | 3 Procedural gaps & synthesis | Seed hash, Poisson levels, pier spacing, flatten falloff, OSM polygons and building heights, bridge detection and piers (M4), WorldCover masks and Poisson-disk scattering (M5) | Complete on the compiler side |
 | 4 Environment & traffic | Calendar, phenology, IDM / MOBIL, CTM with general junctions, ORCA, routed demand, near-field vehicles (M2), pedestrian navigation graph (M3) | Buildings as ORCA obstacles, intersection control |
-| 5 Astronomy & translunar flight | VSOP87 / ELP 2000-82, BSC5, Hapke, LOD band policy | Translunar trajectory harness, atmosphere lookup tables |
+| 5 Astronomy & translunar flight | VSOP87 / ELP 2000-82, BSC5, Hapke, LOD band policy, triangle budget, translunar harness (M6) | Atmosphere lookup tables |
 
 ## Working rules
 
@@ -199,7 +199,21 @@ and is not part of the tiles.
 **Acceptance:** the class histogram over the KJFK tile matches GDAL's on the same window, and
 every output pixel holds a valid class.
 
-## M6 — Translunar flight harness (Phase 5.3)
+## M6 — Translunar flight harness (Phase 5.3) — done
+
+Done as `nosim::flight`, `lod::triangle_budget` and `examples/translunar.rs`, also reachable
+from C; see the README. Against the acceptance:
+
+- Two-body energy drift is below 1e-10 over ten orbits.
+- The Apollo 11-like flight enters the lunar sphere of influence after 2.35 days (Apollo 11:
+  2.45).
+- The camera moves at most 0.554 mm across 2 frame switches and 42,274 rebases at up to
+  10.8 km/s.
+- The triangle budget falls from 6.5 million on the runway to 34,816 past 100 km.
+
+Independently, SciPy's DOP853 stays within 1.3 m of the propagator. With JPL DE421 in place
+of ELP, the flight enters the sphere of influence within 0.1 s and passes the Moon within
+0.1 km.
 
 This proves the coordinate and LOD story end to end without the engine.
 

@@ -335,6 +335,8 @@ Scaling smoothly from runway pavement to translunar orbit requires an analytical
                          atmosphere      └── 500m textures       impostor switching
 ```
 
+> **Implementation note (translunar harness).** `nosim::flight` integrates the Earth and the Moon as point masses (Dormand–Prince 5(4), ELP 2000-82B lunar positions), targets an Apollo 11-like injection, and rides a camera through ECEF, ECI and MCI with 10 km rebases. Across every switch and rebase the camera's `f32` render position moves less than 1 mm. `lod::triangle_budget` models the resident triangles per band: over 5 million on the ground, under 100 thousand past 100 km.
+
 ### A. Ephemeris & Starfield Ingestion
 
 - **Ephemeris Engine:** Ingests the truncated VSOP87 (Sun-Earth) and ELP 2000-82 (Moon) analytical series. Computes Sun and Moon topocentric vectors on worker threads to sub-arcsecond accuracy for any Julian Date, naturally handling real-world lunar phases, solar eclipses, and libration.

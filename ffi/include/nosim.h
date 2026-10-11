@@ -661,6 +661,32 @@ typedef struct NosimBandPolicy {
 } NosimBandPolicy;
 
 /**
+ * A targeted translunar flight.
+ */
+typedef struct NosimTranslunar {
+  /**
+   * TDB Julian Date of injection.
+   */
+  double jd0_tdb;
+  /**
+   * Injection state, geocentric J2000: x, y, z (m), vx, vy, vz (m/s).
+   */
+  double injection[6];
+  /**
+   * Seconds from injection to the Moon's sphere of influence.
+   */
+  double soi_entry_s;
+  /**
+   * Seconds from injection to periselene.
+   */
+  double periselene_s;
+  /**
+   * Periselene distance from the Moon's centre, m.
+   */
+  double periselene_m;
+} NosimTranslunar;
+
+/**
  * One instant on every scale the simulator needs.
  */
 typedef struct NosimEpoch {
@@ -1427,6 +1453,33 @@ struct NosimBandPolicy nosim_policy_for(enum NosimAltitudeBand band);
  */
 enum NosimParentFrame nosim_parent_frame_for(double dist_to_earth_center_m,
                                              double dist_to_moon_center_m);
+
+/**
+ * Resident triangles a band keeps at an altitude (the governor's budget model).
+ */
+uint64_t nosim_triangle_budget(enum NosimAltitudeBand band, double altitude_m);
+
+/**
+ * Targets the Apollo 11-like translunar injection (1969-07-16, 334 km, 10.83 km/s, 110 km
+ * periselene) and writes what it found to `out`.
+ *
+ * # Safety
+ * `out` must be NULL or point to writable memory for one `NosimTranslunar`.
+ */
+enum NosimStatus nosim_flight_apollo11(struct NosimTranslunar *out);
+
+/**
+ * Propagates a geocentric J2000 state (m, m/s) under the Earth and the Moon for `dt_s`
+ * seconds from `jd0_tdb` (negative runs backwards), writing the final state to `out`.
+ *
+ * # Safety
+ * `state` must point to six readable doubles and `out` to six writable doubles (they may be
+ * the same), or be NULL.
+ */
+enum NosimStatus nosim_flight_propagate(double jd0_tdb,
+                                        const double *state,
+                                        double dt_s,
+                                        double *out);
 
 /**
  * ΔT = TT − UT1, seconds, at a UTC instant. `dut1_seconds` is UT1 − UTC from IERS
