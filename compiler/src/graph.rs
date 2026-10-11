@@ -795,6 +795,128 @@ pub fn simulate(g: &Graph, o: &SimOptions) -> Result<SimSummary, CompileError> {
     Ok(s)
 }
 
+/// The near field: a circle around a point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NearField {
+    /// Centre longitude, degrees.
+    pub lon: f64,
+    /// Centre latitude, degrees.
+    pub lat: f64,
+    /// Radius, metres (the spec's near-field radius is 1.5 km).
+    pub radius_m: f64,
+}
+
+/// Result of [`simulate_hybrid`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HybridSummary {
+    /// Steps run.
+    pub steps: usize,
+    /// Graph nodes inside the near field.
+    pub near_nodes: usize,
+    /// Edges simulated vehicle by vehicle.
+    pub near_edges: usize,
+    /// Vehicles that entered at any source.
+    pub entered: f64,
+    /// Vehicles that left at any sink.
+    pub exited: f64,
+    /// Largest |conservation error| seen at any step.
+    pub worst_conservation_error: f64,
+    /// Exit ratio over the second half of the run.
+    pub exit_ratio: f64,
+    /// Near-field vehicles at the end.
+    pub near_vehicles: usize,
+    /// Most near-field vehicles at once.
+    pub peak_near_vehicles: usize,
+    /// Distinct vehicles that drove in the near field.
+    pub near_vehicles_seen: usize,
+    /// Smallest bumper-to-bumper gap seen, metres.
+    pub min_gap_m: f64,
+    /// Positions clamped to avoid an overlap.
+    pub clamps: u64,
+    /// Arrivals held at the end of their edge because a merge had no room.
+    pub holds: u64,
+    /// Mean wall time per step, milliseconds.
+    pub mean_step_ms: f64,
+}
+
+/// Runs the hybrid simulation: individual vehicles inside `near`, the CTM outside, with the
+/// same routed turning in both (see [`assign`]) and the same demand at every source.
+pub fn simulate_hybrid(
+    g: &Graph,
+    o: &SimOptions,
+    near: NearField,
+    substeps: u32,
+) -> Result<HybridSummary, CompileError> {
+    use nosim::geodesy::{EnuFrame, Geodetic, geodetic_to_ecef};
+    use nosim::traffic::hybrid::{Hybrid, HybridConfig};
+    let frame = EnuFrame::at(Geodetic::new(near.lat, near.lon, 0.0));
+    let near_node: Vec<bool> = g
+        .nodes
+        .iter()
+        .map(|n| {
+            let p = frame.to_enu(geodetic_to_ecef(Geodetic::new(n.lat, n.lon, 0.0)));
+            p.x.hypot(p.y) <= near.radius_m
+        })
+        .collect();
+    let a = assign(g, o.demand_veh_per_s, o.assign_iterations);
+    let reach = reaches_sink(g);
+    let mut routed_inputs = vec![false; g.edges.len()];
+    for &(i, _) in a.movement.keys() {
+        routed_inputs[i as usize] = true;
+    }
+    let weight = |i: usize, out: usize| -> f64 {
+        if routed_inputs[i] {
+            return a.movement.get(&(i as u32, out as u32)).copied().unwrap_or(0.0);
+        }
+        if !reach[out] || g.edges[i].reverse == Some(out as u32) {
+            return 0.0;
+        }
+        capacity_veh_per_s(&g.edges[out])
+    };
+    let cfg = HybridConfig { dt_s: o.dt_s, substeps, ..HybridConfig::default() };
+    let mut h = Hybrid::new(g.nodes.len(), &ctm_edges(g), &near_node, &weight, cfg)
+        .map_err(|e| CompileError::Graph(format!("hybrid: {e:?}")))?;
+    for &(node, rate) in &a.source_rate {
+        h.set_source_rate(node, rate);
+    }
+    let steps = (o.seconds / o.dt_s).round() as usize;
+    let mut s = HybridSummary {
+        steps,
+        near_nodes: near_node.iter().filter(|&&n| n).count(),
+        near_edges: (0..g.edges.len()).filter(|&k| h.is_near_edge(k)).count(),
+        min_gap_m: f64::INFINITY,
+        ..Default::default()
+    };
+    let mut seen = std::collections::HashSet::new();
+    let (mut half_in, mut half_out) = (0.0, 0.0);
+    let start = std::time::Instant::now();
+    for step in 0..steps {
+        if step == steps / 2 {
+            let t = h.totals();
+            (half_in, half_out) = (t.entered, t.exited);
+        }
+        h.step();
+        let t = h.totals();
+        s.worst_conservation_error = s.worst_conservation_error.max(t.conservation_error().abs());
+        s.peak_near_vehicles = s.peak_near_vehicles.max(h.near_count());
+        s.min_gap_m = s.min_gap_m.min(h.min_gap());
+        for (_, _, v) in h.vehicles() {
+            seen.insert(v.id);
+        }
+    }
+    s.mean_step_ms = start.elapsed().as_secs_f64() * 1e3 / steps.max(1) as f64;
+    let t = h.totals();
+    s.entered = t.entered;
+    s.exited = t.exited;
+    let (din, dout) = (t.entered - half_in, t.exited - half_out);
+    s.exit_ratio = if din > 0.0 { dout / din } else { 1.0 };
+    s.near_vehicles = h.near_count();
+    s.near_vehicles_seen = seen.len();
+    s.clamps = h.clamps;
+    s.holds = h.holds;
+    Ok(s)
+}
+
 const EDGE_GEO: &str = r#"{"version":"1.0.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":["LineString"],"crs":null,"edges":"planar"}}}"#;
 const NODE_GEO: &str = r#"{"version":"1.0.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB","geometry_types":["Point"],"crs":null,"edges":"planar"}}}"#;
 

@@ -219,6 +219,10 @@ pub struct GraphArgs {
     pub assign_iterations: usize,
     /// Fail when the steady-state exit ratio of the simulation falls below this.
     pub min_exit_ratio: Option<f64>,
+    /// Simulate individual vehicles inside this circle, the CTM outside it.
+    pub near_field: Option<graph::NearField>,
+    /// Near-field substeps per CTM step.
+    pub near_substeps: u32,
 }
 
 /// `osm` subcommand options.
@@ -282,7 +286,7 @@ pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runwa
                          world-compiler tiles --input <features.parquet> --output <dir> [--layer <name>] [--min-zoom <z>] [--max-zoom <z>] [--extent <n>] [--buffer <n>] [--tolerance <x>]\n\
                          world-compiler raster --input <dem.tif> --output <dir> [--patch-runways <runways.parquet>] [--patch-roads <splines.geoparquet>] [--package <dir>] [--patched-dem <out.tif>] [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]\n\
                          world-compiler osm --input <extract.osm.pbf> --output <splines.geoparquet> [--bbox <west,south,east,north>] [--threads <n>]\n\
-                         world-compiler graph --input <splines.geoparquet> --output <dir> [--mode drive|taxi] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>] [--capacity-split] [--assign-iterations <n>] [--min-exit-ratio <r>]]";
+                         world-compiler graph --input <splines.geoparquet> --output <dir> [--mode drive|taxi] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>] [--capacity-split] [--assign-iterations <n>] [--min-exit-ratio <r>] [--near-field <lon,lat,radius_m> [--near-substeps <n>]]]";
 
 /// Parses the command line (everything after the program name).
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, CompileError> {
@@ -548,6 +552,8 @@ fn parse_graph<I: Iterator<Item = String>>(mut it: I) -> Result<GraphArgs, Compi
         routed: true,
         assign_iterations: 5,
         min_exit_ratio: None,
+        near_field: None,
+        near_substeps: 5,
     };
     let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
     let positive = |v: f64| v.is_finite() && v > 0.0;
@@ -569,6 +575,25 @@ fn parse_graph<I: Iterator<Item = String>>(mut it: I) -> Result<GraphArgs, Compi
             "--simulate" => args.simulate_s = Some(num()?),
             "--demand" => args.demand_veh_per_h = num()?,
             "--dt" => args.dt_s = num()?,
+            "--near-field" => {
+                let v: Vec<f64> = value
+                    .split(',')
+                    .map(|x| x.trim().parse::<f64>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| bad(&flag, &value))?;
+                args.near_field = match v[..] {
+                    [lon, lat, r]
+                        if (-180.0..=180.0).contains(&lon) && (-90.0..=90.0).contains(&lat) && positive(r) =>
+                    {
+                        Some(graph::NearField { lon, lat, radius_m: r })
+                    }
+                    _ => return Err(bad(&flag, &value)),
+                };
+            }
+            "--near-substeps" => {
+                args.near_substeps =
+                    value.parse().ok().filter(|&n: &u32| (1..=100).contains(&n)).ok_or_else(|| bad(&flag, &value))?
+            }
             "--min-exit-ratio" => {
                 args.min_exit_ratio = Some(
                     value.parse().ok().filter(|r: &f64| (0.0..=1.0).contains(r)).ok_or_else(|| bad(&flag, &value))?,
@@ -589,22 +614,27 @@ fn parse_graph<I: Iterator<Item = String>>(mut it: I) -> Result<GraphArgs, Compi
 /// Runs `graph`: builds and writes the graph, then optionally runs the CTM on it.
 pub fn run_graph(
     args: &GraphArgs,
-) -> Result<(graph::Graph, graph::GraphSummary, Option<graph::SimSummary>), CompileError> {
+) -> Result<(graph::Graph, graph::GraphSummary, Option<graph::SimSummary>, Option<graph::HybridSummary>), CompileError>
+{
     let rows = osm::read_splines(&args.input)?;
     let (g, summary) = graph::build(&rows, args.mode, args.largest_component);
     graph::write(&args.output, &g)?;
-    let sim = match args.simulate_s {
-        Some(seconds) => Some(graph::simulate(
-            &g,
-            &graph::SimOptions {
-                dt_s: args.dt_s,
-                seconds,
-                demand_veh_per_s: args.demand_veh_per_h / 3600.0,
-                routed: args.routed,
-                assign_iterations: args.assign_iterations,
-            },
-        )?),
-        None => None,
+    let Some(seconds) = args.simulate_s else { return Ok((g, summary, None, None)) };
+    let opts = graph::SimOptions {
+        dt_s: args.dt_s,
+        seconds,
+        demand_veh_per_s: args.demand_veh_per_h / 3600.0,
+        routed: args.routed,
+        assign_iterations: args.assign_iterations,
     };
-    Ok((g, summary, sim))
+    match args.near_field {
+        Some(near) => {
+            let h = graph::simulate_hybrid(&g, &opts, near, args.near_substeps)?;
+            Ok((g, summary, None, Some(h)))
+        }
+        None => {
+            let sim = graph::simulate(&g, &opts)?;
+            Ok((g, summary, Some(sim), None))
+        }
+    }
 }

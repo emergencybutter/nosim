@@ -81,11 +81,17 @@ terrain came straight from the DEM.
 
 **Data:** the runway fixture, then GLO-30.
 
-## M2 — Traffic that goes somewhere (Phase 4.2) — routing done, near field in progress
+## M2 — Traffic that goes somewhere (Phase 4.2) — done
 
-Routing (demand, shortest paths, successive averages, routed turning) is done: on the real
-KJFK graph the exit ratio rose from 83.8% to 99.9% with no jammed links. The near-field
-vehicles and their handoff are next.
+Done: routed demand and turning (`graph --simulate`), and near-field vehicles coupled to the
+CTM (`--near-field`, `nosim::traffic::hybrid`); see the README. On the real KJFK graph:
+
+- The exit ratio rose from 83.8% to 99.9%, with no jammed links.
+- The hybrid conserves vehicles to 2e-12 over 30 minutes.
+- A 2,000-vehicle near-field step takes 0.81 ms.
+- A whole-state far-field step takes about 0.46 s.
+
+Demand is synthetic. Per-vehicle destinations and intersection control remain open.
 
 The road graph currently splits traffic over exits by capacity alone. On real KJFK roads
 that sends vehicles into pockets with no exit, and they jam. The CTM needs routes, and the

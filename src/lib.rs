@@ -17,7 +17,7 @@
 //! | [`arinc424`] | §4 runway record decoding and pavement extrusion |
 //! | [`procedural`] | §5 deterministic gap filling |
 //! | [`phenology`] | §6 four-season phase and snow mask |
-//! | [`traffic`] | §7 IDM, MOBIL, VAT addressing |
+//! | [`traffic`] | §7 IDM, MOBIL, VAT addressing, CTM far field, hybrid near field, ORCA crowds |
 //! | [`photometry`] | §8B analytical limb, §8C Hapke regolith |
 //! | [`lod`] | §2 parent frame selection, §8 altitude-band governor |
 

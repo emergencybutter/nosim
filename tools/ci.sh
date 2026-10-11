@@ -114,6 +114,10 @@ real_data() {
     "$wc" graph --input "$dir/kjfk.geoparquet" --output "$dir/graph_sim" --mode drive --simulate 1800 --demand 300 \
         --min-exit-ratio 0.95
 
+    say "hybrid traffic on real KJFK: vehicles within 1.5 km of Terminal 4, the CTM beyond"
+    "$wc" graph --input "$dir/kjfk.geoparquet" --output "$dir/graph_hybrid" --mode drive --simulate 1800 --demand 300 \
+        --near-field -73.7781,40.6413,1500 --min-exit-ratio 0.95
+
     say "terrain patching on GLO-30 with real roads"
     "$wc" raster --input "$dem" --output "$dir/terrain" \
         --patch-runways fixtures/packages/org.contributor.infrastructure.kjfk/data/arinc_runways.parquet \

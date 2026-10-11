@@ -3,6 +3,7 @@
 //! avoidance in [`orca`].
 
 pub mod ctm;
+pub mod hybrid;
 pub mod orca;
 
 /// Inside this radius agents are simulated individually.

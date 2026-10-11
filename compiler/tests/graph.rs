@@ -153,6 +153,26 @@ fn routed_demand_leaves_and_nothing_jams() {
 }
 
 #[test]
+fn hybrid_near_field_on_the_fixture() {
+    // The fixture's only drive source is the detached Van Wyck stretch north of the airport; a
+    // near field around it turns that edge into individual vehicles spawned at a near source.
+    let (g, _) = graph::build(&splines(), Mode::Drive, false);
+    let near = graph::NearField { lon: -73.7945, lat: 40.715, radius_m: 800.0 };
+    let opts = graph::SimOptions { seconds: 1800.0, demand_veh_per_s: 600.0 / 3600.0, ..Default::default() };
+    let h = graph::simulate_hybrid(&g, &opts, near, 5).unwrap();
+    assert_eq!((h.near_nodes, h.near_edges), (2, 1));
+    assert!(h.worst_conservation_error < 1e-9, "{}", h.worst_conservation_error);
+    assert!((h.entered - 600.0 / 3600.0 * 1800.0).abs() < 1e-6, "{}", h.entered);
+    assert!(h.near_vehicles_seen > 200 && h.exit_ratio > 0.95, "{h:?}");
+    assert!(h.min_gap_m >= 0.0 && h.clamps == 0 && h.holds == 0);
+    // Far from any road: nothing near, and the run is the far field alone, still conserved.
+    let empty =
+        graph::simulate_hybrid(&g, &opts, graph::NearField { lon: -74.5, lat: 41.5, radius_m: 100.0 }, 5).unwrap();
+    assert_eq!((empty.near_nodes, empty.near_edges, empty.near_vehicles_seen), (0, 0, 0));
+    assert!(empty.worst_conservation_error < 1e-9);
+}
+
+#[test]
 fn cli() {
     let args = |s: &str| parse_args(s.split_whitespace().map(str::to_owned));
     match args(
@@ -176,6 +196,15 @@ fn cli() {
         other => panic!("{other:?}"),
     }
     assert!(args("graph --input a --output b --min-exit-ratio 1.5").is_err());
+    match args("graph --input a --output b --simulate 60 --near-field -73.78,40.64,1500 --near-substeps 4").unwrap() {
+        Command::Graph(a) => {
+            assert_eq!(a.near_field, Some(graph::NearField { lon: -73.78, lat: 40.64, radius_m: 1500.0 }));
+            assert_eq!(a.near_substeps, 4);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(args("graph --input a --output b --near-field -73.78,40.64").is_err());
+    assert!(args("graph --input a --output b --near-field -73.78,40.64,0").is_err());
     assert!(args("graph --input a --output b --assign-iterations 0").is_err());
     assert!(args("graph --input a --output b --dt 0").is_err());
     assert!(args("graph --output b").is_err());
@@ -195,8 +224,11 @@ fn cli() {
         routed: true,
         assign_iterations: 5,
         min_exit_ratio: None,
+        near_field: None,
+        near_substeps: 5,
     };
-    let (g, s, sim) = run_graph(&a).unwrap();
+    let (g, s, sim, hybrid) = run_graph(&a).unwrap();
+    assert!(hybrid.is_none());
     // The package is clipped to its bounds, so the detached Van Wyck stretch north of it is gone.
     assert_eq!((s.nodes, s.edges), (18, 23));
     assert!(sim.unwrap().conservation_error.abs() < 1e-9);

@@ -43,6 +43,8 @@ src/
   traffic/ctm.rs Far-field Cell Transmission Model: links, priority
                  merge / FIFO diverge, general junctions (Tampère node
                  model), graph-to-network builder, near-field handoff (spec §7)
+  traffic/hybrid.rs Near-field IDM / MOBIL vehicles on graph edges with zipper
+                 merging, coupled to the CTM beyond, handoff both ways (spec §7)
   traffic/orca.rs ORCA pedestrian avoidance (RVO2 port): agents,
                  polygon obstacles, 2D LP with safest-velocity fallback (spec §7B)
   photometry.rs  Hapke regolith BRDF, Chapman function, limb shell    (spec §8B, §8C)
@@ -153,6 +155,7 @@ manual dispatch, with downloads cached for a week.
 | §7 — IDM equilibrium gap `s₀ + vT`, MOBIL safety/etiquette | `traffic` |
 | §7B — ORCA: a head-on pair and six agents in opposing corridor streams pass with zero overlap; a block is never penetrated (stops at the face alone, routes around with waypoints); walls hold from both sides; a 24-agent circle crossing arrives with overlap bounded by the infeasible-crush fallback; results are deterministic and independent of insertion order | `traffic::orca` |
 | §7 — CTM: vehicles conserved and bounded, free-flow platoon moves exactly one cell per step, steady demand gives density `q / v_f` in every cell, a closed exit sends a shockwave upstream at the wave speed, merges split capacity by priority, a blocked diverge branch holds the whole node (FIFO), spawn count at the near-field boundary equals the exited flow; the general junction equals the merge with one exit and the diverge with one entrance, and on 2,000 random intersections never exceeds a supply or a demand, keeps each approach's turns in proportion, and holds an input back only behind a full exit; links shorter than one step stay conserved and below jam | `traffic::ctm` |
+| §7 near-field vehicles and handoff — on a far/near/far corridor every step conserves vehicles to 1e-9, never lets two overlap, and free-flowing vehicles drive near `v₀`; with the far exit closed the near edge holds a standing queue at the IDM jam gap and the queue spills back into the incoming CTM link; turning choices match their weights (3:1 → 75% ± 5%); MOBIL spreads a packed lane into a free one safely; a dense three-lane ring never clamps a position; runs with the same seed are identical | `traffic::hybrid` |
 | §7 road graph — on the fixture, the drive graph splits the JFK Expressway at its two junctions, keeps it one-way, implies the ramp's direction, reverses the Nassau Expressway, halves Rockaway Boulevard's lanes per direction, closes the roundabout as a loop, leaves out the bus lane closed to cars, and finds the expected 12 components; the taxi graph is one two-way component; an open CTM run accounts for every vehicle and a closed one circulates over every link without loss | `compiler/tests/graph.rs`, `graph` |
 | §8C — opposition surge and full-moon limb flattening vs Lambert | `photometry::hapke_opposition_and_limb_flattening` |
 | §8B — limb is the *brightest* part of the atmosphere, finite airmass (~35) at the horizon | `photometry::limb_is_brightest`, `photometry::chapman_function` |
@@ -168,7 +171,7 @@ manual dispatch, with downloads cached for a week.
 | §4 ARINC 424 decode, extrusion, grade fit, markings data, heightfield patching | Implemented; patching is baked into the terrain tiles and an optional patched DEM; decals and the runtime virtual heightfield are engine-side |
 | §5 Seed hash, Poisson levels, pier spacing, flatten falloff | Implemented; WFC/PCG graphs and bridge detection are engine-side |
 | §6 Calendar, declination, lapse rate, phenology, snow mask | Implemented; GPU buffer plumbing is engine-side |
-| §7 IDM, MOBIL, VAT addressing, CTM far-field with general junctions and near-field handoff, road graph from OSM, ORCA crowds | Implemented; turning fractions are capacity-proportional (no turn counts or routing yet); the ECS and the pedestrian navigation graph that feeds ORCA its preferred velocities are engine-side |
+| §7 IDM, MOBIL, VAT addressing, CTM far-field with general junctions, routed demand, near-field vehicles with handoff, road graph from OSM, ORCA crowds | Implemented; demand is synthetic (by sink capacity), there is no intersection control (signals, yielding to crossing traffic), and turning is by routed shares rather than per-vehicle destinations; the ECS and the pedestrian navigation graph that feeds ORCA its preferred velocities are engine-side |
 | §8A VSOP87D / ELP 2000-82B evaluators, nutation, apparent places, topocentric vectors, phase, libration | Implemented (see below); physical libration (≤ 0.04°) not modelled |
 | §8A Yale Bright Star Catalogue loader, packed buffer, Planckian colour | Implemented; the catalogue itself goes to V ≈ 7.96, deeper than the spec's "to 6.5" |
 | §6/§8A Time scales (UTC → UT1 / TT / TDB, ΔT) | Implemented; DUT1 is an input (IERS Bulletin A), leap-second table valid through 2026-12-28 |
@@ -279,7 +282,39 @@ Routing is what makes the real network work:
 | Residential delay | 19.5% | 0.2% |
 
 Without routes, traffic drifts into pockets that have no exit and fills them. Routed, it
-keeps to motorways, ramps and arterials, and one source that can reach no exit stays idle. A CTM step over the whole state's 944,918 links
+keeps to motorways, ramps and arterials, and one source that can reach no exit stays idle.
+
+**Near field.** `--near-field lon,lat,radius_m` runs the hybrid simulation instead. Inside the
+circle every vehicle is simulated individually on the graph's edges: IDM car following at
+each edge's free-flow speed and MOBIL lane changes once per step, over `--near-substeps`
+substeps (5 by default). Outside it the CTM runs as above.
+
+- **Merges.** Vehicles merge by zipper: the one nearer the merge point goes first.
+- **Handoff, far to near.** Flow leaving an incoming CTM link becomes whole vehicles at the
+  start of their next edge as soon as there is room. While one is waiting, the link's exit
+  closes, so congestion spills back.
+- **Handoff, near to far.** Vehicles leaving the near field enter the outgoing link as its
+  receiving flow allows. While one waits, the edge end acts as a stopped obstacle.
+- **Turning.** Both sides use the same routed turning shares. Choices come from a seeded
+  generator, so runs are reproducible.
+- **Report.** Conservation is checked every step, and the run also reports the minimum gap
+  between vehicles, positions clamped to avoid an overlap, and arrivals held at a full merge.
+
+On the real KJFK graph, a 1.5 km near field around Terminal 4 holds 393 nodes and 598
+edges. A 30-minute run at 300 veh/h per source drives 1,442 vehicles through it, with at
+most 83 at once. Vehicles are conserved to 2e-12, the steady-state exit ratio is 100%, the
+smallest gap is 8.6 m, and no position is clamped or held. Each step, near and far together,
+takes 3 ms. `cargo run --release --example near_field_bench` times the near field alone:
+2,000 vehicles on a three-lane ring take 0.81 ms per step of five substeps.
+
+The first real-data hybrid run found two defects, both fixed:
+
+- Vehicles from two approaches could reach a merge together and overlap. The zipper rule
+  now lets the vehicle nearer the merge go first.
+- Lane changes were applied after accelerations were computed, so a vehicle could keep
+  braking for its old lane. Lane changes are now decided first.
+
+A CTM step over the whole state's 944,918 links
 takes about 0.46 s on one core, faster than real time at Δt = 1 s.
 
 The real-data runs found a bug in the CTM itself. Links shorter than one free-flow step

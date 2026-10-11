@@ -29,7 +29,7 @@ fn main() -> ExitCode {
             if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         Command::Graph(args) => match run_graph(&args) {
-            Ok((_, s, sim)) => {
+            Ok((_, s, sim, hybrid)) => {
                 println!(
                     "{}: {} spline(s) used ({} other class, {} closed to motor vehicles) → {} segment(s)",
                     args.input.display(),
@@ -66,6 +66,42 @@ fn main() -> ExitCode {
                         100.0 * min
                     );
                     return ExitCode::FAILURE;
+                }
+                if let Some(h) = &hybrid {
+                    println!(
+                        "hybrid {} s: {} near-field node(s), {} near-field edge(s); {:.1} veh entered, {:.1} exited; worst conservation error {:.2e}; steady-state exit ratio {:.1}%",
+                        h.steps as f64 * args.dt_s,
+                        h.near_nodes,
+                        h.near_edges,
+                        h.entered,
+                        h.exited,
+                        h.worst_conservation_error,
+                        100.0 * h.exit_ratio
+                    );
+                    println!(
+                        "  near field: {} vehicle(s) now, {} at most, {} driven through; min gap {:.2} m; {} clamp(s), {} merge hold(s); {:.3} ms per step",
+                        h.near_vehicles,
+                        h.peak_near_vehicles,
+                        h.near_vehicles_seen,
+                        h.min_gap_m,
+                        h.clamps,
+                        h.holds,
+                        h.mean_step_ms
+                    );
+                    if h.worst_conservation_error > 1e-6 * h.entered.max(1.0) {
+                        eprintln!("error: hybrid conservation violated by {:.6} vehicles", h.worst_conservation_error);
+                        return ExitCode::FAILURE;
+                    }
+                    if let Some(min) = args.min_exit_ratio
+                        && h.exit_ratio < min
+                    {
+                        eprintln!(
+                            "error: steady-state exit ratio {:.1}% is below the required {:.1}%",
+                            100.0 * h.exit_ratio,
+                            100.0 * min
+                        );
+                        return ExitCode::FAILURE;
+                    }
                 }
                 if let Some(m) = sim {
                     println!(
