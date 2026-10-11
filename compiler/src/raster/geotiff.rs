@@ -163,6 +163,241 @@ impl Dem {
 
     /// Parses TIFF bytes.
     pub fn parse(b: &[u8]) -> Result<Dem, TiffError> {
+        let l = Layout::parse(b)?;
+        let (width, height, block_w, block_h) = (l.width, l.height, l.block_w, l.block_h);
+        let mut heights = vec![f32::NAN; width * height];
+        let mut block = Vec::new();
+        for i in 0..l.offsets.len() {
+            let (bx, by) = (i % l.across, i / l.across);
+            let rows_here = l.decode_block(b, i, &mut block)?;
+            // Predictor 3 leaves big-endian samples whatever the file order.
+            let be = l.big_endian || l.predictor == 3;
+            for r in 0..rows_here {
+                let row = by * block_h + r;
+                if row >= height {
+                    break;
+                }
+                for c in 0..block_w {
+                    let col = bx * block_w + c;
+                    if col >= width {
+                        break;
+                    }
+                    let s = &block[(r * block_w + c) * l.size..][..l.size];
+                    let v = decode_sample(s, l.sample_format, l.bits, be);
+                    let is_nodata = match l.nodata {
+                        Some(n) if n.is_nan() => v.is_nan(),
+                        Some(n) => v == n,
+                        None => false,
+                    };
+                    heights[row * width + col] = if is_nodata { f32::NAN } else { v as f32 };
+                }
+            }
+        }
+        Ok(Dem {
+            width,
+            height,
+            heights,
+            transform: l.geo.transform,
+            crs: l.geo.crs,
+            pixel_is_point: l.geo.pixel_is_point,
+            nodata: l.nodata,
+            storage: Storage {
+                compression: l.compression,
+                predictor: l.predictor,
+                sample_format: l.sample_format,
+                bits: l.bits,
+                tiled: l.tiled,
+                big_endian: l.big_endian,
+            },
+        })
+    }
+}
+
+/// A categorical raster (one byte per pixel, such as a land-cover map), or the window of one
+/// that was read. Only blocks overlapping the window are decoded, so a window of a large
+/// tile costs what the window costs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassGrid {
+    /// Columns in the window.
+    pub width: usize,
+    /// Rows in the window.
+    pub height: usize,
+    /// Row-major class codes.
+    pub classes: Vec<u8>,
+    /// Pixel-edge affine transform of the window (axis-aligned: `t2 = t4 = 0`).
+    pub transform: [f64; 6],
+    /// The declared no-data code.
+    pub nodata: Option<u8>,
+    /// Column and row of the window's first pixel in the file.
+    pub origin: (usize, usize),
+    /// Width and height of the whole file.
+    pub source_size: (usize, usize),
+}
+
+/// The pixels of a raster with pixel-edge transform `t` and `size` whose areas meet `bbox`:
+/// `(col0, row0, col1, row1)`, half-open, clipped to the raster. Edges within 1e-6 pixel of a
+/// pixel boundary snap to it, so a box drawn on pixel edges selects exactly those pixels.
+pub fn window_pixels(t: &[f64; 6], size: (usize, usize), bbox: (f64, f64, f64, f64)) -> (usize, usize, usize, usize) {
+    let snap = |v: f64| if (v - v.round()).abs() < 1e-6 { v.round() } else { v };
+    let (w, s, e, n) = bbox;
+    let x0 = snap((w - t[0]) / t[1]).floor();
+    let x1 = snap((e - t[0]) / t[1]).ceil();
+    let y0 = snap((n - t[3]) / t[5]).floor();
+    let y1 = snap((s - t[3]) / t[5]).ceil();
+    let clamp = |v: f64, hi: usize| v.clamp(0.0, hi as f64) as usize;
+    (clamp(x0, size.0), clamp(y0, size.1), clamp(x1, size.0), clamp(y1, size.1))
+}
+
+impl ClassGrid {
+    /// Loads a categorical GeoTIFF, or the window of it meeting `bbox`.
+    pub fn load(path: &Path, bbox: Option<(f64, f64, f64, f64)>) -> Result<ClassGrid, CompileError> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|mut f| f.read_to_end(&mut bytes))
+            .map_err(|e| CompileError::Io(path.to_path_buf(), e))?;
+        Ok(ClassGrid::parse(&bytes, bbox)?)
+    }
+
+    /// Parses an 8-bit unsigned single-band GeoTIFF with an axis-aligned geographic transform.
+    pub fn parse(b: &[u8], bbox: Option<(f64, f64, f64, f64)>) -> Result<ClassGrid, TiffError> {
+        let l = Layout::parse(b)?;
+        if l.bits != 8 || l.sample_format != 1 {
+            return Err(TiffError::Unsupported(format!(
+                "a class raster has 8-bit unsigned samples, not format {} with {} bits",
+                l.sample_format, l.bits
+            )));
+        }
+        let t = l.geo.transform;
+        if t[2] != 0.0 || t[4] != 0.0 || t[1] <= 0.0 || t[5] >= 0.0 {
+            return Err(TiffError::Unsupported("a class raster must be north-up and axis-aligned".into()));
+        }
+        let (c0, r0, c1, r1) = match bbox {
+            Some(bb) => window_pixels(&t, (l.width, l.height), bb),
+            None => (0, 0, l.width, l.height),
+        };
+        let (w, h) = (c1.saturating_sub(c0), r1.saturating_sub(r0));
+        let mut classes = vec![0u8; w * h];
+        let nodata = l.nodata.filter(|v| v.fract() == 0.0 && (0.0..=255.0).contains(v)).map(|v| v as u8);
+        if let Some(n) = nodata {
+            classes.fill(n);
+        }
+        if w > 0 && h > 0 {
+            let down = l.offsets.len() / l.across;
+            let blocks: Vec<usize> = (0..l.offsets.len())
+                .filter(|&i| {
+                    let (bx, by) = (i % l.across, i / l.across);
+                    bx * l.block_w < c1
+                        && (bx + 1) * l.block_w > c0
+                        && by * l.block_h < r1
+                        && (by + 1) * l.block_h > r0
+                        && by < down
+                })
+                .collect();
+            let decoded = crate::par::parallel_map(&blocks, crate::par::thread_count(0), |&i| {
+                let mut block = Vec::new();
+                let rows = l.decode_block(b, i, &mut block).map_err(CompileError::from)?;
+                Ok((i, rows, block))
+            })
+            .map_err(|e| TiffError::Malformed(e.to_string()))?;
+            for (i, rows, block) in decoded {
+                let (bx, by) = (i % l.across, i / l.across);
+                for r in 0..rows {
+                    let row = by * l.block_h + r;
+                    if row < r0 || row >= r1 {
+                        continue;
+                    }
+                    let col_lo = (bx * l.block_w).max(c0);
+                    let col_hi = ((bx + 1) * l.block_w).min(c1).min(l.width);
+                    if col_lo >= col_hi {
+                        continue;
+                    }
+                    let src = &block[r * l.block_w + (col_lo - bx * l.block_w)..][..col_hi - col_lo];
+                    let dst = (row - r0) * w + (col_lo - c0);
+                    classes[dst..dst + src.len()].copy_from_slice(src);
+                }
+            }
+        }
+        let transform = [t[0] + c0 as f64 * t[1], t[1], 0.0, t[3] + r0 as f64 * t[5], 0.0, t[5]];
+        Ok(ClassGrid {
+            width: w,
+            height: h,
+            classes,
+            transform,
+            nodata,
+            origin: (c0, r0),
+            source_size: (l.width, l.height),
+        })
+    }
+
+    /// Class at a pixel of the window, `None` outside it or where it holds no data.
+    pub fn at(&self, col: usize, row: usize) -> Option<u8> {
+        if col >= self.width || row >= self.height {
+            return None;
+        }
+        let v = self.classes[row * self.width + col];
+        (Some(v) != self.nodata).then_some(v)
+    }
+
+    /// Geographic bounds `(west, south, east, north)` of the window.
+    pub fn bounds(&self) -> (f64, f64, f64, f64) {
+        let t = &self.transform;
+        (t[0], t[3] + self.height as f64 * t[5], t[0] + self.width as f64 * t[1], t[3])
+    }
+
+    /// The pixel containing a point, if it is in the window.
+    pub fn pixel_at(&self, lon: f64, lat: f64) -> Option<(usize, usize)> {
+        let t = &self.transform;
+        let (c, r) = ((lon - t[0]) / t[1], (lat - t[3]) / t[5]);
+        (c >= 0.0 && r >= 0.0 && c < self.width as f64 && r < self.height as f64).then_some((c as usize, r as usize))
+    }
+
+    /// Columns `[c0, c1)` and rows `[r0, r1)` of the pixels whose centres lie in
+    /// `[west, east) × (south, north]`.
+    pub fn centres_in(&self, west: f64, south: f64, east: f64, north: f64) -> (usize, usize, usize, usize) {
+        let t = &self.transform;
+        let col = |lon: f64| (((lon - t[0]) / t[1] - 0.5).ceil().max(0.0) as usize).min(self.width);
+        let row = |lat: f64| (((lat - t[3]) / t[5] - 0.5).ceil().max(0.0) as usize).min(self.height);
+        (col(west), row(north), col(east), row(south))
+    }
+}
+
+/// Writes a categorical raster as a little-endian, uncompressed, single-strip 8-bit GeoTIFF.
+pub fn write_u8(path: &Path, grid: &ClassGrid) -> Result<(), CompileError> {
+    let dem = Dem {
+        width: grid.width,
+        height: grid.height,
+        heights: Vec::new(),
+        transform: grid.transform,
+        crs: Some(4326),
+        pixel_is_point: false,
+        nodata: grid.nodata.map(f64::from),
+        storage: Storage { compression: 1, predictor: 1, sample_format: 1, bits: 8, tiled: false, big_endian: false },
+    };
+    write_samples(path, &dem, &grid.classes, 8, 1, grid.nodata.map(|n| n.to_string()))
+}
+
+/// Everything about a TIFF's first image except the pixels.
+struct Layout {
+    width: usize,
+    height: usize,
+    bits: u16,
+    compression: u16,
+    predictor: u16,
+    sample_format: u16,
+    size: usize,
+    tiled: bool,
+    block_w: usize,
+    block_h: usize,
+    across: usize,
+    offsets: Vec<f64>,
+    counts: Vec<f64>,
+    geo: Georef,
+    nodata: Option<f64>,
+    big_endian: bool,
+}
+
+impl Layout {
+    fn parse(b: &[u8]) -> Result<Layout, TiffError> {
         let big_endian = match b.get(0..4) {
             Some([b'I', b'I', 42, 0]) => false,
             Some([b'M', b'M', 0, 42]) => true,
@@ -260,70 +495,54 @@ impl Dem {
             None => None,
         };
 
-        // Decode every block into the grid.
-        let mut heights = vec![f32::NAN; width * height];
-        let mut block = Vec::new();
-        for (i, (&off, &cnt)) in offsets.iter().zip(&counts).enumerate() {
-            let (bx, by) = (i % across, i / across);
-            let (off, cnt) = (off as usize, cnt as usize);
-            let raw =
-                b.get(off..off + cnt).ok_or_else(|| TiffError::Malformed(format!("block {i} outside the file")))?;
-            let rows_here = if tiled { block_h } else { block_h.min(height - by * block_h) };
-            let expected = block_w * rows_here * size;
-            block.clear();
-            match compression {
-                1 => block.extend_from_slice(raw),
-                5 => lzw_decode(raw, expected, &mut block)?,
-                _ => {
-                    flate2::read::ZlibDecoder::new(raw)
-                        .take(expected as u64)
-                        .read_to_end(&mut block)
-                        .map_err(|e| TiffError::Malformed(format!("block {i}: deflate: {e}")))?;
-                }
-            }
-            if block.len() < expected {
-                return Err(TiffError::Malformed(format!("block {i}: {} bytes, expected {expected}", block.len())));
-            }
-            block.truncate(expected);
-            match predictor {
-                2 => undo_horizontal(&mut block, block_w, size, big_endian),
-                3 => undo_float(&mut block, block_w, size),
-                _ => {}
-            }
-            // Predictor 3 leaves big-endian samples whatever the file order.
-            let be = big_endian || predictor == 3;
-            for r in 0..rows_here {
-                let row = by * block_h + r;
-                if row >= height {
-                    break;
-                }
-                for c in 0..block_w {
-                    let col = bx * block_w + c;
-                    if col >= width {
-                        break;
-                    }
-                    let s = &block[(r * block_w + c) * size..][..size];
-                    let v = decode_sample(s, sample_format, bits, be);
-                    let is_nodata = match nodata {
-                        Some(n) if n.is_nan() => v.is_nan(),
-                        Some(n) => v == n,
-                        None => false,
-                    };
-                    heights[row * width + col] = if is_nodata { f32::NAN } else { v as f32 };
-                }
-            }
-        }
-
-        Ok(Dem {
+        Ok(Layout {
             width,
             height,
-            heights,
-            transform: geo.transform,
-            crs: geo.crs,
-            pixel_is_point: geo.pixel_is_point,
+            bits,
+            compression,
+            predictor,
+            sample_format,
+            size,
+            tiled,
+            block_w,
+            block_h,
+            across,
+            offsets,
+            counts,
+            geo,
             nodata,
-            storage: Storage { compression, predictor, sample_format, bits, tiled, big_endian },
+            big_endian,
         })
+    }
+
+    /// Decompresses block `i` into `block` and undoes its predictor; returns the rows it holds.
+    fn decode_block(&self, b: &[u8], i: usize, block: &mut Vec<u8>) -> Result<usize, TiffError> {
+        let by = i / self.across;
+        let (off, cnt) = (self.offsets[i] as usize, self.counts[i] as usize);
+        let raw = b.get(off..off + cnt).ok_or_else(|| TiffError::Malformed(format!("block {i} outside the file")))?;
+        let rows_here = if self.tiled { self.block_h } else { self.block_h.min(self.height - by * self.block_h) };
+        let expected = self.block_w * rows_here * self.size;
+        block.clear();
+        match self.compression {
+            1 => block.extend_from_slice(raw),
+            5 => lzw_decode(raw, expected, block)?,
+            _ => {
+                flate2::read::ZlibDecoder::new(raw)
+                    .take(expected as u64)
+                    .read_to_end(block)
+                    .map_err(|e| TiffError::Malformed(format!("block {i}: deflate: {e}")))?;
+            }
+        }
+        if block.len() < expected {
+            return Err(TiffError::Malformed(format!("block {i}: {} bytes, expected {expected}", block.len())));
+        }
+        block.truncate(expected);
+        match self.predictor {
+            2 => undo_horizontal(block, self.block_w, self.size, self.big_endian),
+            3 => undo_float(block, self.block_w, self.size),
+            _ => {}
+        }
+        Ok(rows_here)
     }
 }
 
@@ -335,16 +554,30 @@ pub const WRITE_NODATA: f32 = -9999.0;
 /// `GDAL_NODATA`. Axis-aligned transforms use ModelPixelScale and ModelTiepoint; others use
 /// ModelTransformation.
 pub fn write_f32(path: &Path, dem: &Dem) -> Result<(), CompileError> {
+    let data: Vec<u8> =
+        dem.heights.iter().flat_map(|&v| (if v.is_finite() { v } else { WRITE_NODATA }).to_le_bytes()).collect();
+    write_samples(path, dem, &data, 32, 3, Some(WRITE_NODATA.to_string()))
+}
+
+/// Writes one strip of little-endian samples with `dem`'s size, transform and CRS.
+fn write_samples(
+    path: &Path,
+    dem: &Dem,
+    data: &[u8],
+    bits: u16,
+    sample_format: u16,
+    nodata: Option<String>,
+) -> Result<(), CompileError> {
     let (w, h) = (dem.width as u32, dem.height as u32);
     let t = dem.transform;
     let mut tags: Vec<(u16, u16, Vec<u8>, u32)> = Vec::new(); // tag, type, payload, count
     let shorts = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
     let longs = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
     let doubles = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-    let data_len = w * h * 4;
+    let data_len = data.len() as u32;
     tags.push((256, 4, longs(&[w]), 1));
     tags.push((257, 4, longs(&[h]), 1));
-    tags.push((258, 3, shorts(&[32]), 1));
+    tags.push((258, 3, shorts(&[bits]), 1));
     tags.push((259, 3, shorts(&[1]), 1));
     tags.push((262, 3, shorts(&[1]), 1));
     tags.push((273, 4, longs(&[0]), 1)); // strip offset, patched below
@@ -352,7 +585,7 @@ pub fn write_f32(path: &Path, dem: &Dem) -> Result<(), CompileError> {
     tags.push((278, 4, longs(&[h]), 1));
     tags.push((279, 4, longs(&[data_len]), 1));
     tags.push((284, 3, shorts(&[1]), 1));
-    tags.push((339, 3, shorts(&[3]), 1));
+    tags.push((339, 3, shorts(&[sample_format]), 1));
     if t[2] == 0.0 && t[4] == 0.0 && t[1] > 0.0 && t[5] < 0.0 {
         tags.push((33550, 12, doubles(&[t[1], -t[5], 0.0]), 3));
         tags.push((33922, 12, doubles(&[0.0, 0.0, 0.0, t[0], t[3], 0.0]), 6));
@@ -362,8 +595,10 @@ pub fn write_f32(path: &Path, dem: &Dem) -> Result<(), CompileError> {
     }
     let geokeys = [1u16, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, dem.crs.unwrap_or(4326)];
     tags.push((34735, 3, shorts(&geokeys), geokeys.len() as u32));
-    let nodata = format!("{}\0", WRITE_NODATA);
-    tags.push((42113, 2, nodata.as_bytes().to_vec(), nodata.len() as u32));
+    if let Some(n) = nodata {
+        let n = format!("{n}\0");
+        tags.push((42113, 2, n.as_bytes().to_vec(), n.len() as u32));
+    }
     tags.sort_by_key(|t| t.0);
 
     let ifd_len = 2 + tags.len() * 12 + 4;
@@ -405,9 +640,7 @@ pub fn write_f32(path: &Path, dem: &Dem) -> Result<(), CompileError> {
     out.extend_from_slice(&entries);
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&extra);
-    for &v in &dem.heights {
-        out.extend_from_slice(&(if v.is_finite() { v } else { WRITE_NODATA }).to_le_bytes());
-    }
+    out.extend_from_slice(data);
     std::fs::write(path, out).map_err(|e| CompileError::Io(path.to_path_buf(), e))
 }
 
@@ -773,6 +1006,46 @@ mod tests {
     fn rejects_non_tiff() {
         assert!(matches!(Dem::parse(b"PNG\r\n"), Err(TiffError::NotTiff(_))));
         assert!(matches!(Dem::parse(b"II\x2b\x00"), Err(TiffError::Unsupported(_))));
+    }
+
+    #[test]
+    fn class_grid_windows_and_round_trips() {
+        // 40 × 30 classes on a 0.01° grid from (10°E, 50°N), written uncompressed.
+        let (w, h) = (40, 30);
+        let classes: Vec<u8> = (0..w * h).map(|i| ((i % w) / 10 * 10 + (i / w) / 10) as u8).collect();
+        let grid = ClassGrid {
+            width: w,
+            height: h,
+            classes,
+            transform: [10.0, 0.01, 0.0, 50.0, 0.0, -0.01],
+            nodata: Some(0),
+            origin: (0, 0),
+            source_size: (w, h),
+        };
+        let path = std::env::temp_dir().join(format!("nosim-classes-{}.tif", std::process::id()));
+        write_u8(&path, &grid).unwrap();
+        let back = ClassGrid::load(&path, None).unwrap();
+        assert_eq!(back, grid);
+        // A window on pixel edges selects exactly those pixels.
+        let win = ClassGrid::load(&path, Some((10.1, 49.8, 10.2, 49.9))).unwrap();
+        assert_eq!((win.width, win.height, win.origin), (10, 10, (10, 10)));
+        assert_eq!(win.at(0, 0), grid.at(10, 10));
+        assert!((win.transform[0] - 10.1).abs() < 1e-12 && (win.transform[3] - 49.9).abs() < 1e-12);
+        // A window off the edges takes every pixel it touches, clipped to the raster.
+        let win = ClassGrid::load(&path, Some((10.105, 49.0, 10.115, 49.995))).unwrap();
+        assert_eq!((win.width, win.height, win.origin), (2, 30, (10, 0)));
+        // Nodata reads as None; a 32-bit float raster is refused.
+        assert_eq!(grid.at(0, 0), None);
+        assert_eq!(grid.at(10, 0), Some(10));
+        let dem = Dem::parse(&std::fs::read(&path).unwrap()).unwrap();
+        let f = std::env::temp_dir().join(format!("nosim-classes-f-{}.tif", std::process::id()));
+        write_f32(&f, &dem).unwrap();
+        assert!(matches!(ClassGrid::load(&f, None), Err(CompileError::Raster(m)) if m.contains("8-bit")));
+        // Centres in a box: pixel centres at 10.005, 10.015, …
+        assert_eq!(grid.centres_in(10.0, 49.98, 10.02, 50.0), (0, 0, 2, 2));
+        assert_eq!(grid.centres_in(10.006, 49.98, 10.014, 50.0), (1, 0, 1, 2)); // no centre inside
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(f).unwrap();
     }
 
     #[test]

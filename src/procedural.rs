@@ -86,6 +86,69 @@ pub fn estimate_levels(seed: u64, zone: ZoneLevels) -> u32 {
     poisson(&mut rng, zone.lambda).clamp(zone.min_levels, zone.max_levels)
 }
 
+/// Poisson-disk points (Bridson 2007) in `[0, width) × [0, height)` metres, no two closer
+/// than `radius`, then thinned: each point is kept with probability `density(x, y)`, clamped
+/// to `[0, 1]`. Thinning keeps the minimum distance, so a land-cover mask scales how many
+/// trees stand on a patch without letting them crowd. Deterministic for a given seed.
+pub fn poisson_disk(
+    width: f64,
+    height: f64,
+    radius: f64,
+    seed: u64,
+    mut density: impl FnMut(f64, f64) -> f64,
+) -> Vec<(f64, f64)> {
+    if !(width > 0.0 && height > 0.0 && radius > 0.0) {
+        return Vec::new();
+    }
+    let cell = radius / std::f64::consts::SQRT_2;
+    let (gw, gh) = ((width / cell).ceil() as usize, (height / cell).ceil() as usize);
+    let mut grid: Vec<Option<u32>> = vec![None; gw * gh];
+    let mut rng = Rng::new(mix64(seed));
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    let mut active: Vec<u32> = Vec::new();
+    let slot = |p: (f64, f64)| ((p.1 / cell) as usize).min(gh - 1) * gw + ((p.0 / cell) as usize).min(gw - 1);
+    let first = (rng.uniform01() * width, rng.uniform01() * height);
+    grid[slot(first)] = Some(0);
+    points.push(first);
+    active.push(0);
+    while !active.is_empty() {
+        let pick = (rng.uniform01() * active.len() as f64) as usize % active.len();
+        let centre = points[active[pick] as usize];
+        let mut placed = false;
+        for _ in 0..30 {
+            let a = rng.uniform01() * std::f64::consts::TAU;
+            let d = radius * (1.0 + rng.uniform01());
+            let p = (centre.0 + d * a.cos(), centre.1 + d * a.sin());
+            if !(p.0 >= 0.0 && p.0 < width && p.1 >= 0.0 && p.1 < height) {
+                continue;
+            }
+            let (cx, cy) = ((p.0 / cell) as i64, (p.1 / cell) as i64);
+            let clear = (cy - 2..=cy + 2).all(|y| {
+                (cx - 2..=cx + 2).all(|x| {
+                    if x < 0 || y < 0 || x >= gw as i64 || y >= gh as i64 {
+                        return true;
+                    }
+                    grid[y as usize * gw + x as usize].is_none_or(|k| {
+                        let q = points[k as usize];
+                        (q.0 - p.0).powi(2) + (q.1 - p.1).powi(2) >= radius * radius
+                    })
+                })
+            });
+            if clear {
+                grid[slot(p)] = Some(points.len() as u32);
+                active.push(points.len() as u32);
+                points.push(p);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            active.swap_remove(pick);
+        }
+    }
+    points.into_iter().filter(|&(x, y)| rng.uniform01() < density(x, y).clamp(0.0, 1.0)).collect()
+}
+
 /// Stations (metres from the near abutment) at which bridge piers are raycast downward.
 /// Spacing is shrunk slightly so piers are evenly distributed and never land on an abutment.
 pub fn pier_stations(deck_length_m: f64, spacing_m: f64) -> Vec<f64> {
@@ -169,6 +232,30 @@ mod tests {
         m /= f64::from(n);
         assert!(near(m, 2.0, 0.05));
         assert!(near(m2 / f64::from(n) - m * m, 2.0, 0.1));
+    }
+
+    #[test]
+    fn poisson_disk_spacing_and_thinning() {
+        let full = poisson_disk(200.0, 100.0, 5.0, 7, |_, _| 1.0);
+        // Bridson fills the plane at roughly one point per 1.5 r² or better.
+        assert!(full.len() as f64 > 200.0 * 100.0 / (1.5 * 25.0) * 0.8, "{}", full.len());
+        for (i, a) in full.iter().enumerate() {
+            assert!(a.0 >= 0.0 && a.0 < 200.0 && a.1 >= 0.0 && a.1 < 100.0);
+            for b in &full[i + 1..] {
+                assert!((a.0 - b.0).hypot(a.1 - b.1) >= 5.0 - 1e-9);
+            }
+        }
+        assert_eq!(poisson_disk(200.0, 100.0, 5.0, 7, |_, _| 1.0), full);
+        assert_ne!(poisson_disk(200.0, 100.0, 5.0, 8, |_, _| 1.0), full);
+        // A quarter density keeps about a quarter; a half-plane mask keeps one side only.
+        let quarter = poisson_disk(200.0, 100.0, 5.0, 7, |_, _| 0.25);
+        let r = quarter.len() as f64 / full.len() as f64;
+        assert!((r - 0.25).abs() < 0.05, "{r}");
+        let half = poisson_disk(200.0, 100.0, 5.0, 7, |x, _| if x < 100.0 { 1.0 } else { 0.0 });
+        assert!(half.iter().all(|p| p.0 < 100.0));
+        let left = full.iter().filter(|p| p.0 < 100.0).count();
+        assert_eq!(half.len(), left);
+        assert!(poisson_disk(0.0, 10.0, 1.0, 1, |_, _| 1.0).is_empty());
     }
 
     #[test]

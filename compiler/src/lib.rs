@@ -9,6 +9,7 @@ pub mod arinc;
 pub mod bridges;
 pub mod geoparquet;
 pub mod graph;
+pub mod landcover;
 pub mod osm;
 pub(crate) mod par;
 pub mod raster;
@@ -203,6 +204,8 @@ pub enum Command {
     Areas(AreasArgs),
     /// Find bridges: tagged decks, splines over water, splines over DEM gorges.
     Bridges(BridgesArgs),
+    /// Resample a land-cover raster into class tiles and density masks.
+    Landcover(LandcoverArgs),
     /// Build a directed road graph from a spline table.
     Graph(GraphArgs),
 }
@@ -303,6 +306,19 @@ pub struct BridgesArgs {
     pub expect: Vec<(String, f64)>,
 }
 
+/// `landcover` subcommand options.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LandcoverArgs {
+    /// Categorical GeoTIFF (ESA WorldCover).
+    pub input: PathBuf,
+    /// Directory for `classes/`, `masks/` and `legend.json`.
+    pub output: PathBuf,
+    /// Processing parameters.
+    pub options: landcover::LandcoverOptions,
+    /// Directory of scenery packages whose `vegetation` exclusions apply.
+    pub packages: Option<PathBuf>,
+}
+
 /// `raster` subcommand options.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RasterArgs {
@@ -355,6 +371,7 @@ pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runwa
                          world-compiler osm --input <extract.osm.pbf> --output <splines.geoparquet> [--bbox <west,south,east,north>] [--threads <n>]\n\
                          world-compiler areas --input <extract.osm.pbf> --output <dir> [--bbox <west,south,east,north>] [--packages <dir>] [--threads <n>]\n\
                          world-compiler bridges --splines <splines.geoparquet> --areas <dir> --output <bridges.geoparquet> [--dem <dem.tif>] [--min-drop <m>] [--expect-over-water <name>=<m>]... [--threads <n>]\n\
+                         world-compiler landcover --input <worldcover.tif> --output <dir> [--bbox <west,south,east,north>] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--packages <dir>] [--threads <n>]\n\
                          world-compiler graph --input <splines.geoparquet> --output <dir> [--mode drive|taxi|walk] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>] [--capacity-split] [--assign-iterations <n>] [--min-exit-ratio <r>] [--near-field <lon,lat,radius_m> [--near-substeps <n>]]] [--walk-from <lon,lat> --walk-to <lon,lat> [--walkers <n>] [--walk-seconds <s>]]";
 
 /// Parses the command line (everything after the program name).
@@ -368,9 +385,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Co
         Some("osm") => parse_osm(it).map(Command::Osm),
         Some("areas") => parse_areas(it).map(Command::Areas),
         Some("bridges") => parse_bridges(it).map(Command::Bridges),
+        Some("landcover") => parse_landcover(it).map(Command::Landcover),
         Some("graph") => parse_graph(it).map(Command::Graph),
         other => Err(CompileError::Usage(format!(
-            "expected subcommand `arinc`, `validate`, `tiles`, `raster`, `osm`, `areas`, `bridges` or `graph`, got {other:?}\n{USAGE}"
+            "expected subcommand `arinc`, `validate`, `tiles`, `raster`, `osm`, `areas`, `bridges`, `landcover` or `graph`, got {other:?}\n{USAGE}"
         ))),
     }
 }
@@ -708,6 +726,40 @@ pub fn run_bridges(args: &BridgesArgs) -> Result<(Vec<bridges::Bridge>, bridges:
     summary.coastline_pieces = coast.len();
     bridges::write_bridges(&args.output, &found)?;
     Ok((found, summary))
+}
+
+fn parse_landcover<I: Iterator<Item = String>>(mut it: I) -> Result<LandcoverArgs, CompileError> {
+    let (mut input, mut output, mut packages) = (None, None, None);
+    let mut options = landcover::LandcoverOptions::default();
+    let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
+    while let Some(flag) = it.next() {
+        let value = it.next().ok_or_else(|| CompileError::Usage(format!("{flag} needs a value\n{USAGE}")))?;
+        match flag.as_str() {
+            "--input" => input = Some(PathBuf::from(value)),
+            "--output" => output = Some(PathBuf::from(value)),
+            "--packages" => packages = Some(PathBuf::from(value)),
+            "--bbox" => options.bbox = Some(parse_bbox(&value).ok_or_else(|| bad(&flag, &value))?),
+            "--min-zoom" => options.min_zoom = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--max-zoom" => options.max_zoom = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--tile-size" => options.tile_size = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--threads" => options.threads = value.parse().map_err(|_| bad(&flag, &value))?,
+            _ => return Err(CompileError::Usage(format!("unknown flag {flag}\n{USAGE}"))),
+        }
+    }
+    Ok(LandcoverArgs {
+        input: input.ok_or_else(|| CompileError::Usage(format!("--input is required\n{USAGE}")))?,
+        output: output.ok_or_else(|| CompileError::Usage(format!("--output is required\n{USAGE}")))?,
+        options,
+        packages,
+    })
+}
+
+/// Runs `landcover`: reads the window of the raster meeting the bounding box and writes the
+/// class tiles, masks and legend.
+pub fn run_landcover(args: &LandcoverArgs) -> Result<landcover::LandcoverSummary, CompileError> {
+    let grid = raster::geotiff::ClassGrid::load(&args.input, args.options.bbox)?;
+    let vfs = args.packages.as_deref().map(mount_packages).transpose()?;
+    landcover::process(&grid, &args.output, &args.options, vfs.as_ref())
 }
 
 fn parse_graph<I: Iterator<Item = String>>(mut it: I) -> Result<GraphArgs, CompileError> {

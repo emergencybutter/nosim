@@ -2,9 +2,9 @@
 # The gate, as one script for CI and for local runs.
 #
 #   tools/ci.sh check               format, lints, docs, tests, generated-file drift, CLI runs
-#   tools/ci.sh real-data <dir>     download GLO-30 and BBBike New York into <dir> (kept as a
-#                                   cache) and cross-check against libtiff, libosmium, networkx
-#                                   and PROJ
+#   tools/ci.sh real-data <dir>     download GLO-30, BBBike New York and ESA WorldCover into
+#                                   <dir> (kept as a cache) and cross-check against libtiff,
+#                                   libosmium, networkx, PROJ and GDAL
 #
 # Run from the repository root. Every step must pass; the first failure stops the script.
 set -euo pipefail
@@ -82,6 +82,8 @@ check() {
     "$wc" osm --input fixtures/osm/areas_sample.osm.pbf --output "$tmp/area_roads.geoparquet"
     "$wc" bridges --splines "$tmp/area_roads.geoparquet" --areas "$tmp/areas" --output "$tmp/bridges.geoparquet" \
         --expect-over-water "Lake Bridge=800" --expect-over-water "Strait Bridge=800"
+    "$wc" landcover --input fixtures/landcover/kjfk_classes.tif --output "$tmp/landcover" --packages fixtures/packages \
+        --min-zoom 12 --max-zoom 14
 
     say "check passed"
 }
@@ -91,6 +93,8 @@ real_data() {
     mkdir -p "$dir"
     local glo="Copernicus_DSM_COG_10_N40_00_W074_00_DEM"
     local dem="$dir/$glo.tif" pbf="$dir/new-york.osm.pbf"
+    local wc_tile="ESA_WorldCover_10m_2021_v200_N39W075_Map"
+    local worldcover="$dir/$wc_tile.tif"
 
     say "download (skipped when cached)"
     [ -s "$dem" ] || fetch "$dem" "https://copernicus-dem-30m.s3.amazonaws.com/$glo/$glo.tif"
@@ -100,6 +104,9 @@ real_data() {
     [ -s "$pbf" ] || fetch "$pbf" \
         "https://download.bbbike.org/osm/bbbike/NewYork/NewYork.osm.pbf" \
         "https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf"
+
+    [ -s "$worldcover" ] || fetch "$worldcover" \
+        "https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/$wc_tile.tif"
 
     say "release builds"
     cargo build --release --locked -p nosim-compiler --bin world-compiler --example probe_dem
@@ -147,11 +154,17 @@ real_data() {
     "$wc" graph --input "$dir/kjfk.geoparquet" --output "$dir/graph_hybrid" --mode drive --simulate 1800 --demand 300 \
         --near-field -73.7781,40.6413,1500 --min-exit-ratio 0.95
 
+    say "land cover: ESA WorldCover over the KJFK package bounds vs GDAL"
+    "$wc" landcover --input "$worldcover" --output "$dir/landcover" --bbox "$bbox" --packages fixtures/packages \
+        --min-zoom 10 --max-zoom 16
+    python3 tools/check_landcover.py "$worldcover" "$dir/landcover" --bbox="$bbox"
+
     say "terrain patching on GLO-30 with real roads"
     "$wc" raster --input "$dem" --output "$dir/terrain" \
         --patch-runways fixtures/packages/org.contributor.infrastructure.kjfk/data/arinc_runways.parquet \
         --patch-roads "$dir/kjfk.geoparquet" --min-zoom 12 --max-zoom 13
-    rm -rf "$dir/terrain" "$dir"/graph_* "$dir/areas" "$dir/nyc.geoparquet" "$dir/bridges.geoparquet"
+    rm -rf "$dir/terrain" "$dir"/graph_* "$dir/areas" "$dir/nyc.geoparquet" "$dir/bridges.geoparquet" \
+        "$dir/landcover"
 
     say "real-data checks passed"
 }

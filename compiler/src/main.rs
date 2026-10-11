@@ -3,8 +3,8 @@
 use std::process::ExitCode;
 
 use nosim_compiler::{
-    Command, USAGE, parse_args, run_areas, run_arinc, run_bridges, run_graph, run_osm, run_raster, run_tiles,
-    run_validate, validate,
+    Command, USAGE, parse_args, run_areas, run_arinc, run_bridges, run_graph, run_landcover, run_osm, run_raster,
+    run_tiles, run_validate, validate,
 };
 
 fn main() -> ExitCode {
@@ -306,6 +306,48 @@ fn main() -> ExitCode {
                     }
                 }
                 if missed.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Landcover(args) => match run_landcover(&args) {
+            Ok(s) => {
+                let (c0, r0, w, h) = s.window;
+                println!(
+                    "{}: window {w} × {h} pixel(s) at column {c0}, row {r0}; {} unknown code pixel(s)",
+                    args.input.display(),
+                    s.unknown_pixels
+                );
+                let total: u64 = s.histogram.values().sum();
+                let names: std::collections::HashMap<u8, &str> =
+                    nosim_compiler::landcover::WORLDCOVER.iter().copied().collect();
+                for (code, n) in &s.histogram {
+                    println!(
+                        "  {code:>3} {:<24} {n:>10}  {:>5.1}%",
+                        names.get(code).copied().unwrap_or(if *code == 0 { "no data" } else { "unknown" }),
+                        100.0 * *n as f64 / total as f64
+                    );
+                }
+                let per_zoom: Vec<String> = s.tiles.iter().map(|(z, n)| format!("z{z}: {n}")).collect();
+                println!(
+                    "{}: class tiles ({}), {} mask tile(s), {} empty tile(s) skipped{}",
+                    args.output.display(),
+                    per_zoom.join(", "),
+                    s.mask_tiles,
+                    s.empty_tiles,
+                    if s.excluded_pixels > 0 {
+                        format!("; vegetation excluded at {} output pixel(s)", s.excluded_pixels)
+                    } else {
+                        String::new()
+                    }
+                );
+                if s.unknown_pixels > 0 {
+                    eprintln!("error: the raster holds codes that are not WorldCover classes");
+                    return ExitCode::FAILURE;
+                }
+                ExitCode::SUCCESS
             }
             Err(e) => {
                 eprintln!("error: {e}");

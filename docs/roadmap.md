@@ -10,10 +10,11 @@ proven, and what data it needs. Section numbers refer to
 
 Every box in the §1 pipeline has a first working version. The core covers §2–§8 as CPU
 reference math, and the C ABI exposes it to a C host. The compiler turns CIFP, GeoTIFF
-DEMs and OSM PBF into GeoParquet, MVT, Terrain-RGB, normal maps, quantized mesh, spline
-tables, polygon tables, bridges and a road graph. Readers have been checked against
+DEMs, OSM PBF and land-cover rasters into GeoParquet, MVT, Terrain-RGB, normal maps,
+quantized mesh, spline tables, polygon tables, bridges, land-cover masks and a road graph. Readers have been checked against
 independent decoders on real data: GLO-30 against libtiff, the New York OSM extract against
-libosmium (ways and areas), area sizes against PROJ, and the road graph against networkx.
+libosmium (ways and areas), area sizes against PROJ, ESA WorldCover against GDAL, and the
+road graph against networkx.
 
 Against the spec's verification blueprint (§10):
 
@@ -21,7 +22,7 @@ Against the spec's verification blueprint (§10):
 |---|---|---|
 | 1 Coordinate & terrain spine | Floating origin, sub-millimetre check, quantized-mesh terrain | 3D Tiles streaming client (engine-side) |
 | 2 Aeronautical & spline layer | ARINC 424 parse, extrusion, grade fit, RW31L ± 1 ft, OSM splines, road graph, heightfield patching (M1) | Complete on the compiler side |
-| 3 Procedural gaps & synthesis | Seed hash, Poisson levels, pier spacing, flatten falloff, OSM polygons and building heights, bridge detection and piers (M4) | WorldCover masks |
+| 3 Procedural gaps & synthesis | Seed hash, Poisson levels, pier spacing, flatten falloff, OSM polygons and building heights, bridge detection and piers (M4), WorldCover masks and Poisson-disk scattering (M5) | Complete on the compiler side |
 | 4 Environment & traffic | Calendar, phenology, IDM / MOBIL, CTM with general junctions, ORCA, routed demand, near-field vehicles (M2), pedestrian navigation graph (M3) | Buildings as ORCA obstacles, intersection control |
 | 5 Astronomy & translunar flight | VSOP87 / ELP 2000-82, BSC5, Hapke, LOD band policy | Translunar trajectory harness, atmosphere lookup tables |
 
@@ -176,7 +177,17 @@ mask streets, and tree canopy can still fool it.
   over water.
 - The validator checks polygon tables for closed rings and valid winding.
 
-## M5 — Land cover masks (Phase 3.3)
+## M5 — Land cover masks (Phase 3.3) — done
+
+Done as `world-compiler landcover` and `nosim::procedural::poisson_disk`; see the README.
+On the WorldCover 2021 tile over the KJFK package bounds, the class histogram matches
+GDAL's on the same window count for count, and every class tile pixel holds a valid class.
+Against GDAL's own warp, the class tiles agree on every pixel where they take the nearest
+source pixel, and on 98–99.6% of pixels where they take the majority class. The KJFK
+package's runway safety area removes vegetation from the masks.
+
+The §5 Perlin modulation of the masks (clearings, copses) belongs to the scattering pass
+and is not part of the tiles.
 
 **Deliverables**
 - Categorical raster support in `raster`: nearest or mode resampling, never interpolation,
