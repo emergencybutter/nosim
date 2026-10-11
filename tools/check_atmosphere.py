@@ -22,10 +22,15 @@ import argparse
 import json
 import math
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
-from scipy.integrate import quad
+from scipy.integrate import IntegrationWarning, quad
+
+# quad reports round-off near the ozone tent's corners; the result is still far inside the
+# tolerance the check applies.
+warnings.filterwarnings("ignore", category=IntegrationWarning)
 
 
 class Atmosphere:

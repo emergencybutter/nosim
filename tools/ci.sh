@@ -175,7 +175,7 @@ real_data() {
 
     say "atmosphere tables (reference sizes) vs quadrature, brute-force single scattering and Monte Carlo"
     "$wc" atmosphere --output "$dir/atmosphere"
-    python3 -W ignore::scipy.integrate.IntegrationWarning tools/check_atmosphere.py "$dir/atmosphere"
+    python3 tools/check_atmosphere.py "$dir/atmosphere"
 
     say "terrain patching on GLO-30 with real roads"
     "$wc" raster --input "$dem" --output "$dir/terrain" \
