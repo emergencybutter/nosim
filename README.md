@@ -270,6 +270,14 @@ needs no Parquet reader of its own:
   `nosim_traffic_edge_vehicles` reads it back.
 - **Tiles:** `nosim_tile_at`, `nosim_tile_bounds` and `nosim_tile_path` locate terrain-RGB,
   normal-map, quantized-mesh, land-cover and vector tiles in the compiler's output.
+  `nosim_tile_read_heights` decodes a Terrain-RGB tile to metres and `nosim_tile_read_bytes`
+  a land-cover class tile or density mask, so the client needs no PNG decoder either.
+- **Polygons:** `nosim_package_polygon_table_count` / `_path` list a package's
+  `content.polygons`, and `nosim_polygon_table_load`, `_get`, `_tag`, `_name`, `_ring` and
+  `_ring_points` read them (or a table from `world-compiler areas`): building heights and
+  every ring, outer or hole.
+- **Scattering:** `nosim_poisson_disk` is §5's Poisson-disk scatter thinned by a density grid
+  such as the tree mask.
 
 The C smoke test loads the KJFK package and resolves its spline table through the VFS. It
 builds the drive graph (18 nodes, 23 edges) and seeds half a vehicle near the end of every
@@ -277,6 +285,14 @@ edge, since nothing flows in inside the package bounds. After 60 s it prints the
 11.5 entered, 1.0000000000000002 exited, 10.499999999999998 on the network. The Rust test
 runs the same sequence through `nosim_compiler::graph::Traffic`, the code `graph --simulate`
 uses, and requires the three totals to match bit for bit.
+
+**Worlds for the client.** `tools/make_world.sh fixture` compiles the fixture DEM and land
+cover into `target/world/kjfk-fixture`, which the Unreal client draws by default.
+`tools/make_world.sh real <cache-dir>` downloads GLO-30, BBBike's New York extract,
+WorldCover 2021 and the FAA's current CIFP. It writes `target/world/kjfk-real`: runways,
+OSM roads and areas, terrain patched under them, and land cover. Point the client's
+*World Dir* at it, or start it with `-NosimWorld=<dir>`. On cycle 2610 that is 4 runways,
+22,271 splines, 54,747 buildings in the terrain area and a drive graph of 27,483 edges.
 
 Linking the compiler's tables in brings Arrow and Parquet with them: the release static
 library is about 100 MB and the shared library 11 MB.
@@ -663,10 +679,15 @@ every package directory under `<dir>` is mounted through the §3 VFS and an airp
 a package's `arinc_overrides` takes that package's rows instead — the override file uses the
 same table, so a compiled output can be edited and fed back as a package.
 
-The FAA CIFP download is free but behind a click-through, so `fixtures/cifp/kjfk_sample.txt`
-is a synthetic file in the real column layout (one `PA` record, eight `PG` records whose
-reciprocal thresholds were placed geometrically, plus a continuation and a non-runway record
-the compiler must skip). Its headings follow the spec's worked example (04R at 044.3° true),
+The first run on the FAA's real CIFP (cycle 2610) found the decoder reading the wrong columns
+from 61 on: there ARINC 424-18 puts the ellipsoid height (tenths of a metre), so KJFK's
+thresholds came out at −28 ft and its runways 46 ft wide. Elevation, displaced threshold,
+crossing height, width and stopway now come from columns 67–71, 72–75, 76–77, 78–80 and
+87–90, and a real KJFK record is a test case. The synthetic sample moved with them.
+
+`fixtures/cifp/kjfk_sample.txt` is a synthetic file in the real column layout (one `PA`
+record, eight `PG` records whose reciprocal thresholds were placed geometrically, plus a
+continuation and a non-runway record the compiler must skip). Its headings follow the spec's worked example (04R at 044.3° true),
 not real JFK, where 4/22 lies at about 31° true.
 
 ## Atmosphere tables

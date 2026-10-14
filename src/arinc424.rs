@@ -1,17 +1,18 @@
 //! ARINC 424 runway (PG) record decoding and runway pavement geometry (spec §4).
 //!
-//! Fixed-width column layout (1-based, 132-character records):
+//! Fixed-width column layout (1-based, 132-character records), as ARINC 424-18 and the FAA's
+//! CIFP lay it out:
 //!
 //! | Columns | Field | Columns | Field |
 //! |---|---|---|---|
 //! | 1 | Record type (`S`) | 52–56 | Runway gradient (signed, thousandths of a percent) |
-//! | 2–4 | Customer / area code | 61–65 | Landing threshold elevation (ft, signed) |
-//! | 5 | Section code (`P`) | 66–69 | Displaced threshold distance (ft) |
-//! | 7–10 | Airport ICAO identifier | 70–71 | Threshold crossing height (ft) |
-//! | 11–12 | ICAO region code | 72–74 | Runway width (ft) |
-//! | 13 | Subsection code (`G`) | 81–85 | Stopway (ft) |
-//! | 14–18 | Runway identifier (`RW04R`) | 102–123 | Runway description |
-//! | 23–27 | Runway length (ft) | | |
+//! | 2–4 | Customer / area code | 61–66 | Ellipsoid height (tenths of a metre; not read) |
+//! | 5 | Section code (`P`) | 67–71 | Landing threshold elevation (ft, signed) |
+//! | 7–10 | Airport ICAO identifier | 72–75 | Displaced threshold distance (ft) |
+//! | 11–12 | ICAO region code | 76–77 | Threshold crossing height (ft) |
+//! | 13 | Subsection code (`G`) | 78–80 | Runway width (ft) |
+//! | 14–18 | Runway identifier (`RW04R`) | 87–90 | Stopway (ft) |
+//! | 23–27 | Runway length (ft) | 102–123 | Runway description |
 //! | 28–31 | Bearing (tenths of a degree; `DDDT` marks a true bearing) | | |
 //! | 33–41 | Latitude (`N`/`S` `DDMMSSss`) | | |
 //! | 42–51 | Longitude (`E`/`W` `DDDMMSSss`) | | |
@@ -189,11 +190,11 @@ pub fn parse_runway_record(line: &str) -> Result<RunwayRecord, ParseError> {
     r.lat_deg = parse_latitude(col(line, 33, 41)).ok_or(ParseError::BadField("latitude"))?;
     r.lon_deg = parse_longitude(col(line, 42, 51)).ok_or(ParseError::BadField("longitude"))?;
     r.gradient_pct = parse_signed(col(line, 52, 56)).map(|g| g as f64 / 1000.0);
-    r.threshold_elev_ft = parse_signed(col(line, 61, 65)).ok_or(ParseError::BadField("threshold elevation"))? as f64;
-    r.displaced_threshold_ft = parse_uint(col(line, 66, 69)).unwrap_or(0) as f64;
-    r.threshold_crossing_height_ft = parse_uint(col(line, 70, 71)).map(|v| v as f64);
-    r.width_ft = parse_uint(col(line, 72, 74)).ok_or(ParseError::BadField("runway width"))? as f64;
-    r.stopway_ft = parse_uint(col(line, 81, 85)).map(|v| v as f64);
+    r.threshold_elev_ft = parse_signed(col(line, 67, 71)).ok_or(ParseError::BadField("threshold elevation"))? as f64;
+    r.displaced_threshold_ft = parse_uint(col(line, 72, 75)).unwrap_or(0) as f64;
+    r.threshold_crossing_height_ft = parse_uint(col(line, 76, 77)).map(|v| v as f64);
+    r.width_ft = parse_uint(col(line, 78, 80)).ok_or(ParseError::BadField("runway width"))? as f64;
+    r.stopway_ft = parse_uint(col(line, 87, 90)).map(|v| v as f64);
     r.description = col(line, 102, 123).trim().to_owned();
     Ok(r)
 }
@@ -342,11 +343,29 @@ mod tests {
         put(33, f.lat);
         put(42, f.lon);
         put(52, f.gradient);
-        put(61, f.elev);
-        put(66, f.disp);
-        put(72, f.width);
+        put(67, f.elev);
+        put(72, f.disp);
+        put(78, f.width);
         put(102, f.description);
         String::from_utf8(r).unwrap()
+    }
+
+    /// A record from the FAA's CIFP (cycle 2610, public domain): the ellipsoid height in
+    /// columns 61–66 must not be read as the threshold elevation, which follows it.
+    #[test]
+    fn faa_cifp_record() {
+        let line = format!(
+            "{:<132}",
+            "SUSAP KJFKK6GRW04L   0120790440 N40372318W073470505         -0028300012046057200IIHIQ1"
+        );
+        let r = parse_runway_record(&line).unwrap();
+        assert_eq!(r.runway_ident, "RW04L");
+        assert_eq!((r.length_ft, r.bearing_deg), (12079.0, 44.0));
+        assert_eq!(r.threshold_elev_ft, 12.0);
+        assert_eq!(r.displaced_threshold_ft, 460.0);
+        assert_eq!(r.threshold_crossing_height_ft, Some(57.0));
+        assert_eq!(r.width_ft, 200.0);
+        assert_eq!(r.stopway_ft, None);
     }
 
     #[test]
@@ -423,7 +442,7 @@ mod tests {
         not_pg[12] = b'A';
         assert_eq!(parse_runway_record(&String::from_utf8(not_pg).unwrap()), Err(ParseError::NotRunwayRecord));
         let mut bad_width = line.into_bytes();
-        bad_width[71..74].copy_from_slice(b"   ");
+        bad_width[77..80].copy_from_slice(b"   ");
         assert_eq!(
             parse_runway_record(&String::from_utf8(bad_width).unwrap()),
             Err(ParseError::BadField("runway width"))

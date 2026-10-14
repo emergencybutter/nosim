@@ -1,0 +1,11 @@
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.vs/
+*.sln
+*.slnx
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
+Plugins/Nosim/Source/ThirdParty/NosimLibrary/include/
+Plugins/Nosim/Source/ThirdParty/NosimLibrary/lib/

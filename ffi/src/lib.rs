@@ -2325,6 +2325,390 @@ pub unsafe extern "C" fn nosim_tile_path(
     unsafe { write_cstr(buf, cap, &path) }
 }
 
+/// Number of polygon tables (`content.polygons`) a package lists (0 for NULL).
+///
+/// # Safety
+/// `h` must be NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_package_polygon_table_count(h: *const NosimPackage) -> usize {
+    // SAFETY: documented contract.
+    unsafe { opt_ref(h) }.map_or(0, |p| p.inner.manifest().content.polygons.len())
+}
+
+/// Absolute path of the package's polygon table `i`. Returns the size needed including the
+/// NUL, 0 for a bad handle or index.
+///
+/// # Safety
+/// `h` must be NULL or live; `buf` must be NULL or point to `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_package_polygon_table_path(
+    h: *const NosimPackage,
+    i: usize,
+    buf: *mut c_char,
+    cap: usize,
+) -> usize {
+    // SAFETY: documented contract.
+    let Some(p) = (unsafe { opt_ref(h) }) else { return 0 };
+    match p.inner.manifest().content.polygons.get(i) {
+        // SAFETY: documented contract.
+        Some(rel) => unsafe { write_cstr(buf, cap, &p.inner.root().join(rel).to_string_lossy()) },
+        None => 0,
+    }
+}
+
+/// A polygon table (`content.polygons`, or a table written by `world-compiler areas`).
+pub struct NosimPolygonTable {
+    rows: Vec<nosim_compiler::osm::areas::AreaRow>,
+}
+
+/// One area's attributes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimArea {
+    /// libosmium area id (2 × way id, or 2 × relation id + 1).
+    pub area_id: i64,
+    /// OSM id of the way or relation.
+    pub osm_id: i64,
+    /// True for a row of the building table, which carries the heights below.
+    pub building: bool,
+    /// Roof-top height above ground, metres (0 when not a building).
+    pub height_m: f64,
+    /// Height of the bottom above ground, metres.
+    pub min_height_m: f64,
+    /// Area on the WGS84 ellipsoid, m².
+    pub area_m2: f64,
+    /// Polygons (outer rings).
+    pub polygon_count: usize,
+    /// Rings over all polygons, outers and holes.
+    pub ring_count: usize,
+}
+
+/// One ring of an area.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimRing {
+    /// Polygon the ring belongs to.
+    pub polygon: usize,
+    /// True for the polygon's outer ring (counter-clockwise), false for a hole (clockwise).
+    pub outer: bool,
+    /// Points; the ring is open (the first point is not repeated).
+    pub point_count: usize,
+}
+
+/// A ring as found: its polygon, whether it is the outer ring, and its points.
+type RingRef<'a> = (usize, bool, &'a [(f64, f64)]);
+
+/// Ring `k` of an area, counting each polygon's outer ring and then its holes in turn.
+fn area_ring(r: &nosim_compiler::osm::areas::AreaRow, k: usize) -> Option<RingRef<'_>> {
+    let mut k = k;
+    for (p, rings) in r.polygons.iter().enumerate() {
+        if k < rings.len() {
+            return Some((p, k == 0, &rings[k]));
+        }
+        k -= rings.len();
+    }
+    None
+}
+
+/// Loads a polygon table (GeoParquet). NULL on failure (see `nosim_last_error`).
+///
+/// # Safety
+/// `path` must be NULL or a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_polygon_table_load(path: *const c_char) -> *mut NosimPolygonTable {
+    // SAFETY: documented contract.
+    let Ok(path) = (unsafe { read_cstr(path) }) else { return ptr::null_mut() };
+    match nosim_compiler::osm::areas::read_polygons(std::path::Path::new(path)) {
+        Ok(rows) => Box::into_raw(Box::new(NosimPolygonTable { rows })),
+        Err(e) => {
+            fail(NosimStatus::Io, e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Releases a polygon table. NULL is ignored.
+///
+/// # Safety
+/// `t` must be NULL or a live handle, freed once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_polygon_table_free(t: *mut NosimPolygonTable) {
+    if !t.is_null() {
+        // SAFETY: handle came from Box::into_raw.
+        drop(unsafe { Box::from_raw(t) });
+    }
+}
+
+/// Number of areas (0 for NULL).
+///
+/// # Safety
+/// `t` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_polygon_table_count(t: *const NosimPolygonTable) -> usize {
+    // SAFETY: documented contract.
+    unsafe { opt_ref(t) }.map_or(0, |t| t.rows.len())
+}
+
+/// Attributes of area `i`.
+///
+/// # Safety
+/// `t` must be NULL or live; `out` must be NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_polygon_table_get(
+    t: *const NosimPolygonTable,
+    i: usize,
+    out: *mut NosimArea,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let (Some(t), Some(out)) = (unsafe { opt_ref(t) }, unsafe { opt_mut(out) }) else {
+        return fail(NosimStatus::NullPointer, "table or out is NULL");
+    };
+    let Some(r) = t.rows.get(i) else { return fail(NosimStatus::InvalidArgument, "area index out of range") };
+    *out = NosimArea {
+        area_id: r.area_id,
+        osm_id: r.osm_id,
+        building: r.building.is_some(),
+        height_m: r.building.as_ref().map_or(0.0, |b| b.height_m),
+        min_height_m: r.building.as_ref().map_or(0.0, |b| b.min_height_m),
+        area_m2: r.area_m2,
+        polygon_count: r.polygons.len(),
+        ring_count: r.polygons.iter().map(Vec::len).sum(),
+    };
+    NosimStatus::Ok
+}
+
+/// Deciding tag of area `i` as `key=value`, e.g. `building=terminal` or `natural=water`;
+/// returns the size needed including the NUL, 0 for a bad handle or index.
+///
+/// # Safety
+/// `t` must be NULL or live; `buf` must be NULL or point to `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_polygon_table_tag(
+    t: *const NosimPolygonTable,
+    i: usize,
+    buf: *mut c_char,
+    cap: usize,
+) -> usize {
+    // SAFETY: documented contract.
+    match unsafe { opt_ref(t) }.and_then(|t| t.rows.get(i)) {
+        // SAFETY: documented contract.
+        Some(r) => unsafe { write_cstr(buf, cap, &format!("{}={}", r.key, r.value)) },
+        None => 0,
+    }
+}
+
+/// `name` of area `i`; returns the size needed including the NUL, 0 when it has none.
+///
+/// # Safety
+/// `t` must be NULL or live; `buf` must be NULL or point to `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_polygon_table_name(
+    t: *const NosimPolygonTable,
+    i: usize,
+    buf: *mut c_char,
+    cap: usize,
+) -> usize {
+    // SAFETY: documented contract.
+    match unsafe { opt_ref(t) }.and_then(|t| t.rows.get(i)).and_then(|r| r.name.as_deref()) {
+        // SAFETY: documented contract.
+        Some(name) => unsafe { write_cstr(buf, cap, name) },
+        None => 0,
+    }
+}
+
+/// Ring `k` of area `i`, counting each polygon's outer ring and then its holes in turn.
+///
+/// # Safety
+/// `t` must be NULL or live; `out` must be NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_polygon_table_ring(
+    t: *const NosimPolygonTable,
+    i: usize,
+    k: usize,
+    out: *mut NosimRing,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let (Some(t), Some(out)) = (unsafe { opt_ref(t) }, unsafe { opt_mut(out) }) else {
+        return fail(NosimStatus::NullPointer, "table or out is NULL");
+    };
+    let Some((polygon, outer, ring)) = t.rows.get(i).and_then(|r| area_ring(r, k)) else {
+        return fail(NosimStatus::InvalidArgument, "area or ring index out of range");
+    };
+    *out = NosimRing { polygon, outer, point_count: ring.len() };
+    NosimStatus::Ok
+}
+
+/// Points of ring `k` of area `i` as `lon, lat` pairs (degrees) into `lonlat` (room for
+/// `capacity` points). Returns the point count; at most `capacity` are written.
+///
+/// # Safety
+/// `t` must be NULL or live; `lonlat` must be NULL or point to `2 · capacity` doubles.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_polygon_table_ring_points(
+    t: *const NosimPolygonTable,
+    i: usize,
+    k: usize,
+    lonlat: *mut f64,
+    capacity: usize,
+) -> usize {
+    // SAFETY: documented contract.
+    let Some((_, _, ring)) = (unsafe { opt_ref(t) }).and_then(|t| t.rows.get(i)).and_then(|r| area_ring(r, k)) else {
+        return 0;
+    };
+    if !lonlat.is_null() {
+        for (n, &(lon, lat)) in ring.iter().take(capacity).enumerate() {
+            // SAFETY: n < capacity and the caller provides 2 · capacity doubles.
+            unsafe {
+                *lonlat.add(2 * n) = lon;
+                *lonlat.add(2 * n + 1) = lat;
+            }
+        }
+    }
+    ring.len()
+}
+
+/// Pixel dimensions of a decoded tile.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NosimTileSize {
+    /// Pixels across.
+    pub width: u32,
+    /// Pixels down (row 0 is the tile's north edge).
+    pub height: u32,
+}
+
+/// # Safety
+/// `path` must be NULL or a NUL-terminated string.
+unsafe fn read_tile_file(path: *const c_char) -> Result<Vec<u8>, NosimStatus> {
+    // SAFETY: documented contract of the callers.
+    let path = unsafe { read_cstr(path) }?;
+    std::fs::read(path).map_err(|e| fail(NosimStatus::Io, format!("{path}: {e}")))
+}
+
+/// Decodes a Terrain-RGB tile (`terrain-rgb/z/x/y.png`) into heights in metres, row-major
+/// from the north-west corner. `size` receives the dimensions. With `out` NULL or `capacity`
+/// below `width · height`, only `size` is filled and `BufferTooSmall` returned, so a first
+/// call can size the buffer. Pixels the DEM did not cover hold 0 m, as the tile encodes them.
+///
+/// # Safety
+/// `path` must be NULL or a NUL-terminated string; `out` must be NULL or point to `capacity`
+/// floats; `size` must be NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_tile_read_heights(
+    path: *const c_char,
+    out: *mut f32,
+    capacity: usize,
+    size: *mut NosimTileSize,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let Some(size) = (unsafe { opt_mut(size) }) else { return fail(NosimStatus::NullPointer, "size is NULL") };
+    // SAFETY: documented contract.
+    let bytes = match unsafe { read_tile_file(path) } {
+        Ok(b) => b,
+        Err(s) => return s,
+    };
+    let img = match nosim_compiler::raster::png::decode_rgb(&bytes) {
+        Ok(img) => img,
+        Err(e) => return fail(NosimStatus::Parse, e),
+    };
+    *size = NosimTileSize { width: img.width, height: img.height };
+    let n = img.width as usize * img.height as usize;
+    if out.is_null() || capacity < n {
+        return fail(NosimStatus::BufferTooSmall, format!("{n} heights needed"));
+    }
+    // SAFETY: n <= capacity floats, per the contract.
+    let dst = unsafe { std::slice::from_raw_parts_mut(out, n) };
+    for (d, px) in dst.iter_mut().zip(img.data.chunks_exact(3)) {
+        *d = nosim_compiler::raster::terrain_rgb::decode_height([px[0], px[1], px[2]]) as f32;
+    }
+    NosimStatus::Ok
+}
+
+/// Decodes an 8-bit greyscale tile, a land-cover class tile (`classes/z/x/y.png`, ESA
+/// WorldCover codes, 0 = no data) or a density mask (`masks/<name>/z/x/y.png`, 0–255), into
+/// bytes, row-major from the north-west corner. Sizing works as in `nosim_tile_read_heights`.
+///
+/// # Safety
+/// `path` must be NULL or a NUL-terminated string; `out` must be NULL or point to `capacity`
+/// bytes; `size` must be NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_tile_read_bytes(
+    path: *const c_char,
+    out: *mut u8,
+    capacity: usize,
+    size: *mut NosimTileSize,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let Some(size) = (unsafe { opt_mut(size) }) else { return fail(NosimStatus::NullPointer, "size is NULL") };
+    // SAFETY: documented contract.
+    let bytes = match unsafe { read_tile_file(path) } {
+        Ok(b) => b,
+        Err(s) => return s,
+    };
+    let img = match nosim_compiler::raster::png::decode_gray(&bytes) {
+        Ok(img) => img,
+        Err(e) => return fail(NosimStatus::Parse, e),
+    };
+    *size = NosimTileSize { width: img.width, height: img.height };
+    let n = img.data.len();
+    if out.is_null() || capacity < n {
+        return fail(NosimStatus::BufferTooSmall, format!("{n} bytes needed"));
+    }
+    // SAFETY: n <= capacity bytes, per the contract.
+    unsafe { ptr::copy_nonoverlapping(img.data.as_ptr(), out, n) };
+    NosimStatus::Ok
+}
+
+/// §5 scattering: Poisson-disk points (Bridson) in `[0, width) × [0, height)` metres, no two
+/// closer than `radius`, each kept with the probability `density` gives at its position.
+/// `density` is a `density_width × density_height` grid of 0–255 values (a land-cover mask,
+/// row 0 at `y = 0`) stretched over the area and read at the nearest cell; NULL keeps every
+/// point. Writes up to `capacity` points as `x, y` pairs and returns how many there are; the
+/// same seed gives the same points.
+///
+/// # Safety
+/// `density` must be NULL or point to `density_width · density_height` bytes; `xy` must be
+/// NULL or point to `2 · capacity` doubles.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nosim_poisson_disk(
+    width: f64,
+    height: f64,
+    radius: f64,
+    seed: u64,
+    density: *const u8,
+    density_width: u32,
+    density_height: u32,
+    xy: *mut f64,
+    capacity: usize,
+) -> usize {
+    let (dw, dh) = (density_width as usize, density_height as usize);
+    let grid = if density.is_null() || dw == 0 || dh == 0 {
+        None
+    } else {
+        // SAFETY: documented contract.
+        unsafe { slice_in(density, dw * dh) }
+    };
+    let points = procedural::poisson_disk(width, height, radius, seed, |x, y| match grid {
+        None => 1.0,
+        Some(g) => {
+            let i = ((x / width * dw as f64) as usize).min(dw - 1);
+            let j = ((y / height * dh as f64) as usize).min(dh - 1);
+            f64::from(g[j * dw + i]) / 255.0
+        }
+    });
+    if !xy.is_null() {
+        for (n, &(x, y)) in points.iter().take(capacity).enumerate() {
+            // SAFETY: n < capacity and the caller provides 2 · capacity doubles.
+            unsafe {
+                *xy.add(2 * n) = x;
+                *xy.add(2 * n + 1) = y;
+            }
+        }
+    }
+    points.len()
+}
+
 // ---- Time scales -----------------------------------------------------------------------
 
 /// One instant on every scale the simulator needs.

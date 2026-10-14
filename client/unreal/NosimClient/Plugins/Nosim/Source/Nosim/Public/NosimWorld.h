@@ -1,0 +1,194 @@
+#pragma once
+
+#include "GameFramework/Actor.h"
+#include "NosimModule.h"
+#include "NosimWorld.generated.h"
+
+class ADirectionalLight;
+class UInstancedStaticMeshComponent;
+class UMaterialInstanceDynamic;
+class UProceduralMeshComponent;
+
+/** A drive-graph edge as drawn: its polyline in local centimetres, and animation state. */
+struct FNosimEdgeVis
+{
+	TArray<FVector> Points;
+	TArray<double> Stations; // metres from the first point
+	double LengthM = 0;
+	double SpeedMps = 0;
+	uint32 Lanes = 1;
+	double LateralCm = 0; // offset to the right of travel
+	double Phase = 0;
+};
+
+/**
+ * One scenery package drawn through the nosim C ABI.
+ *
+ * The package is mounted in a VFS, its spline table resolved and read, and its runways built
+ * from CIFP records by nosim's ARINC 424 decoder and extruder. Positions go geodetic → ECEF →
+ * ENU about the package centre (nosim), then to Unreal as X east, Y south, Z up, centimetres,
+ * with the Earth's curvature taken out so the ground is a plane. The drive graph runs nosim's
+ * routed CTM; vehicles are drawn per edge from its counts, moving at the speed of the urban
+ * fundamental diagram for the edge's density. The sun follows nosim's ephemeris.
+ */
+UCLASS()
+class NOSIM_API ANosimWorld : public AActor
+{
+	GENERATED_BODY()
+
+public:
+	ANosimWorld();
+
+	/** Scenery package directory. Empty: the repository's KJFK fixture. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Data")
+	FString PackageDir;
+
+	/** FAA CIFP file with the package's runway records. Empty: the world's `cifp.txt`, else the repository's KJFK sample. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Data")
+	FString CifpPath;
+
+	/**
+	 * A compiled world (tools/make_world.sh): `terrain/` and `landcover/` from the compiler, and
+	 * optionally `splines.geoparquet`, `areas/buildings.geoparquet` and `cifp.txt`, which then
+	 * replace the package's own tables. Empty: <repo>/target/world/kjfk-fixture when it exists.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Data")
+	FString WorldDir;
+
+	/** Terrain reaches this far beyond the package bounds, where the tiles cover it. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Terrain", meta = (ClampMin = "0"))
+	float TerrainMarginM = 1500.f;
+
+	/** Spacing of the terrain mesh's vertices. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Terrain", meta = (ClampMin = "5"))
+	float TerrainSpacingM = 20.f;
+
+	/** Scatter trees over the land cover's tree mask. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Terrain")
+	bool bDrawTrees = true;
+
+	/** Least distance between two trees (Poisson-disk radius). */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Terrain", meta = (ClampMin = "3", EditCondition = "bDrawTrees"))
+	float TreeSpacingM = 9.f;
+
+	/** Build the geometry in the editor too, not only in play. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Data")
+	bool bBuildInEditor = true;
+
+	/** Simulated seconds of traffic per real second. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Traffic", meta = (ClampMin = "0"))
+	float TrafficTimeScale = 1.f;
+
+	/** Vehicles injected at the network's entry edges, per simulated minute. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Traffic", meta = (ClampMin = "0"))
+	float VehiclesPerMinute = 40.f;
+
+	/** Start the sun at the wall clock instead of StartUtc. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Sun")
+	bool bUseWallClock = false;
+
+	/** Sun clock at the start of play (UTC). The default is mid-morning in New York today. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Sun", meta = (EditCondition = "!bUseWallClock"))
+	FDateTime StartUtc;
+
+	/** Simulated seconds of sun clock per real second; 60 moves the sun an hour a minute. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Sun")
+	float SunTimeScale = 60.f;
+
+	/** Spawn a sun, sky atmosphere, sky light and fog when the level has none. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Sun")
+	bool bSpawnEnvironment = true;
+
+	/** Reloads the package and rebuilds everything. */
+	UFUNCTION(CallInEditor, Category = "Nosim")
+	void Rebuild();
+
+	virtual void OnConstruction(const FTransform& Transform) override;
+	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type Reason) override;
+	virtual void BeginDestroy() override;
+	virtual void Tick(float DeltaSeconds) override;
+
+private:
+	void BuildScene();
+	void ReleaseNative();
+	void SpawnEnvironment();
+	void UpdateTraffic(float DeltaSeconds);
+	void UpdateSun();
+	void PlaceCamera();
+	void ShowStatus() const;
+
+	/** ECEF metres → local centimetres, curvature removed. */
+	FVector ToLocal(const NosimVec3& Ecef) const;
+	/** Longitude / latitude on the ellipsoid → local centimetres (Z is not meaningful). */
+	FVector LonLatToLocal(double Lon, double Lat) const;
+	/** Longitude / latitude / height → local centimetres, curvature removed. */
+	FVector GeoToLocal(double Lon, double Lat, double HeightM) const;
+	/** A unit ECEF direction → a unit local direction. */
+	FVector DirectionToLocal(const NosimVec3& EcefDirection) const;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UProceduralMeshComponent> Scenery;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UProceduralMeshComponent> Terrain;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UProceduralMeshComponent> Models;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UInstancedStaticMeshComponent> Trees;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UInstancedStaticMeshComponent> VehiclesFree;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UInstancedStaticMeshComponent> VehiclesSlow;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UInstancedStaticMeshComponent> VehiclesJammed;
+
+	UPROPERTY(Transient)
+	TObjectPtr<ADirectionalLight> Sun;
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UMaterialInstanceDynamic>> Materials;
+
+	NosimPackage* Package = nullptr;
+	NosimVfs* Vfs = nullptr;
+	NosimSplineTable* Splines = nullptr;
+	NosimGraph* Graph = nullptr;
+	NosimTraffic* Traffic = nullptr;
+
+	NosimGeodetic Anchor = {0, 0, 0};
+	NosimVec3 AnchorEcef = {0, 0, 0};
+	double GroundZ = 0; // metres, local
+	double ViewTargetZ = 0; // ground at the centre, metres
+	FString PackageId;
+	int32 RunwayCount = 0;
+	int32 SplineCount = 0;
+	int32 BuildingCount = 0;
+	int32 ModelCount = 0;
+	int32 TreeCount = 0;
+	int32 TerrainTiles = 0;
+	int32 LandcoverTiles = 0;
+	FString WorldName;
+
+	TArray<FNosimEdgeVis> Edges;
+	TArray<int32> EntryEdges;
+	int32 EntryCursor = 0;
+	double InjectDebt = 0;
+	double TrafficDebt = 0;
+	double TrafficDt = 1;
+	NosimTrafficTotals Totals = {0, 0, 0, 0};
+
+	FDateTime SunUtc;
+	double SunAzimuthDeg = 0;
+	double SunElevationDeg = 0;
+	double MoonAzimuthDeg = 0;
+	double MoonElevationDeg = 0;
+	bool bCameraPlaced = false;
+	float PlayedSeconds = 0.f;
+	bool bShotTaken = false;
+	FString Problem;
+};

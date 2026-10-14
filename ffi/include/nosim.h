@@ -206,6 +206,11 @@ typedef struct NosimOrcaSim NosimOrcaSim;
 typedef struct NosimPackage NosimPackage;
 
 /**
+ * A polygon table (`content.polygons`, or a table written by `world-compiler areas`).
+ */
+typedef struct NosimPolygonTable NosimPolygonTable;
+
+/**
  * A spline table (`content.spline_networks`, or the output of `world-compiler osm`).
  */
 typedef struct NosimSplineTable NosimSplineTable;
@@ -928,6 +933,76 @@ typedef struct NosimTile {
    */
   uint32_t y;
 } NosimTile;
+
+/**
+ * One area's attributes.
+ */
+typedef struct NosimArea {
+  /**
+   * libosmium area id (2 × way id, or 2 × relation id + 1).
+   */
+  int64_t area_id;
+  /**
+   * OSM id of the way or relation.
+   */
+  int64_t osm_id;
+  /**
+   * True for a row of the building table, which carries the heights below.
+   */
+  bool building;
+  /**
+   * Roof-top height above ground, metres (0 when not a building).
+   */
+  double height_m;
+  /**
+   * Height of the bottom above ground, metres.
+   */
+  double min_height_m;
+  /**
+   * Area on the WGS84 ellipsoid, m².
+   */
+  double area_m2;
+  /**
+   * Polygons (outer rings).
+   */
+  size_t polygon_count;
+  /**
+   * Rings over all polygons, outers and holes.
+   */
+  size_t ring_count;
+} NosimArea;
+
+/**
+ * One ring of an area.
+ */
+typedef struct NosimRing {
+  /**
+   * Polygon the ring belongs to.
+   */
+  size_t polygon;
+  /**
+   * True for the polygon's outer ring (counter-clockwise), false for a hole (clockwise).
+   */
+  bool outer;
+  /**
+   * Points; the ring is open (the first point is not repeated).
+   */
+  size_t point_count;
+} NosimRing;
+
+/**
+ * Pixel dimensions of a decoded tile.
+ */
+typedef struct NosimTileSize {
+  /**
+   * Pixels across.
+   */
+  uint32_t width;
+  /**
+   * Pixels down (row 0 is the tile's north edge).
+   */
+  uint32_t height;
+} NosimTileSize;
 
 /**
  * One instant on every scale the simulator needs.
@@ -1922,6 +1997,152 @@ size_t nosim_tile_path(enum NosimTileLayer layer,
                        struct NosimTile tile,
                        char *buf,
                        size_t cap);
+
+/**
+ * Number of polygon tables (`content.polygons`) a package lists (0 for NULL).
+ *
+ * # Safety
+ * `h` must be NULL or a live handle.
+ */
+size_t nosim_package_polygon_table_count(const struct NosimPackage *h);
+
+/**
+ * Absolute path of the package's polygon table `i`. Returns the size needed including the
+ * NUL, 0 for a bad handle or index.
+ *
+ * # Safety
+ * `h` must be NULL or live; `buf` must be NULL or point to `cap` bytes.
+ */
+size_t nosim_package_polygon_table_path(const struct NosimPackage *h,
+                                        size_t i,
+                                        char *buf,
+                                        size_t cap);
+
+/**
+ * Loads a polygon table (GeoParquet). NULL on failure (see `nosim_last_error`).
+ *
+ * # Safety
+ * `path` must be NULL or a NUL-terminated string.
+ */
+struct NosimPolygonTable *nosim_polygon_table_load(const char *path);
+
+/**
+ * Releases a polygon table. NULL is ignored.
+ *
+ * # Safety
+ * `t` must be NULL or a live handle, freed once.
+ */
+void nosim_polygon_table_free(struct NosimPolygonTable *t);
+
+/**
+ * Number of areas (0 for NULL).
+ *
+ * # Safety
+ * `t` must be NULL or live.
+ */
+size_t nosim_polygon_table_count(const struct NosimPolygonTable *t);
+
+/**
+ * Attributes of area `i`.
+ *
+ * # Safety
+ * `t` must be NULL or live; `out` must be NULL or writable.
+ */
+enum NosimStatus nosim_polygon_table_get(const struct NosimPolygonTable *t,
+                                         size_t i,
+                                         struct NosimArea *out);
+
+/**
+ * Deciding tag of area `i` as `key=value`, e.g. `building=terminal` or `natural=water`;
+ * returns the size needed including the NUL, 0 for a bad handle or index.
+ *
+ * # Safety
+ * `t` must be NULL or live; `buf` must be NULL or point to `cap` bytes.
+ */
+size_t nosim_polygon_table_tag(const struct NosimPolygonTable *t, size_t i, char *buf, size_t cap);
+
+/**
+ * `name` of area `i`; returns the size needed including the NUL, 0 when it has none.
+ *
+ * # Safety
+ * `t` must be NULL or live; `buf` must be NULL or point to `cap` bytes.
+ */
+size_t nosim_polygon_table_name(const struct NosimPolygonTable *t, size_t i, char *buf, size_t cap);
+
+/**
+ * Ring `k` of area `i`, counting each polygon's outer ring and then its holes in turn.
+ *
+ * # Safety
+ * `t` must be NULL or live; `out` must be NULL or writable.
+ */
+enum NosimStatus nosim_polygon_table_ring(const struct NosimPolygonTable *t,
+                                          size_t i,
+                                          size_t k,
+                                          struct NosimRing *out);
+
+/**
+ * Points of ring `k` of area `i` as `lon, lat` pairs (degrees) into `lonlat` (room for
+ * `capacity` points). Returns the point count; at most `capacity` are written.
+ *
+ * # Safety
+ * `t` must be NULL or live; `lonlat` must be NULL or point to `2 · capacity` doubles.
+ */
+size_t nosim_polygon_table_ring_points(const struct NosimPolygonTable *t,
+                                       size_t i,
+                                       size_t k,
+                                       double *lonlat,
+                                       size_t capacity);
+
+/**
+ * Decodes a Terrain-RGB tile (`terrain-rgb/z/x/y.png`) into heights in metres, row-major
+ * from the north-west corner. `size` receives the dimensions. With `out` NULL or `capacity`
+ * below `width · height`, only `size` is filled and `BufferTooSmall` returned, so a first
+ * call can size the buffer. Pixels the DEM did not cover hold 0 m, as the tile encodes them.
+ *
+ * # Safety
+ * `path` must be NULL or a NUL-terminated string; `out` must be NULL or point to `capacity`
+ * floats; `size` must be NULL or writable.
+ */
+enum NosimStatus nosim_tile_read_heights(const char *path,
+                                         float *out,
+                                         size_t capacity,
+                                         struct NosimTileSize *size);
+
+/**
+ * Decodes an 8-bit greyscale tile, a land-cover class tile (`classes/z/x/y.png`, ESA
+ * WorldCover codes, 0 = no data) or a density mask (`masks/<name>/z/x/y.png`, 0–255), into
+ * bytes, row-major from the north-west corner. Sizing works as in `nosim_tile_read_heights`.
+ *
+ * # Safety
+ * `path` must be NULL or a NUL-terminated string; `out` must be NULL or point to `capacity`
+ * bytes; `size` must be NULL or writable.
+ */
+enum NosimStatus nosim_tile_read_bytes(const char *path,
+                                       uint8_t *out,
+                                       size_t capacity,
+                                       struct NosimTileSize *size);
+
+/**
+ * §5 scattering: Poisson-disk points (Bridson) in `[0, width) × [0, height)` metres, no two
+ * closer than `radius`, each kept with the probability `density` gives at its position.
+ * `density` is a `density_width × density_height` grid of 0–255 values (a land-cover mask,
+ * row 0 at `y = 0`) stretched over the area and read at the nearest cell; NULL keeps every
+ * point. Writes up to `capacity` points as `x, y` pairs and returns how many there are; the
+ * same seed gives the same points.
+ *
+ * # Safety
+ * `density` must be NULL or point to `density_width · density_height` bytes; `xy` must be
+ * NULL or point to `2 · capacity` doubles.
+ */
+size_t nosim_poisson_disk(double width,
+                          double height,
+                          double radius,
+                          uint64_t seed,
+                          const uint8_t *density,
+                          uint32_t density_width,
+                          uint32_t density_height,
+                          double *xy,
+                          size_t capacity);
 
 /**
  * ΔT = TT − UT1, seconds, at a UTC instant. `dut1_seconds` is UT1 − UTC from IERS

@@ -251,8 +251,8 @@ fn arinc_runway_and_markings() {
         |line: &mut Vec<u8>, col1: usize, s: &str| line[col1 - 1..col1 - 1 + s.len()].copy_from_slice(s.as_bytes());
     put(&mut line, 1, "SUSAP KJFKK6GRW04R");
     put(&mut line, 23, "084000443 N40375932W073461245");
-    put(&mut line, 61, "+001204500");
-    put(&mut line, 72, "150");
+    put(&mut line, 67, "+00120450");
+    put(&mut line, 78, "150");
     put(&mut line, 102, "GROOVED");
     let mut rec = unsafe { std::mem::zeroed::<NosimRunwayRecord>() };
     // SAFETY: slice sized as passed.
@@ -543,4 +543,98 @@ fn client_hand_off() {
         unsafe { nosim_tile_path(NosimTileLayer::LandcoverMask, ptr::null(), t, buf.as_mut_ptr(), buf.len()) },
         0
     );
+}
+
+#[test]
+fn package_polygons_tiles_and_scattering() {
+    let dir = fixture("fixtures/packages/org.contributor.infrastructure.kjfk");
+    unsafe {
+        // The package lists one polygon table: Terminal 4 and the TWA Flight Center.
+        let pkg = nosim_package_load(dir.as_ptr());
+        assert!(!pkg.is_null(), "{}", last_error());
+        assert_eq!(nosim_package_polygon_table_count(pkg), 1);
+        let mut buf = [0 as c_char; 512];
+        let n = nosim_package_polygon_table_path(pkg, 0, buf.as_mut_ptr(), buf.len());
+        assert!(n > 1 && cstr_buf(&buf).ends_with("terminal_footprints.geoparquet"));
+        assert_eq!(nosim_package_polygon_table_path(pkg, 1, buf.as_mut_ptr(), buf.len()), 0);
+        let t = nosim_polygon_table_load(buf.as_ptr());
+        assert!(!t.is_null(), "{}", last_error());
+        assert_eq!(nosim_polygon_table_count(t), 2);
+        let mut a = NosimArea::default();
+        assert_eq!(nosim_polygon_table_get(t, 0, &mut a), NosimStatus::Ok);
+        assert!(a.building && a.height_m == 20.0 && a.polygon_count == 1 && a.ring_count == 1);
+        assert!((a.area_m2 - 14_408.6).abs() < 0.1);
+        let mut tag = [0 as c_char; 64];
+        nosim_polygon_table_tag(t, 0, tag.as_mut_ptr(), tag.len());
+        assert_eq!(cstr_buf(&tag), "building=terminal");
+        nosim_polygon_table_name(t, 1, tag.as_mut_ptr(), tag.len());
+        assert_eq!(cstr_buf(&tag), "TWA Flight Center");
+        let mut ring = NosimRing::default();
+        assert_eq!(nosim_polygon_table_ring(t, 0, 0, &mut ring), NosimStatus::Ok);
+        assert!(ring.outer && ring.polygon == 0 && ring.point_count >= 3);
+        let mut pts = vec![0.0; 2 * ring.point_count];
+        assert_eq!(nosim_polygon_table_ring_points(t, 0, 0, pts.as_mut_ptr(), ring.point_count), ring.point_count);
+        assert!(pts.chunks(2).all(|p| (-73.783..-73.781).contains(&p[0]) && (40.643..40.645).contains(&p[1])));
+        assert_eq!(nosim_polygon_table_ring(t, 0, 1, &mut ring), NosimStatus::InvalidArgument);
+        assert_eq!(nosim_polygon_table_get(t, 2, &mut a), NosimStatus::InvalidArgument);
+        nosim_polygon_table_free(t);
+        nosim_package_free(pkg);
+        assert!(nosim_polygon_table_load(ptr::null()).is_null());
+        assert_eq!(nosim_polygon_table_count(ptr::null()), 0);
+        assert_eq!(nosim_package_polygon_table_count(ptr::null()), 0);
+    }
+
+    // Tiles: a Terrain-RGB tile and a class tile written with the compiler's encoders.
+    let tmp = std::env::temp_dir().join(format!("nosim_ffi_tiles_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let heights = [-12.5, 0.0, 4.2, 312.9];
+    let rgb: Vec<u8> = heights.iter().flat_map(|&h| nosim_compiler::raster::terrain_rgb::encode_height(h)).collect();
+    let terrain = tmp.join("terrain.png");
+    std::fs::write(&terrain, nosim_compiler::raster::png::encode_rgb(2, 2, &rgb)).unwrap();
+    let classes = tmp.join("classes.png");
+    std::fs::write(&classes, nosim_compiler::raster::png::encode_gray(3, 1, &[10, 80, 0])).unwrap();
+    let terrain = CString::new(terrain.to_str().unwrap()).unwrap();
+    let classes = CString::new(classes.to_str().unwrap()).unwrap();
+    unsafe {
+        let mut size = NosimTileSize::default();
+        assert_eq!(
+            nosim_tile_read_heights(terrain.as_ptr(), ptr::null_mut(), 0, &mut size),
+            NosimStatus::BufferTooSmall
+        );
+        assert_eq!((size.width, size.height), (2, 2));
+        let mut h = [0f32; 4];
+        assert_eq!(nosim_tile_read_heights(terrain.as_ptr(), h.as_mut_ptr(), 4, &mut size), NosimStatus::Ok);
+        for (got, want) in h.iter().zip(heights) {
+            assert!((f64::from(*got) - want).abs() <= 0.05, "{got} vs {want}");
+        }
+        let mut c = [0u8; 3];
+        assert_eq!(nosim_tile_read_bytes(classes.as_ptr(), c.as_mut_ptr(), 3, &mut size), NosimStatus::Ok);
+        assert_eq!((c, size.width, size.height), ([10, 80, 0], 3, 1));
+        // An RGB tile is not a greyscale one, and the other way round.
+        assert_eq!(nosim_tile_read_bytes(terrain.as_ptr(), c.as_mut_ptr(), 3, &mut size), NosimStatus::Parse);
+        assert_eq!(nosim_tile_read_heights(classes.as_ptr(), h.as_mut_ptr(), 4, &mut size), NosimStatus::Parse);
+        let missing = CString::new("/nonexistent/1/2/3.png").unwrap();
+        assert_eq!(nosim_tile_read_bytes(missing.as_ptr(), c.as_mut_ptr(), 3, &mut size), NosimStatus::Io);
+        assert_eq!(
+            nosim_tile_read_bytes(classes.as_ptr(), c.as_mut_ptr(), 3, ptr::null_mut()),
+            NosimStatus::NullPointer
+        );
+    }
+    std::fs::remove_dir_all(&tmp).unwrap();
+
+    // Scattering: the left half of the density grid is empty, the right half full.
+    let density = [0u8, 255];
+    let all = unsafe { nosim_poisson_disk(100.0, 50.0, 5.0, 7, ptr::null(), 0, 0, ptr::null_mut(), 0) };
+    let mut xy = vec![0.0; 2 * all];
+    let kept = unsafe { nosim_poisson_disk(100.0, 50.0, 5.0, 7, density.as_ptr(), 2, 1, xy.as_mut_ptr(), all) };
+    assert!(all > 50 && kept > all / 4 && kept < all * 3 / 4, "{kept} of {all}");
+    let pts: Vec<(f64, f64)> = xy[..2 * kept].chunks(2).map(|p| (p[0], p[1])).collect();
+    assert!(pts.iter().all(|&(x, y)| (50.0..100.0).contains(&x) && (0.0..50.0).contains(&y)));
+    for (i, a) in pts.iter().enumerate() {
+        for b in &pts[i + 1..] {
+            assert!((a.0 - b.0).hypot(a.1 - b.1) >= 5.0);
+        }
+    }
+    let again = unsafe { nosim_poisson_disk(100.0, 50.0, 5.0, 7, density.as_ptr(), 2, 1, ptr::null_mut(), 0) };
+    assert_eq!(again, kept);
 }
