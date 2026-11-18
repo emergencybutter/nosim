@@ -1,11 +1,16 @@
-//! A minimal PNG writer (8-bit RGB or greyscale, Sub-filtered rows, zlib via `flate2`) and
-//! the reader the tests use to prove what was written.
+//! A minimal PNG writer (8-bit RGB, RGBA or greyscale, Sub-filtered rows, zlib via `flate2`)
+//! and the reader the tests and the C ABI use to read what was written.
 
 use std::io::{Read, Write};
 
 /// Writes an 8-bit RGB PNG. `rgb` is row-major, three bytes per pixel.
 pub fn encode_rgb(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
     encode(width, height, rgb, 3)
+}
+
+/// Writes an 8-bit RGBA PNG (straight alpha). `rgba` is row-major, four bytes per pixel.
+pub fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    encode(width, height, rgba, 4)
 }
 
 /// Writes an 8-bit greyscale PNG. `grey` is row-major, one byte per pixel.
@@ -32,8 +37,12 @@ fn encode(width: u32, height: u32, pixels: &[u8], channels: usize) -> Vec<u8> {
     let mut ihdr = Vec::with_capacity(13);
     ihdr.extend_from_slice(&width.to_be_bytes());
     ihdr.extend_from_slice(&height.to_be_bytes());
-    let colour = if channels == 3 { 2 } else { 0 };
-    ihdr.extend_from_slice(&[8, colour, 0, 0, 0]); // depth 8, RGB or grey, deflate, filter 0, no interlace
+    let colour = match channels {
+        4 => 6,
+        3 => 2,
+        _ => 0,
+    };
+    ihdr.extend_from_slice(&[8, colour, 0, 0, 0]); // depth 8, RGBA / RGB / grey, deflate, filter 0, no interlace
     chunk(&mut out, b"IHDR", &ihdr);
     chunk(&mut out, b"IDAT", &idat);
     chunk(&mut out, b"IEND", &[]);
@@ -61,14 +70,14 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-/// A decoded 8-bit RGB PNG.
+/// A decoded 8-bit PNG.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rgb {
     /// Width in pixels.
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
-    /// Row-major RGB bytes.
+    /// Row-major pixels: RGB, RGBA or grey bytes, as the decoding function says.
     pub data: Vec<u8>,
 }
 
@@ -79,6 +88,21 @@ pub fn decode_rgb(b: &[u8]) -> Result<Rgb, String> {
         (img, 3) => Ok(img),
         _ => Err("not an RGB PNG".into()),
     }
+}
+
+/// Reads an 8-bit, non-interlaced greyscale, RGB or RGBA PNG as RGBA (grey and RGB are
+/// opaque).
+pub fn decode_rgba(b: &[u8]) -> Result<Rgb, String> {
+    let (img, channels) = decode(b)?;
+    if channels == 4 {
+        return Ok(img);
+    }
+    let data = img
+        .data
+        .chunks_exact(channels)
+        .flat_map(|p| if channels == 3 { [p[0], p[1], p[2], 255] } else { [p[0], p[0], p[0], 255] })
+        .collect();
+    Ok(Rgb { data, ..img })
 }
 
 /// Reads an 8-bit, non-interlaced greyscale PNG; `data` holds one byte per pixel.
@@ -109,10 +133,14 @@ fn decode(b: &[u8]) -> Result<(Rgb, usize), String> {
             b"IHDR" => {
                 width = u32::from_be_bytes(data[0..4].try_into().expect("4"));
                 height = u32::from_be_bytes(data[4..8].try_into().expect("4"));
-                if data[8] != 8 || !matches!(data[9], 0 | 2) || data[12] != 0 {
-                    return Err("only 8-bit non-interlaced RGB or greyscale is supported".into());
+                if data[8] != 8 || !matches!(data[9], 0 | 2 | 6) || data[12] != 0 {
+                    return Err("only 8-bit non-interlaced RGB, RGBA or greyscale is supported".into());
                 }
-                channels = if data[9] == 2 { 3 } else { 1 };
+                channels = match data[9] {
+                    6 => 4,
+                    2 => 3,
+                    _ => 1,
+                };
             }
             b"IDAT" => idat.extend_from_slice(data),
             b"IEND" => break,
@@ -182,7 +210,13 @@ mod tests {
         assert!(decode_rgb(&corrupt).is_err());
         let grey: Vec<u8> = (0..w * h).map(|i| (i * 53 % 256) as u8).collect();
         let png = encode_gray(w, h, &grey);
-        assert_eq!(decode_gray(&png).unwrap(), Rgb { width: w, height: h, data: grey });
+        assert_eq!(decode_gray(&png).unwrap(), Rgb { width: w, height: h, data: grey.clone() });
         assert!(decode_rgb(&png).is_err());
+        let as_rgba: Vec<u8> = grey.iter().flat_map(|&g| [g, g, g, 255]).collect();
+        assert_eq!(decode_rgba(&png).unwrap().data, as_rgba);
+        let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i * 29 % 256) as u8).collect();
+        let png = encode_rgba(w, h, &rgba);
+        assert_eq!(decode_rgba(&png).unwrap(), Rgb { width: w, height: h, data: rgba });
+        assert!(decode_rgb(&png).is_err() && decode_gray(&png).is_err());
     }
 }

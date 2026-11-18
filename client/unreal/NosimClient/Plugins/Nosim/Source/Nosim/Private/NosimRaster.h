@@ -45,3 +45,24 @@ private:
 	TArray<float> Heights; // NaN where no tile was loaded
 	TArray<uint8> Bytes;
 };
+
+/** One terrain chunk's imagery: a square of tiles from `world-compiler imagery`, as one image. */
+struct FNosimImageryChunk
+{
+	int32 Size = 0; // pixels per side; 0 when no tile was found
+	int32 Tiles = 0; // tiles read
+	TArray<FColor> Pixels; // row-major from the north-west corner; alpha 0 where nothing covers
+};
+
+namespace NosimImagery
+{
+/** The deepest zoom written under `Dir` (the compiler's imagery output) no deeper than `MaxZoom`; -1 when none is. */
+int32 DeepestZoom(const FString& Dir, int32 MaxZoom);
+
+/**
+ * Reads the imagery tiles at `Zoom` under the tile (`ChunkZoom`, `Cx`, `Cy`) into one image,
+ * missing tiles left transparent. False when none of them exists. Safe to call from several
+ * threads at once.
+ */
+bool LoadChunk(const FString& Dir, int32 Zoom, int32 ChunkZoom, int32 Cx, int32 Cy, FNosimImageryChunk& Out);
+} // namespace NosimImagery

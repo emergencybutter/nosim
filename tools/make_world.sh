@@ -4,14 +4,16 @@
 #   tools/make_world.sh fixture [out]           the KJFK fixture DEM and land cover
 #                                               (default out: target/world/kjfk-fixture)
 #   tools/make_world.sh real <cache-dir> [out]  real KJFK: Copernicus GLO-30, OpenStreetMap
-#                                               (BBBike New York), ESA WorldCover 2021 and the
-#                                               FAA's current CIFP, downloaded into <cache-dir>
+#                                               (BBBike New York), ESA WorldCover 2021, USDA
+#                                               NAIP imagery and the FAA's current CIFP,
+#                                               downloaded into <cache-dir>
 #                                               (default out: target/world/kjfk-real)
 #
-# A world holds terrain/ and landcover/ tiles and, for real data, the tables that replace the
-# package's synthetic ones: splines.geoparquet, areas/*.geoparquet and cifp.txt. Real data
-# stays out of the repository (OpenStreetMap is ODbL, WorldCover CC-BY 4.0); keep worlds
-# under target/. Run from the repository root.
+# A world holds terrain/ and landcover/ tiles and, for real data, imagery/ tiles and the
+# tables that replace the package's synthetic ones: splines.geoparquet, areas/*.geoparquet and
+# cifp.txt. Real data stays out of the repository (OpenStreetMap is ODbL, WorldCover CC-BY
+# 4.0; NAIP is public domain but large); keep worlds under target/. Run from the repository
+# root.
 set -euo pipefail
 
 say() { printf '\n==> %s\n' "$*"; }
@@ -90,6 +92,48 @@ real() {
         cifp_zip=""
     fi
 
+    # NAIP aerial imagery from the USGS National Map image service: one 2048-pixel Web
+    # Mercator GeoTIFF per z14 tile over the box, which is z17 resolution on z17's pixel grid,
+    # so the compiler copies it without resampling.
+    say "NAIP imagery (skipped when cached)"
+    mkdir -p "$cache/naip"
+    "$py" - "$bbox" "$cache/naip" <<'PY'
+import concurrent.futures, math, os, sys, time, urllib.request
+west, south, east, north = map(float, sys.argv[1].split(","))
+dest = sys.argv[2]
+z, R = 14, 20037508.342789244
+size = 2 * R / 2**z
+def tile(lon, lat):
+    n = 2**z
+    return int((lon + 180) / 360 * n), int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n)
+(x0, y0), (x1, y1) = tile(west, north), tile(east, south)
+service = "https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/ImageServer/exportImage"
+def get(xy):
+    x, y = xy
+    path = os.path.join(dest, f"z{z}_{x}_{y}.tif")
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return "cached"
+    b = (-R + x * size, R - (y + 1) * size, -R + (x + 1) * size, R - y * size)
+    url = (f"{service}?bbox={b[0]!r},{b[1]!r},{b[2]!r},{b[3]!r}&bboxSR=3857&imageSR=3857&size=2048,2048"
+           "&format=tiff&pixelType=U8&compression=LZW&bandIds=0,1,2&interpolation=RSP_BilinearInterpolation&f=image")
+    for attempt in range(3):
+        try:
+            data = urllib.request.urlopen(url, timeout=180).read()
+            if data[:4] != b"II*\x00":
+                raise ValueError(data[:200])
+            open(path + ".part", "wb").write(data)
+            os.replace(path + ".part", path)
+            return "fetched"
+        except Exception as e:
+            print(f"  z{z}/{x}/{y}: {e}; retrying", file=sys.stderr)
+            time.sleep(5)
+    raise SystemExit(f"NAIP tile z{z}/{x}/{y} failed")
+tiles = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+with concurrent.futures.ThreadPoolExecutor(4) as pool:
+    done = list(pool.map(get, tiles))
+print(f"{len(tiles)} tiles: {done.count('fetched')} fetched, {done.count('cached')} cached")
+PY
+
     build
     rm -rf "$out"
     mkdir -p "$out"
@@ -121,6 +165,8 @@ PY
         --min-zoom 10 --max-zoom 14 --only terrain-rgb
     say "land cover: WorldCover 2021"
     "$wc" landcover --input "$worldcover" --output "$out/landcover" --bbox "$bbox" --min-zoom 10 --max-zoom 15
+    say "imagery: NAIP"
+    "$wc" imagery --input "$cache/naip" --output "$out/imagery" --bbox "$bbox" --min-zoom 10 --max-zoom 17
     say "world written to $out"
 }
 

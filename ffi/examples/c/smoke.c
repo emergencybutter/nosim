@@ -142,6 +142,9 @@ int main(int argc, char **argv) {
     CHECK(tb.min_lat <= 40.6398 && tb.max_lat >= 40.6398 && tb.max_lat - tb.min_lat < 0.05);
     CHECK(nosim_tile_path(NOSIM_TILE_LAYER_LANDCOVER_MASK, "trees", m12, tpath, sizeof tpath) > 0);
     CHECK(strncmp(tpath, "masks/trees/12/", 15) == 0);
+    NosimTileSize tsize = {0, 0};
+    CHECK(nosim_tile_read_rgba(NULL, NULL, 0, NULL) == NOSIM_STATUS_NULL_POINTER);
+    CHECK(nosim_tile_read_rgba("/nonexistent/12/1208/1541.png", NULL, 0, &tsize) == NOSIM_STATUS_IO);
 
     nosim_vfs_free(vfs);
     nosim_package_free(pkg);

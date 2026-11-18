@@ -3,8 +3,8 @@
 use std::process::ExitCode;
 
 use nosim_compiler::{
-    Command, USAGE, parse_args, run_areas, run_arinc, run_atmosphere, run_bridges, run_graph, run_landcover, run_osm,
-    run_raster, run_tiles, run_validate, validate,
+    Command, USAGE, parse_args, run_areas, run_arinc, run_atmosphere, run_bridges, run_graph, run_imagery,
+    run_landcover, run_osm, run_raster, run_tiles, run_validate, validate,
 };
 
 fn main() -> ExitCode {
@@ -347,6 +347,25 @@ fn main() -> ExitCode {
                     eprintln!("error: the raster holds codes that are not WorldCover classes");
                     return ExitCode::FAILURE;
                 }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Imagery(args) => match run_imagery(&args) {
+            Ok(s) => {
+                let per_zoom: Vec<String> = s.tiles.iter().map(|(z, n)| format!("z{z}: {n}")).collect();
+                println!(
+                    "{} source(s), {:.1} Mpixel read; {}: tiles ({}), {} partly covered, {} empty skipped",
+                    s.sources,
+                    s.source_pixels as f64 / 1e6,
+                    args.output.display(),
+                    per_zoom.join(", "),
+                    s.partial_tiles,
+                    s.empty_tiles
+                );
                 ExitCode::SUCCESS
             }
             Err(e) => {

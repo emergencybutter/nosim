@@ -77,7 +77,8 @@ compiler/
                  writer / reader (png.rs), greedy Delaunay TIN with gap filling (tin.rs),
                  Cesium quantized-mesh encoder / decoder (quantized_mesh.rs), runway and
                  road heightfield patching (patch.rs), float32 and uint8 GeoTIFF writers,
-                 windowed 8-bit class rasters (ClassGrid)
+                 windowed 8-bit class rasters (ClassGrid), RGB imagery in degrees or Web
+                 Mercator (RgbImage)
   src/osm/       OpenStreetMap PBF reader: blobs, zlib, dense and plain nodes, ways, relations
                  (pbf.rs); road and aeroway extraction with tag normalisation, spline
                  GeoParquet (mod.rs); libosmium-compatible ring assembly (multipolygon.rs);
@@ -86,6 +87,7 @@ compiler/
   src/atmosphere.rs Writes the atmosphere tables as raw f32 textures and atmosphere.json
   src/landcover.rs Land cover: categorical resampling (mode / nearest), class tiles,
                  per-class density masks with vegetation exclusions
+  src/imagery.rs Aerial imagery: RGB GeoTIFFs mosaicked into colour tile pyramids
   src/graph.rs   Road graph: splines split at shared nodes into directed edges, strongly
                  connected components, edge / node GeoParquet, CTM construction and run
   src/par.rs     Order-preserving parallel map over scoped threads, shared by raster and osm
@@ -99,7 +101,7 @@ compiler/
                  from that fixture to open and closed CTM runs; polygons, heights,
                  exclusions, the validator's polygon checks and bridges (areas.rs); land
                  cover from a GDAL-written class raster to tiles, masks and scattering
-                 (landcover.rs)
+                 (landcover.rs); aerial imagery from synthetic RGB GeoTIFFs (imagery.rs)
 fixtures/        The spec's KJFK example package (scenery tests) — its arinc_runways.parquet
                  and taxiways_and_roads.geoparquet are real tables compiled from the CIFP and
                  OSM samples (and terminal_footprints.geoparquet from the area sample), so the
@@ -187,6 +189,7 @@ manual dispatch, with downloads cached for a week.
 | §7 near-field vehicles and handoff — on a far/near/far corridor every step conserves vehicles to 1e-9, never lets two overlap, and free-flowing vehicles drive near `v₀`; with the far exit closed the near edge holds a standing queue at the IDM jam gap and the queue spills back into the incoming CTM link; turning choices match their weights (3:1 → 75% ± 5%); MOBIL spreads a packed lane into a free one safely; a dense three-lane ring never clamps a position; runs with the same seed are identical | `traffic::hybrid` |
 | §5 / Phase 3 polygons — closed ways and multipolygon relations assemble as libosmium does: pieces join into rings, a courtyard becomes a hole, two outers stay two, a hole touching its outer twice splits the area in two, a boundary listed twice cancels; rings come out counter-clockwise outside and clockwise inside; a missing member, an open ring, a bow-tie and a three-node way are listed with reasons and locations; `height` (metres, feet, feet-and-inches), `min_height`, `building:levels` and `building:min_level` normalise to metres, and untagged buildings get §5 Poisson levels from their building type or the land use under them, the same every run; the KJFK package's `procedural_buildings` mask removes the two terminals inside the perimeter; the validator catches a clockwise outer ring, a wrong area and a hole outside its outer ring | `compiler/tests/areas.rs`, `osm::multipolygon`, `osm::areas` |
 | §5 / Phase 3.3 land cover — a GDAL-written WorldCover-style raster (DEFLATE, horizontal predictor, 256-pixel tiles, colour table) reads to the counts GDAL reported, whole or as a window across tile boundaries; every class tile pixel holds a class that occurs in the source, and every source class survives; masks are full over the forest and empty over the water, and fractional along edges at low zoom; output is byte-identical between runs; the KJFK package's runway safety area zeroes the grass mask there but leaves the classes and the forest alone; Poisson-disk trees thinned by the tree mask all stand in the forest and fill it; Poisson-disk points never closer than the radius, thinning keeps the expected fraction, deterministic per seed | `compiler/tests/landcover.rs`, `landcover`, `procedural::poisson_disk_spacing_and_thinning` |
+| §1 imagery — RGB GeoTIFFs round-trip in degrees and Web Mercator, with or without an alpha band, whole or windowed; NAIP's fourth (near-infrared) band is dropped; other projected CRSs are refused; a Web Mercator source on the deepest zoom's pixel grid is copied to the tiles pixel for pixel, and each zoom above is the rounded mean of 2 × 2 pixels below; a one-pixel checkerboard seven times finer than the output averages to grey everywhere instead of aliasing; where sources overlap the first wins; uncovered pixels are transparent and edge pixels partly so; tiles no source reaches are not written; output is byte-identical whatever the thread count | `compiler/tests/imagery.rs`, `raster::geotiff`, `imagery` |
 | §5 bridge detection — two bridge ways drawn in opposite directions join into one deck over the lake; the bridge across the strait measures the sea between two coastlines; an untagged causeway is a missing bridge exactly over the water; the tunnel and the footway onto a pier are not bridges; piers fall evenly at ≤ 35 m and never on an abutment; over a DEM valley the span reaches rim to rim and piers are cast 40 m down to the valley floor; a building at the rim masks it | `compiler/tests/areas.rs`, `bridges` |
 | §7B pedestrian navigation — walk mode keeps footpaths and streets two-way at walking pace, drops motorways and `foot=no`; shortest routes equal a brute-force search on every pair of a small grid; a route follower visits every waypoint in order even when pushed past one; two crowds of 20 walk the fixture route through each other with no overlap, all arrive within 20% of walking alone, and reversing the insertion order of simultaneous entrants changes nothing | `traffic::orca`, `graph`, `compiler/tests/graph.rs` |
 | §7 road graph — on the fixture, the drive graph splits the JFK Expressway at its two junctions, keeps it one-way, implies the ramp's direction, reverses the Nassau Expressway, halves Rockaway Boulevard's lanes per direction, closes the roundabout as a loop, leaves out the bus lane closed to cars, and finds the expected 12 components; the taxi graph is one two-way component; an open CTM run accounts for every vehicle and a closed one circulates over every link without loss | `compiler/tests/graph.rs`, `graph` |
@@ -215,7 +218,7 @@ manual dispatch, with downloads cached for a week.
 | §8B precomputed scattering (Bruneton) | Implemented on the CPU (`nosim::atmosphere`, `world-compiler atmosphere`), with the analytical limb calibrated at the 100 km hand-over; the shaders that sample the tables are engine-side |
 | §8 LOD band policy, parent-frame selection, triangle budget model, translunar harness | Implemented; the harness's ECI is J2000 and its ECEF rotates by GMST alone (precession and nutation do not affect continuity) |
 | C ABI for the UE5 client | Implemented: every core module, plus spline and graph tables, the routed CTM and tile addressing from the compiler, is reachable from C; a compiled C program reproduces the Rust traffic totals bit for bit |
-| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler; raster processor; OSM ingestion) | Implemented for runways, packages, GeoParquet → MVT tiling with Morton ordering, geographic DEM → Terrain-RGB / normal maps / quantized mesh, and OSM PBF roads and aeroways → spline GeoParquet, matched way for way against libosmium on the New York extract; OSM buildings, water and land use from closed ways and multipolygon relations, matched area for area against libosmium; bridges; ESA WorldCover → class tiles and density masks, histogram matched against GDAL; turn restrictions, FlatGeobuf, H3, 3D Tiles, projected-CRS DEMs, BigTIFF and imagery rasters not started |
+| §1 world-compiler (ARINC 424 → GeoParquet, with §3 overrides; package validator; vector tiler; raster processor; OSM ingestion) | Implemented for runways, packages, GeoParquet → MVT tiling with Morton ordering, geographic DEM → Terrain-RGB / normal maps / quantized mesh, and OSM PBF roads and aeroways → spline GeoParquet, matched way for way against libosmium on the New York extract; OSM buildings, water and land use from closed ways and multipolygon relations, matched area for area against libosmium; bridges; ESA WorldCover → class tiles and density masks, histogram matched against GDAL; RGB imagery GeoTIFFs (NAIP) → colour tile pyramids; turn restrictions, FlatGeobuf, H3, 3D Tiles, projected-CRS DEMs, BigTIFF and Sentinel-2 imagery not started |
 
 What comes next, milestone by milestone, is in [docs/roadmap.md](docs/roadmap.md).
 
@@ -270,8 +273,9 @@ needs no Parquet reader of its own:
   `nosim_traffic_edge_vehicles` reads it back.
 - **Tiles:** `nosim_tile_at`, `nosim_tile_bounds` and `nosim_tile_path` locate terrain-RGB,
   normal-map, quantized-mesh, land-cover and vector tiles in the compiler's output.
-  `nosim_tile_read_heights` decodes a Terrain-RGB tile to metres and `nosim_tile_read_bytes`
-  a land-cover class tile or density mask, so the client needs no PNG decoder either.
+  `nosim_tile_read_heights` decodes a Terrain-RGB tile to metres, `nosim_tile_read_bytes`
+  a land-cover class tile or density mask, and `nosim_tile_read_rgba` an imagery tile, so the
+  client needs no PNG decoder either.
 - **Polygons:** `nosim_package_polygon_table_count` / `_path` list a package's
   `content.polygons`, and `nosim_polygon_table_load`, `_get`, `_tag`, `_name`, `_ring` and
   `_ring_points` read them (or a table from `world-compiler areas`): building heights and
@@ -289,10 +293,13 @@ uses, and requires the three totals to match bit for bit.
 **Worlds for the client.** `tools/make_world.sh fixture` compiles the fixture DEM and land
 cover into `target/world/kjfk-fixture`, which the Unreal client draws by default.
 `tools/make_world.sh real <cache-dir>` downloads GLO-30, BBBike's New York extract,
-WorldCover 2021 and the FAA's current CIFP. It writes `target/world/kjfk-real`: runways,
-OSM roads and areas, terrain patched under them, and land cover. Point the client's
-*World Dir* at it, or start it with `-NosimWorld=<dir>`. On cycle 2610 that is 4 runways,
-22,271 splines, 54,747 buildings in the terrain area and a drive graph of 27,483 edges.
+WorldCover 2021, NAIP imagery and the FAA's current CIFP. It writes
+`target/world/kjfk-real`: runways, OSM roads and areas, terrain patched under them, land
+cover and imagery. Point the client's *World Dir* at it, or start it with
+`-NosimWorld=<dir>`. On cycle 2610 that is 4 runways, 22,271 splines, 54,747 buildings in
+the terrain area, a drive graph of 27,483 edges and 1,755 imagery tiles at z17. The client
+drapes the imagery over the terrain, a 2048-pixel texture per z14 tile, and leaves the
+pavement to the photo with only the runway markings drawn over it.
 
 Linking the compiler's tables in brings Arrow and Parquet with them: the release static
 library is about 100 MB and the shared library 11 MB.
@@ -584,6 +591,35 @@ Verified on the WorldCover 2021 tile N39W075 (57 MB) over the KJFK package bound
 
 WorldCover is CC-BY 4.0 (© ESA WorldCover project, contains modified Copernicus Sentinel
 data). It is used for verification and not committed; the fixture is synthetic.
+
+```sh
+cargo run -p nosim-compiler --release -- imagery --input <image.tif|dir>... --output imagery/ [--bbox <west,south,east,north>] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--threads <n>]
+```
+
+`imagery` mosaics aerial photographs into colour tiles for the client to drape over the
+terrain. It reads three- or four-band 8-bit GeoTIFFs (the same containers as `raster`) in
+WGS 84 degrees or Web Mercator. A fourth band counts as alpha only when the file says so;
+NAIP's is near-infrared and is dropped. Each `--input` is a file or a directory of them,
+and where sources overlap the first listed wins. With `--bbox`, only the source pixels
+meeting the box are read. It writes:
+
+- `z/x/y.png`: Web-Mercator tiles, RGB where the sources cover the whole tile and RGBA
+  where they do not, alpha being the fraction of the pixel covered. The deepest zoom samples
+  the sources: a pixel averages one bilinear sample per source pixel it spans, so a source
+  finer than the tiles is not aliased, and a Web Mercator source on the tiles' own pixel
+  grid is copied unchanged. Each zoom above is the coverage-weighted mean of 2 × 2 pixels of
+  the one below. Tiles no source reaches are not written.
+- `imagery.json`: tile size, zooms, bounds, tiles per zoom, and each source's window and
+  transform.
+
+`tools/make_world.sh real` fetches NAIP from the USGS National Map image service, which
+exports any box in any CRS: one 2048-pixel Web Mercator GeoTIFF per z14 tile, which is
+z17's resolution on z17's grid. Over the KJFK terrain area (−73.84…−73.72, 40.60…40.68)
+that is 30 downloads, 322 MB in LZW, and 110 megapixels. `imagery` writes zooms 10–17 from
+them in 10 s on 16 threads: 2,387 tiles, 267 MB, of which 1,755 are at z17 (0.91 m a pixel
+at this latitude). Each of the 64 z17 tiles under one download matches the download pixel
+for pixel. NAIP is a US government work in the public domain (USDA, served by the USGS National Map);
+it is not committed.
 
 ```sh
 cargo run -p nosim-compiler --release -- raster --input dem.tif --output terrain/ [--patch-runways <runways.parquet>] [--patch-roads <splines.geoparquet>] [--package <dir>] [--patched-dem <out.tif>] [--body earth|moon] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--mesh-grid <n>] [--mesh-error <m>] [--threads <n>] [--only terrain-rgb,normals,mesh]

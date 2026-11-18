@@ -1,10 +1,13 @@
-//! A single-band GeoTIFF reader for digital elevation models: classic TIFF (little or big
+//! A GeoTIFF reader for digital elevation models and imagery: classic TIFF (little or big
 //! endian), strips or tiles, uncompressed / LZW / DEFLATE, horizontal and floating-point
 //! predictors, integer and floating-point samples, and the GeoTIFF keys needed to place the
 //! raster in a geographic (longitude / latitude) coordinate system.
 //!
-//! Projected rasters are refused rather than silently mis-georeferenced: the compiler expects
-//! inputs such as Copernicus GLO-30 or LOLA grids that are already in degrees.
+//! DEMs and class rasters have one band. Imagery ([`RgbImage`]) has three or four 8-bit bands,
+//! interleaved, and may also be in Web Mercator (EPSG:3857), which is what aerial imagery
+//! services hand out. Other projected rasters are refused rather than silently
+//! mis-georeferenced: the compiler expects inputs such as Copernicus GLO-30 or LOLA grids that
+//! are already in degrees.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -163,7 +166,7 @@ impl Dem {
 
     /// Parses TIFF bytes.
     pub fn parse(b: &[u8]) -> Result<Dem, TiffError> {
-        let l = Layout::parse(b)?;
+        let l = Layout::parse(b, false)?;
         let (width, height, block_w, block_h) = (l.width, l.height, l.block_w, l.block_h);
         let mut heights = vec![f32::NAN; width * height];
         let mut block = Vec::new();
@@ -260,7 +263,7 @@ impl ClassGrid {
 
     /// Parses an 8-bit unsigned single-band GeoTIFF with an axis-aligned geographic transform.
     pub fn parse(b: &[u8], bbox: Option<(f64, f64, f64, f64)>) -> Result<ClassGrid, TiffError> {
-        let l = Layout::parse(b)?;
+        let l = Layout::parse(b, false)?;
         if l.bits != 8 || l.sample_format != 1 {
             return Err(TiffError::Unsupported(format!(
                 "a class raster has 8-bit unsigned samples, not format {} with {} bits",
@@ -276,47 +279,8 @@ impl ClassGrid {
             None => (0, 0, l.width, l.height),
         };
         let (w, h) = (c1.saturating_sub(c0), r1.saturating_sub(r0));
-        let mut classes = vec![0u8; w * h];
         let nodata = l.nodata.filter(|v| v.fract() == 0.0 && (0.0..=255.0).contains(v)).map(|v| v as u8);
-        if let Some(n) = nodata {
-            classes.fill(n);
-        }
-        if w > 0 && h > 0 {
-            let down = l.offsets.len() / l.across;
-            let blocks: Vec<usize> = (0..l.offsets.len())
-                .filter(|&i| {
-                    let (bx, by) = (i % l.across, i / l.across);
-                    bx * l.block_w < c1
-                        && (bx + 1) * l.block_w > c0
-                        && by * l.block_h < r1
-                        && (by + 1) * l.block_h > r0
-                        && by < down
-                })
-                .collect();
-            let decoded = crate::par::parallel_map(&blocks, crate::par::thread_count(0), |&i| {
-                let mut block = Vec::new();
-                let rows = l.decode_block(b, i, &mut block).map_err(CompileError::from)?;
-                Ok((i, rows, block))
-            })
-            .map_err(|e| TiffError::Malformed(e.to_string()))?;
-            for (i, rows, block) in decoded {
-                let (bx, by) = (i % l.across, i / l.across);
-                for r in 0..rows {
-                    let row = by * l.block_h + r;
-                    if row < r0 || row >= r1 {
-                        continue;
-                    }
-                    let col_lo = (bx * l.block_w).max(c0);
-                    let col_hi = ((bx + 1) * l.block_w).min(c1).min(l.width);
-                    if col_lo >= col_hi {
-                        continue;
-                    }
-                    let src = &block[r * l.block_w + (col_lo - bx * l.block_w)..][..col_hi - col_lo];
-                    let dst = (row - r0) * w + (col_lo - c0);
-                    classes[dst..dst + src.len()].copy_from_slice(src);
-                }
-            }
-        }
+        let classes = l.read_window(b, (c0, r0, c1, r1), nodata.unwrap_or(0))?;
         let transform = [t[0] + c0 as f64 * t[1], t[1], 0.0, t[3] + r0 as f64 * t[5], 0.0, t[5]];
         Ok(ClassGrid {
             width: w,
@@ -361,6 +325,163 @@ impl ClassGrid {
     }
 }
 
+/// Radius of the Web Mercator sphere (the WGS 84 semi-major axis), metres.
+pub const MERCATOR_RADIUS_M: f64 = 6_378_137.0;
+
+/// The coordinate system of an imagery raster's transform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageCrs {
+    /// Longitude / latitude, degrees.
+    Geographic,
+    /// Web Mercator (EPSG:3857), metres.
+    WebMercator,
+}
+
+impl ImageCrs {
+    /// A longitude / latitude in this CRS.
+    pub fn from_lonlat(self, lon: f64, lat: f64) -> (f64, f64) {
+        match self {
+            ImageCrs::Geographic => (lon, lat),
+            ImageCrs::WebMercator => {
+                (MERCATOR_RADIUS_M * lon.to_radians(), MERCATOR_RADIUS_M * lat.to_radians().tan().asinh())
+            }
+        }
+    }
+
+    /// The longitude / latitude of a point in this CRS.
+    pub fn to_lonlat(self, x: f64, y: f64) -> (f64, f64) {
+        match self {
+            ImageCrs::Geographic => (x, y),
+            ImageCrs::WebMercator => {
+                ((x / MERCATOR_RADIUS_M).to_degrees(), (y / MERCATOR_RADIUS_M).sinh().atan().to_degrees())
+            }
+        }
+    }
+}
+
+/// An 8-bit colour raster (aerial imagery), or the window of one that was read. Pixels are
+/// RGBA: alpha comes from the file's alpha band when it has one, is 0 where every band holds
+/// the declared no-data value, and is 255 elsewhere. A fourth band that is not alpha (NAIP's
+/// near-infrared) is dropped.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RgbImage {
+    /// Columns in the window.
+    pub width: usize,
+    /// Rows in the window.
+    pub height: usize,
+    /// Row-major RGBA bytes; transparent pixels are all zero.
+    pub rgba: Vec<u8>,
+    /// Pixel-edge affine transform of the window in `crs` units (axis-aligned, north up).
+    pub transform: [f64; 6],
+    /// What the transform's units are.
+    pub crs: ImageCrs,
+    /// Column and row of the window's first pixel in the file.
+    pub origin: (usize, usize),
+    /// Width and height of the whole file.
+    pub source_size: (usize, usize),
+}
+
+impl RgbImage {
+    /// Loads an imagery GeoTIFF, or the window of it meeting `bbox` (longitude / latitude).
+    pub fn load(path: &Path, bbox: Option<(f64, f64, f64, f64)>) -> Result<RgbImage, CompileError> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|mut f| f.read_to_end(&mut bytes))
+            .map_err(|e| CompileError::Io(path.to_path_buf(), e))?;
+        RgbImage::parse(&bytes, bbox).map_err(|e| CompileError::Raster(format!("{}: {e}", path.display())))
+    }
+
+    /// Parses a three- or four-band, 8-bit, interleaved GeoTIFF with an axis-aligned
+    /// transform in a geographic CRS or Web Mercator.
+    pub fn parse(b: &[u8], bbox: Option<(f64, f64, f64, f64)>) -> Result<RgbImage, TiffError> {
+        let l = Layout::parse(b, true)?;
+        if l.bits != 8 || l.sample_format != 1 {
+            return Err(TiffError::Unsupported(format!(
+                "imagery has 8-bit unsigned samples, not format {} with {} bits",
+                l.sample_format, l.bits
+            )));
+        }
+        let t = l.geo.transform;
+        if t[2] != 0.0 || t[4] != 0.0 || t[1] <= 0.0 || t[5] >= 0.0 {
+            return Err(TiffError::Unsupported("imagery must be north-up and axis-aligned".into()));
+        }
+        let crs = if l.geo.projected.is_some() { ImageCrs::WebMercator } else { ImageCrs::Geographic };
+        let (c0, r0, c1, r1) = match bbox {
+            Some((w, s, e, n)) => {
+                let (x0, y0) = crs.from_lonlat(w, s);
+                let (x1, y1) = crs.from_lonlat(e, n);
+                window_pixels(&t, (l.width, l.height), (x0, y0, x1, y1))
+            }
+            None => (0, 0, l.width, l.height),
+        };
+        let (w, h) = (c1.saturating_sub(c0), r1.saturating_sub(r0));
+        let raw = l.read_window(b, (c0, r0, c1, r1), 0)?;
+        let nodata = l.nodata.filter(|v| v.fract() == 0.0 && (0.0..=255.0).contains(v)).map(|v| v as u8);
+        let mut rgba = vec![0u8; w * h * 4];
+        for (px, src) in rgba.chunks_exact_mut(4).zip(raw.chunks_exact(l.spp)) {
+            let a = if l.alpha {
+                src[3]
+            } else if nodata.is_some_and(|n| src[..3].iter().all(|&v| v == n)) {
+                0
+            } else {
+                255
+            };
+            if a > 0 {
+                px.copy_from_slice(&[src[0], src[1], src[2], a]);
+            }
+        }
+        let transform = [t[0] + c0 as f64 * t[1], t[1], 0.0, t[3] + r0 as f64 * t[5], 0.0, t[5]];
+        Ok(RgbImage { width: w, height: h, rgba, transform, crs, origin: (c0, r0), source_size: (l.width, l.height) })
+    }
+
+    /// RGBA at a pixel of the window; `None` outside it.
+    pub fn at(&self, col: usize, row: usize) -> Option<[u8; 4]> {
+        (col < self.width && row < self.height).then(|| {
+            let k = (row * self.width + col) * 4;
+            [self.rgba[k], self.rgba[k + 1], self.rgba[k + 2], self.rgba[k + 3]]
+        })
+    }
+
+    /// Bounds `(west, south, east, north)` of the window in `crs` units.
+    pub fn bounds(&self) -> (f64, f64, f64, f64) {
+        let t = &self.transform;
+        (t[0], t[3] + self.height as f64 * t[5], t[0] + self.width as f64 * t[1], t[3])
+    }
+
+    /// Longitude / latitude bounds `(west, south, east, north)` of the window.
+    pub fn bounds_lonlat(&self) -> (f64, f64, f64, f64) {
+        let (w, s, e, n) = self.bounds();
+        let (w, s) = self.crs.to_lonlat(w, s);
+        let (e, n) = self.crs.to_lonlat(e, n);
+        (w, s, e, n)
+    }
+}
+
+/// Writes imagery as a little-endian, uncompressed, single-strip GeoTIFF: three bands, or
+/// four with an unassociated alpha band when any pixel is not opaque. Georeferenced in
+/// WGS 84 degrees or Web Mercator, as `img.crs` says.
+pub fn write_rgb(path: &Path, img: &RgbImage) -> Result<(), CompileError> {
+    let alpha = img.rgba.chunks_exact(4).any(|p| p[3] != 255);
+    let data: Vec<u8> =
+        if alpha { img.rgba.clone() } else { img.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect() };
+    let geokeys: Vec<u16> = match img.crs {
+        ImageCrs::Geographic => vec![1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326],
+        ImageCrs::WebMercator => vec![1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 3857],
+    };
+    let raster = Raster {
+        width: img.width as u32,
+        height: img.height as u32,
+        transform: img.transform,
+        bits: 8,
+        sample_format: 1,
+        spp: if alpha { 4 } else { 3 },
+        extra_samples: alpha.then_some(2),
+        geokeys,
+        nodata: None,
+    };
+    write_raster(path, &raster, &data)
+}
+
 /// Writes a categorical raster as a little-endian, uncompressed, single-strip 8-bit GeoTIFF.
 pub fn write_u8(path: &Path, grid: &ClassGrid) -> Result<(), CompileError> {
     let dem = Dem {
@@ -385,6 +506,10 @@ struct Layout {
     predictor: u16,
     sample_format: u16,
     size: usize,
+    /// Interleaved samples per pixel.
+    spp: usize,
+    /// The fourth sample is alpha (ExtraSamples 1 or 2) rather than another band.
+    alpha: bool,
     tiled: bool,
     block_w: usize,
     block_h: usize,
@@ -397,7 +522,9 @@ struct Layout {
 }
 
 impl Layout {
-    fn parse(b: &[u8]) -> Result<Layout, TiffError> {
+    /// Reads the first image's layout. `imagery` admits three- and four-band rasters and Web
+    /// Mercator; otherwise the raster must have one band in a geographic CRS.
+    fn parse(b: &[u8], imagery: bool) -> Result<Layout, TiffError> {
         let big_endian = match b.get(0..4) {
             Some([b'I', b'I', 42, 0]) => false,
             Some([b'M', b'M', 0, 42]) => true,
@@ -431,9 +558,20 @@ impl Layout {
         let bits = one(258, Some(1.0))? as u16;
         let compression = one(259, Some(1.0))? as u16;
         let samples_per_pixel = one(277, Some(1.0))? as u16;
-        if samples_per_pixel != 1 {
+        if imagery {
+            if !matches!(samples_per_pixel, 3 | 4) {
+                return Err(TiffError::Unsupported(format!(
+                    "{samples_per_pixel} samples per pixel; imagery has three (RGB) or four bands"
+                )));
+            }
+            if one(284, Some(1.0))? as u16 != 1 {
+                return Err(TiffError::Unsupported("separate band planes (PlanarConfiguration 2)".into()));
+            }
+        } else if samples_per_pixel != 1 {
             return Err(TiffError::Unsupported(format!("{samples_per_pixel} samples per pixel; a DEM has one band")));
         }
+        // A fourth band is alpha only when ExtraSamples says so; NAIP's is near-infrared.
+        let alpha = samples_per_pixel == 4 && matches!(num(338)?.as_deref(), Some([1.0 | 2.0, ..]));
         let predictor = one(317, Some(1.0))? as u16;
         let sample_format = one(339, Some(1.0))? as u16;
         let size = match (sample_format, bits) {
@@ -480,7 +618,7 @@ impl Layout {
         }
 
         // Georeferencing.
-        let geo = Georef::from_tags(&rd, &tags)?;
+        let geo = Georef::from_tags(&rd, &tags, imagery)?;
 
         let nodata = match get(42113) {
             Some(e) => {
@@ -503,6 +641,8 @@ impl Layout {
             predictor,
             sample_format,
             size,
+            spp: samples_per_pixel as usize,
+            alpha,
             tiled,
             block_w,
             block_h,
@@ -515,13 +655,61 @@ impl Layout {
         })
     }
 
+    /// The samples of the pixels `[c0, c1) × [r0, r1)`, row-major and interleaved as stored,
+    /// decoding only the blocks that meet the window (in parallel). Bytes no block covers hold
+    /// `fill`.
+    fn read_window(&self, b: &[u8], window: (usize, usize, usize, usize), fill: u8) -> Result<Vec<u8>, TiffError> {
+        let (c0, r0, c1, r1) = window;
+        let (w, h) = (c1.saturating_sub(c0), r1.saturating_sub(r0));
+        let px = self.size * self.spp;
+        let mut out = vec![fill; w * h * px];
+        if w == 0 || h == 0 {
+            return Ok(out);
+        }
+        let down = self.offsets.len() / self.across;
+        let blocks: Vec<usize> = (0..self.offsets.len())
+            .filter(|&i| {
+                let (bx, by) = (i % self.across, i / self.across);
+                bx * self.block_w < c1
+                    && (bx + 1) * self.block_w > c0
+                    && by * self.block_h < r1
+                    && (by + 1) * self.block_h > r0
+                    && by < down
+            })
+            .collect();
+        let decoded = crate::par::parallel_map(&blocks, crate::par::thread_count(0), |&i| {
+            let mut block = Vec::new();
+            let rows = self.decode_block(b, i, &mut block).map_err(CompileError::from)?;
+            Ok((i, rows, block))
+        })
+        .map_err(|e| TiffError::Malformed(e.to_string()))?;
+        for (i, rows, block) in decoded {
+            let (bx, by) = (i % self.across, i / self.across);
+            for r in 0..rows {
+                let row = by * self.block_h + r;
+                if row < r0 || row >= r1 {
+                    continue;
+                }
+                let col_lo = (bx * self.block_w).max(c0);
+                let col_hi = ((bx + 1) * self.block_w).min(c1).min(self.width);
+                if col_lo >= col_hi {
+                    continue;
+                }
+                let src = &block[(r * self.block_w + (col_lo - bx * self.block_w)) * px..][..(col_hi - col_lo) * px];
+                let dst = ((row - r0) * w + (col_lo - c0)) * px;
+                out[dst..dst + src.len()].copy_from_slice(src);
+            }
+        }
+        Ok(out)
+    }
+
     /// Decompresses block `i` into `block` and undoes its predictor; returns the rows it holds.
     fn decode_block(&self, b: &[u8], i: usize, block: &mut Vec<u8>) -> Result<usize, TiffError> {
         let by = i / self.across;
         let (off, cnt) = (self.offsets[i] as usize, self.counts[i] as usize);
         let raw = b.get(off..off + cnt).ok_or_else(|| TiffError::Malformed(format!("block {i} outside the file")))?;
         let rows_here = if self.tiled { self.block_h } else { self.block_h.min(self.height - by * self.block_h) };
-        let expected = self.block_w * rows_here * self.size;
+        let expected = self.block_w * rows_here * self.size * self.spp;
         block.clear();
         match self.compression {
             1 => block.extend_from_slice(raw),
@@ -538,7 +726,7 @@ impl Layout {
         }
         block.truncate(expected);
         match self.predictor {
-            2 => undo_horizontal(block, self.block_w, self.size, self.big_endian),
+            2 => undo_horizontal(block, self.block_w, self.size, self.spp, self.big_endian),
             3 => undo_float(block, self.block_w, self.size),
             _ => {}
         }
@@ -568,8 +756,40 @@ fn write_samples(
     sample_format: u16,
     nodata: Option<String>,
 ) -> Result<(), CompileError> {
-    let (w, h) = (dem.width as u32, dem.height as u32);
-    let t = dem.transform;
+    let raster = Raster {
+        width: dem.width as u32,
+        height: dem.height as u32,
+        transform: dem.transform,
+        bits,
+        sample_format,
+        spp: 1,
+        extra_samples: None,
+        geokeys: vec![1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, dem.crs.unwrap_or(4326)],
+        nodata,
+    };
+    write_raster(path, &raster, data)
+}
+
+/// What [`write_raster`] needs besides the samples.
+struct Raster {
+    width: u32,
+    height: u32,
+    transform: [f64; 6],
+    bits: u16,
+    sample_format: u16,
+    /// Interleaved samples per pixel: 1 (grey), 3 (RGB) or 4.
+    spp: u16,
+    /// The ExtraSamples code of a fourth sample (2: unassociated alpha).
+    extra_samples: Option<u16>,
+    geokeys: Vec<u16>,
+    nodata: Option<String>,
+}
+
+/// Writes one strip of little-endian samples.
+fn write_raster(path: &Path, raster: &Raster, data: &[u8]) -> Result<(), CompileError> {
+    let (w, h) = (raster.width, raster.height);
+    let t = raster.transform;
+    let (bits, spp) = (raster.bits, raster.spp);
     let mut tags: Vec<(u16, u16, Vec<u8>, u32)> = Vec::new(); // tag, type, payload, count
     let shorts = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
     let longs = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
@@ -577,15 +797,19 @@ fn write_samples(
     let data_len = data.len() as u32;
     tags.push((256, 4, longs(&[w]), 1));
     tags.push((257, 4, longs(&[h]), 1));
-    tags.push((258, 3, shorts(&[bits]), 1));
+    let per_band = |v: u16| vec![v; spp as usize];
+    tags.push((258, 3, shorts(&per_band(bits)), u32::from(spp)));
     tags.push((259, 3, shorts(&[1]), 1));
-    tags.push((262, 3, shorts(&[1]), 1));
+    tags.push((262, 3, shorts(&[if spp >= 3 { 2 } else { 1 }]), 1));
     tags.push((273, 4, longs(&[0]), 1)); // strip offset, patched below
-    tags.push((277, 3, shorts(&[1]), 1));
+    tags.push((277, 3, shorts(&[spp]), 1));
     tags.push((278, 4, longs(&[h]), 1));
     tags.push((279, 4, longs(&[data_len]), 1));
     tags.push((284, 3, shorts(&[1]), 1));
-    tags.push((339, 3, shorts(&[sample_format]), 1));
+    if let Some(extra) = raster.extra_samples {
+        tags.push((338, 3, shorts(&[extra]), 1));
+    }
+    tags.push((339, 3, shorts(&per_band(raster.sample_format)), u32::from(spp)));
     if t[2] == 0.0 && t[4] == 0.0 && t[1] > 0.0 && t[5] < 0.0 {
         tags.push((33550, 12, doubles(&[t[1], -t[5], 0.0]), 3));
         tags.push((33922, 12, doubles(&[0.0, 0.0, 0.0, t[0], t[3], 0.0]), 6));
@@ -593,9 +817,8 @@ fn write_samples(
         let m = [t[1], t[2], 0.0, t[0], t[4], t[5], 0.0, t[3], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         tags.push((34264, 12, doubles(&m), 16));
     }
-    let geokeys = [1u16, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, dem.crs.unwrap_or(4326)];
-    tags.push((34735, 3, shorts(&geokeys), geokeys.len() as u32));
-    if let Some(n) = nodata {
+    tags.push((34735, 3, shorts(&raster.geokeys), raster.geokeys.len() as u32));
+    if let Some(n) = &raster.nodata {
         let n = format!("{n}\0");
         tags.push((42113, 2, n.as_bytes().to_vec(), n.len() as u32));
     }
@@ -647,11 +870,17 @@ fn write_samples(
 struct Georef {
     transform: [f64; 6],
     crs: Option<u16>,
+    /// `ProjectedCSTypeGeoKey` of a projected raster (only Web Mercator is admitted).
+    projected: Option<u16>,
     pixel_is_point: bool,
 }
 
+/// EPSG codes of Web Mercator: 3857, and the deprecated 3785 and 900913 aliases (the last
+/// does not fit a GeoKey short and so never appears).
+const WEB_MERCATOR_EPSG: [u16; 2] = [3857, 3785];
+
 impl Georef {
-    fn from_tags(rd: &Reader<'_>, tags: &BTreeMap<u16, Entry>) -> Result<Georef, TiffError> {
+    fn from_tags(rd: &Reader<'_>, tags: &BTreeMap<u16, Entry>, imagery: bool) -> Result<Georef, TiffError> {
         let keys = match tags.get(&34735) {
             Some(e) => rd.numbers(e)?,
             None => return Err(TiffError::Georeferencing("no GeoKeyDirectory; not a GeoTIFF".into())),
@@ -679,11 +908,13 @@ impl Georef {
             }
         }
         match model_type {
-            Some(2) => {}
+            Some(2) => projected = None,
+            Some(1) if imagery && projected.is_some_and(|p| WEB_MERCATOR_EPSG.contains(&p)) => {}
             Some(1) => {
                 return Err(TiffError::Georeferencing(format!(
-                    "projected CRS (EPSG {}); reproject to geographic coordinates first",
-                    projected.map_or("unknown".to_owned(), |p| p.to_string())
+                    "projected CRS (EPSG {}); reproject to geographic coordinates{} first",
+                    projected.map_or("unknown".to_owned(), |p| p.to_string()),
+                    if imagery { " or Web Mercator" } else { "" }
                 )));
             }
             Some(3) => return Err(TiffError::Georeferencing("geocentric CRS".into())),
@@ -726,7 +957,7 @@ impl Georef {
         if transform[1] * transform[5] - transform[2] * transform[4] == 0.0 {
             return Err(TiffError::Georeferencing("singular pixel transform".into()));
         }
-        Ok(Georef { transform, crs, pixel_is_point })
+        Ok(Georef { transform, crs, projected, pixel_is_point })
     }
 }
 
@@ -845,13 +1076,14 @@ fn decode_sample(s: &[u8], format: u16, bits: u16, be: bool) -> f64 {
     }
 }
 
-/// Predictor 2: each sample is stored as the difference from the one to its left.
-fn undo_horizontal(block: &mut [u8], width: usize, size: usize, big_endian: bool) {
-    let stride = width * size;
+/// Predictor 2: each sample is stored as the difference from the same band's sample one
+/// pixel to the left (`spp` interleaved samples per pixel).
+fn undo_horizontal(block: &mut [u8], width: usize, size: usize, spp: usize, big_endian: bool) {
+    let stride = width * size * spp;
     for row in block.chunks_exact_mut(stride) {
-        for c in 1..width {
+        for c in spp..width * spp {
             let (prev, cur) = row.split_at_mut(c * size);
-            let prev = &prev[(c - 1) * size..];
+            let prev = &prev[(c - spp) * size..];
             let cur = &mut cur[..size];
             match size {
                 1 => cur[0] = cur[0].wrapping_add(prev[0]),
@@ -984,11 +1216,15 @@ mod tests {
     #[test]
     fn predictors() {
         let mut row = vec![5u8, 1, 1, 250];
-        undo_horizontal(&mut row, 4, 1, false);
+        undo_horizontal(&mut row, 4, 1, 1, false);
         assert_eq!(row, [5, 6, 7, 1]);
+        // Interleaved RGB: each band is differenced against itself.
+        let mut row = vec![10u8, 20, 30, 1, 2, 3, 255, 0, 1];
+        undo_horizontal(&mut row, 3, 1, 3, false);
+        assert_eq!(row, [10, 20, 30, 11, 22, 33, 10, 22, 34]);
         let mut row = 300u16.to_le_bytes().to_vec();
         row.extend((-50i16 as u16).to_le_bytes());
-        undo_horizontal(&mut row, 2, 2, false);
+        undo_horizontal(&mut row, 2, 2, 1, false);
         assert_eq!(u16::from_le_bytes([row[2], row[3]]), 250);
         // Float predictor: two samples 1.0 and 2.0 → big-endian planes, byte-differenced.
         let be = [1.0f32.to_be_bytes(), 2.0f32.to_be_bytes()];
@@ -1046,6 +1282,95 @@ mod tests {
         assert_eq!(grid.centres_in(10.006, 49.98, 10.014, 50.0), (1, 0, 1, 2)); // no centre inside
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(f).unwrap();
+    }
+
+    #[test]
+    fn imagery_round_trips_in_both_crs() {
+        let path = std::env::temp_dir().join(format!("nosim-rgb-{}.tif", std::process::id()));
+        let (w, h) = (6usize, 4usize);
+        for (crs, transform) in [
+            (ImageCrs::Geographic, [-74.0, 0.001, 0.0, 41.0, 0.0, -0.001]),
+            (ImageCrs::WebMercator, [-8_237_000.0, 2.0, 0.0, 5_012_000.0, 0.0, -2.0]),
+        ] {
+            let rgba: Vec<u8> = (0..w * h).flat_map(|i| [i as u8, (i * 3) as u8, (i * 7) as u8, 255]).collect();
+            let mut img = RgbImage { width: w, height: h, rgba, transform, crs, origin: (0, 0), source_size: (w, h) };
+            write_rgb(&path, &img).unwrap();
+            assert_eq!(RgbImage::load(&path, None).unwrap(), img);
+            // With an alpha band: transparent pixels read back as all zero.
+            img.rgba[0..4].copy_from_slice(&[0, 0, 0, 0]);
+            img.rgba[7] = 128;
+            write_rgb(&path, &img).unwrap();
+            assert_eq!(RgbImage::load(&path, None).unwrap(), img);
+            // A window on the pixel edges of columns 2–3 and rows 1–2, given in degrees.
+            let t = transform;
+            let (west, south) = crs.to_lonlat(t[0] + 2.0 * t[1], t[3] + 3.0 * t[5]);
+            let (east, north) = crs.to_lonlat(t[0] + 4.0 * t[1], t[3] + t[5]);
+            let win = RgbImage::load(&path, Some((west, south, east, north))).unwrap();
+            assert_eq!((win.width, win.height, win.origin, win.source_size), (2, 2, (2, 1), (w, h)));
+            assert_eq!(win.at(0, 0), img.at(2, 1));
+            assert_eq!(win.at(1, 1), img.at(3, 2));
+            let b = win.bounds_lonlat();
+            assert!((b.0 - west).abs() < 1e-9 && (b.3 - north).abs() < 1e-9);
+            // Imagery is not a DEM.
+            assert!(matches!(Dem::load(&path), Err(CompileError::Raster(m)) if m.contains("samples per pixel")));
+        }
+        // A fourth band that is not alpha (NAIP's near-infrared) is dropped.
+        let raster = Raster {
+            width: 2,
+            height: 1,
+            transform: [-74.0, 0.001, 0.0, 41.0, 0.0, -0.001],
+            bits: 8,
+            sample_format: 1,
+            spp: 4,
+            extra_samples: None,
+            geokeys: vec![1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326],
+            nodata: None,
+        };
+        write_raster(&path, &raster, &[1, 2, 3, 0, 4, 5, 6, 99]).unwrap();
+        assert_eq!(RgbImage::load(&path, None).unwrap().rgba, [1, 2, 3, 255, 4, 5, 6, 255]);
+        // Declared no-data in every band is transparent.
+        let raster = Raster { spp: 3, nodata: Some("0".into()), ..raster };
+        write_raster(&path, &raster, &[0, 0, 0, 0, 7, 0]).unwrap();
+        assert_eq!(RgbImage::load(&path, None).unwrap().rgba, [0, 0, 0, 0, 0, 7, 0, 255]);
+        // A DEM is not imagery.
+        let dem = Dem::parse(&std::fs::read(&path).unwrap());
+        assert!(dem.is_err());
+        let one_band = Raster { spp: 1, nodata: None, ..raster };
+        write_raster(&path, &one_band, &[1, 2]).unwrap();
+        assert!(matches!(RgbImage::load(&path, None), Err(CompileError::Raster(m)) if m.contains("three (RGB)")));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn web_mercator_is_imagery_only() {
+        let (x, y) = ImageCrs::WebMercator.from_lonlat(-73.78, 40.64);
+        let (lon, lat) = ImageCrs::WebMercator.to_lonlat(x, y);
+        assert!((lon + 73.78).abs() < 1e-12 && (lat - 40.64).abs() < 1e-12);
+        // The north edge of z14 tile row 6164, as the USGS image service georeferences it.
+        let (_, north) = crate::tiler::tile_to_lonlat(0.0, 6164.0, 14);
+        assert!((ImageCrs::WebMercator.from_lonlat(0.0, north).1 - 4_960_457.387_594_799).abs() < 1e-6);
+        let path = std::env::temp_dir().join(format!("nosim-merc-{}.tif", std::process::id()));
+        let raster = Raster {
+            width: 2,
+            height: 1,
+            transform: [x, 1.0, 0.0, y, 0.0, -1.0],
+            bits: 8,
+            sample_format: 1,
+            spp: 1,
+            extra_samples: None,
+            geokeys: vec![1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 3857],
+            nodata: None,
+        };
+        write_raster(&path, &raster, &[1, 2]).unwrap();
+        assert!(matches!(Dem::load(&path), Err(CompileError::Raster(m)) if m.contains("projected CRS (EPSG 3857)")));
+        // Projected CRSs other than Web Mercator are refused for imagery too (UTM 18N here).
+        let utm =
+            Raster { spp: 3, geokeys: vec![1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, 32618], ..raster };
+        write_raster(&path, &utm, &[0; 6]).unwrap();
+        assert!(
+            matches!(RgbImage::load(&path, None), Err(CompileError::Raster(m)) if m.contains("EPSG 32618") && m.contains("Web Mercator"))
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -619,6 +619,21 @@ fn package_polygons_tiles_and_scattering() {
             nosim_tile_read_bytes(classes.as_ptr(), c.as_mut_ptr(), 3, ptr::null_mut()),
             NosimStatus::NullPointer
         );
+        // Imagery: RGBA tiles as written, RGB and greyscale ones as opaque RGBA.
+        let rgba = [10u8, 20, 30, 255, 0, 0, 0, 0];
+        let imagery = tmp.join("imagery.png");
+        std::fs::write(&imagery, nosim_compiler::raster::png::encode_rgba(2, 1, &rgba)).unwrap();
+        let imagery = CString::new(imagery.to_str().unwrap()).unwrap();
+        assert_eq!(nosim_tile_read_rgba(imagery.as_ptr(), ptr::null_mut(), 0, &mut size), NosimStatus::BufferTooSmall);
+        assert_eq!((size.width, size.height), (2, 1));
+        let mut px = [0u8; 16];
+        assert_eq!(nosim_tile_read_rgba(imagery.as_ptr(), px.as_mut_ptr(), 8, &mut size), NosimStatus::Ok);
+        assert_eq!(px[..8], rgba);
+        assert_eq!(nosim_tile_read_rgba(terrain.as_ptr(), px.as_mut_ptr(), 16, &mut size), NosimStatus::Ok);
+        assert_eq!(px[..4], [rgb[0], rgb[1], rgb[2], 255]);
+        assert_eq!(nosim_tile_read_rgba(classes.as_ptr(), px.as_mut_ptr(), 16, &mut size), NosimStatus::Ok);
+        assert_eq!(px[..8], [10, 10, 10, 255, 80, 80, 80, 255]);
+        assert_eq!(nosim_tile_read_rgba(missing.as_ptr(), px.as_mut_ptr(), 16, &mut size), NosimStatus::Io);
     }
     std::fs::remove_dir_all(&tmp).unwrap();
 

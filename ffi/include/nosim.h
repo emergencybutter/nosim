@@ -2123,6 +2123,21 @@ enum NosimStatus nosim_tile_read_bytes(const char *path,
                                        struct NosimTileSize *size);
 
 /**
+ * Decodes an imagery tile (`imagery/z/x/y.png`, as `world-compiler imagery` writes them)
+ * into RGBA bytes, four per pixel, row-major from the north-west corner. RGB and greyscale
+ * tiles read as opaque; alpha is the fraction of the pixel the imagery covers. Sizing works
+ * as in `nosim_tile_read_heights`, with `capacity` counted in bytes.
+ *
+ * # Safety
+ * `path` must be NULL or a NUL-terminated string; `out` must be NULL or point to `capacity`
+ * bytes; `size` must be NULL or writable.
+ */
+enum NosimStatus nosim_tile_read_rgba(const char *path,
+                                      uint8_t *out,
+                                      size_t capacity,
+                                      struct NosimTileSize *size);
+
+/**
  * §5 scattering: Poisson-disk points (Bridson) in `[0, width) × [0, height)` metres, no two
  * closer than `radius`, each kept with the probability `density` gives at its position.
  * `density` is a `density_width × density_height` grid of 0–255 values (a land-cover mask,

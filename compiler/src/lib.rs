@@ -10,6 +10,7 @@ pub mod atmosphere;
 pub mod bridges;
 pub mod geoparquet;
 pub mod graph;
+pub mod imagery;
 pub mod landcover;
 pub mod osm;
 pub(crate) mod par;
@@ -207,6 +208,8 @@ pub enum Command {
     Bridges(BridgesArgs),
     /// Resample a land-cover raster into class tiles and density masks.
     Landcover(LandcoverArgs),
+    /// Tile aerial imagery for draping over the terrain.
+    Imagery(ImageryArgs),
     /// Precompute the atmospheric scattering tables.
     Atmosphere(AtmosphereArgs),
     /// Build a directed road graph from a spline table.
@@ -322,6 +325,17 @@ pub struct LandcoverArgs {
     pub packages: Option<PathBuf>,
 }
 
+/// `imagery` subcommand options.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ImageryArgs {
+    /// GeoTIFFs, or directories of them, in priority order.
+    pub inputs: Vec<PathBuf>,
+    /// Directory for the `z/x/y.png` tiles and `imagery.json`.
+    pub output: PathBuf,
+    /// Processing parameters.
+    pub options: imagery::ImageryOptions,
+}
+
 /// `atmosphere` subcommand options.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AtmosphereArgs {
@@ -388,6 +402,7 @@ pub const USAGE: &str = "world-compiler arinc --input <cifp.txt> --output <runwa
                          world-compiler areas --input <extract.osm.pbf> --output <dir> [--bbox <west,south,east,north>] [--packages <dir>] [--threads <n>]\n\
                          world-compiler bridges --splines <splines.geoparquet> --areas <dir> --output <bridges.geoparquet> [--dem <dem.tif>] [--min-drop <m>] [--expect-over-water <name>=<m>]... [--threads <n>]\n\
                          world-compiler landcover --input <worldcover.tif> --output <dir> [--bbox <west,south,east,north>] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--packages <dir>] [--threads <n>]\n\
+                         world-compiler imagery --input <image.tif|dir>... --output <dir> [--bbox <west,south,east,north>] [--min-zoom <z>] [--max-zoom <z>] [--tile-size <px>] [--threads <n>]\n\
                          world-compiler atmosphere --output <dir> [--sizes reference|small|tiny] [--orders <n>] [--handover-km <km>]\n\
                          world-compiler graph --input <splines.geoparquet> --output <dir> [--mode drive|taxi|walk] [--largest-component] [--simulate <s> [--demand <veh/h>] [--dt <s>] [--capacity-split] [--assign-iterations <n>] [--min-exit-ratio <r>] [--near-field <lon,lat,radius_m> [--near-substeps <n>]]] [--walk-from <lon,lat> --walk-to <lon,lat> [--walkers <n>] [--walk-seconds <s>]]";
 
@@ -403,10 +418,11 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Command, Co
         Some("areas") => parse_areas(it).map(Command::Areas),
         Some("bridges") => parse_bridges(it).map(Command::Bridges),
         Some("landcover") => parse_landcover(it).map(Command::Landcover),
+        Some("imagery") => parse_imagery(it).map(Command::Imagery),
         Some("atmosphere") => parse_atmosphere(it).map(Command::Atmosphere),
         Some("graph") => parse_graph(it).map(Command::Graph),
         other => Err(CompileError::Usage(format!(
-            "expected subcommand `arinc`, `validate`, `tiles`, `raster`, `osm`, `areas`, `bridges`, `landcover`, `atmosphere` or `graph`, got {other:?}\n{USAGE}"
+            "expected subcommand `arinc`, `validate`, `tiles`, `raster`, `osm`, `areas`, `bridges`, `landcover`, `imagery`, `atmosphere` or `graph`, got {other:?}\n{USAGE}"
         ))),
     }
 }
@@ -778,6 +794,77 @@ pub fn run_landcover(args: &LandcoverArgs) -> Result<landcover::LandcoverSummary
     let grid = raster::geotiff::ClassGrid::load(&args.input, args.options.bbox)?;
     let vfs = args.packages.as_deref().map(mount_packages).transpose()?;
     landcover::process(&grid, &args.output, &args.options, vfs.as_ref())
+}
+
+fn parse_imagery<I: Iterator<Item = String>>(mut it: I) -> Result<ImageryArgs, CompileError> {
+    let (mut inputs, mut output) = (Vec::new(), None);
+    let mut options = imagery::ImageryOptions::default();
+    let bad = |flag: &str, value: &str| {
+        CompileError::Usage(format!(
+            "{flag}: invalid value {value:?}
+{USAGE}"
+        ))
+    };
+    while let Some(flag) = it.next() {
+        let value = it.next().ok_or_else(|| {
+            CompileError::Usage(format!(
+                "{flag} needs a value
+{USAGE}"
+            ))
+        })?;
+        match flag.as_str() {
+            "--input" => inputs.push(PathBuf::from(value)),
+            "--output" => output = Some(PathBuf::from(value)),
+            "--bbox" => options.bbox = Some(parse_bbox(&value).ok_or_else(|| bad(&flag, &value))?),
+            "--min-zoom" => options.min_zoom = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--max-zoom" => options.max_zoom = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--tile-size" => options.tile_size = value.parse().map_err(|_| bad(&flag, &value))?,
+            "--threads" => options.threads = value.parse().map_err(|_| bad(&flag, &value))?,
+            _ => {
+                return Err(CompileError::Usage(format!(
+                    "unknown flag {flag}
+{USAGE}"
+                )));
+            }
+        }
+    }
+    if inputs.is_empty() {
+        return Err(CompileError::Usage(format!(
+            "--input is required
+{USAGE}"
+        )));
+    }
+    Ok(ImageryArgs {
+        inputs,
+        output: output.ok_or_else(|| {
+            CompileError::Usage(format!(
+                "--output is required
+{USAGE}"
+            ))
+        })?,
+        options,
+    })
+}
+
+/// Runs `imagery`: reads the window of every source meeting the bounding box (sources it
+/// misses are skipped) and writes the tile pyramid.
+pub fn run_imagery(args: &ImageryArgs) -> Result<imagery::ImagerySummary, CompileError> {
+    let paths = imagery::list_sources(&args.inputs)?;
+    if paths.is_empty() {
+        return Err(CompileError::Usage("no GeoTIFF among the inputs".into()));
+    }
+    let mut mosaic = imagery::Mosaic::default();
+    let mut names = Vec::new();
+    for path in &paths {
+        let img = raster::geotiff::RgbImage::load(path, args.options.bbox)?;
+        if img.width > 0 && img.height > 0 {
+            mosaic.images.push(img);
+            names.push(
+                path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned()),
+            );
+        }
+    }
+    imagery::process(&mosaic, &names, &args.output, &args.options)
 }
 
 fn parse_atmosphere<I: Iterator<Item = String>>(mut it: I) -> Result<AtmosphereArgs, CompileError> {

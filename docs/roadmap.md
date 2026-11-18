@@ -294,7 +294,7 @@ These are named in the spec but have no milestone yet:
 - 3D Tiles output;
 - projected-CRS DEMs and BigTIFF;
 - lunar physical libration;
-- imagery rasters (Sentinel-2, NAIP).
+- Sentinel-2 imagery (NAIP, for the United States, is in: `world-compiler imagery`).
 
 Each becomes a milestone when a consumer needs it.
 

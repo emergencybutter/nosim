@@ -192,3 +192,68 @@ uint8 FNosimRasterMosaic::Byte(double Lon, double Lat) const
 	}
 	return Bytes[J * Width + I];
 }
+
+int32 NosimImagery::DeepestZoom(const FString& Dir, int32 MaxZoom)
+{
+	for (const int32 Z : ZoomsWritten(Dir))
+	{
+		if (Z <= MaxZoom)
+		{
+			return Z;
+		}
+	}
+	return -1;
+}
+
+bool NosimImagery::LoadChunk(const FString& Dir, int32 Zoom, int32 ChunkZoom, int32 Cx, int32 Cy, FNosimImageryChunk& Out)
+{
+	Out = FNosimImageryChunk();
+	if (Zoom < ChunkZoom)
+	{
+		return false;
+	}
+	const int32 Span = 1 << (Zoom - ChunkZoom);
+	TArray<uint8> Rgba;
+	for (int32 Ty = 0; Ty < Span; ++Ty)
+	{
+		for (int32 Tx = 0; Tx < Span; ++Tx)
+		{
+			const FString Path = FPaths::Combine(Dir, FString::Printf(TEXT("%d/%d/%d.png"), Zoom, Cx * Span + Tx, Cy * Span + Ty));
+			if (!FPaths::FileExists(Path))
+			{
+				continue;
+			}
+			const FTCHARToUTF8 Utf8(*Path);
+			NosimTileSize Size = {0, 0};
+			nosim_tile_read_rgba(Utf8.Get(), nullptr, 0, &Size);
+			const int32 N = static_cast<int32>(Size.width);
+			if (N == 0 || Size.width != Size.height || (Out.Size != 0 && N * Span != Out.Size))
+			{
+				UE_LOG(LogNosim, Warning, TEXT("Skipping imagery tile %s (%u x %u)"), *Path, Size.width, Size.height);
+				continue;
+			}
+			if (Out.Size == 0)
+			{
+				Out.Size = N * Span;
+				Out.Pixels.Init(FColor(0, 0, 0, 0), Out.Size * Out.Size);
+			}
+			Rgba.SetNumUninitialized(N * N * 4);
+			if (nosim_tile_read_rgba(Utf8.Get(), Rgba.GetData(), Rgba.Num(), &Size) != NOSIM_STATUS_OK)
+			{
+				UE_LOG(LogNosim, Warning, TEXT("Imagery tile %s: %s"), *Path, *FNosimModule::LastError());
+				continue;
+			}
+			for (int32 J = 0; J < N; ++J)
+			{
+				FColor* Row = &Out.Pixels[(Ty * N + J) * Out.Size + Tx * N];
+				const uint8* Src = &Rgba[J * N * 4];
+				for (int32 I = 0; I < N; ++I)
+				{
+					Row[I] = FColor(Src[4 * I], Src[4 * I + 1], Src[4 * I + 2], Src[4 * I + 3]);
+				}
+			}
+			++Out.Tiles;
+		}
+	}
+	return Out.Tiles > 0;
+}

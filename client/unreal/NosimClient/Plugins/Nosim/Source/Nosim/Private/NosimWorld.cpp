@@ -13,10 +13,16 @@
 #include "Engine/ExponentialHeightFog.h"
 #include "Engine/SkyLight.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/Texture2D.h"
 #include "EngineUtils.h"
 #include "GameFramework/PlayerController.h"
 #include "Materials/Material.h"
+#include "Async/ParallelFor.h"
 #include "Materials/MaterialExpressionConstant.h"
+#include "Materials/MaterialExpressionLinearInterpolate.h"
+#include "Materials/MaterialExpressionMultiply.h"
+#include "Materials/MaterialExpressionScalarParameter.h"
+#include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialExpressionVertexColor.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Kismet/KismetSystemLibrary.h"
@@ -28,6 +34,7 @@
 #include "NosimGltf.h"
 #include "NosimRaster.h"
 #include "ProceduralMeshComponent.h"
+#include "TextureResource.h"
 
 namespace
 {
@@ -101,6 +108,109 @@ UMaterialInterface* VertexColorMaterial()
 #else
 	return LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/EngineDebugMaterials/VertexColorMaterial.VertexColorMaterial"));
 #endif
+}
+
+/**
+ * The terrain's material where it has imagery: the `Imagery` texture's colour, scaled by
+ * `Brightness`, over the land-cover vertex colour, mixed by the texture's alpha (its coverage).
+ */
+UMaterialInterface* ImageryMaterial()
+{
+#if WITH_EDITORONLY_DATA
+	static TStrongObjectPtr<UMaterial> Material;
+	if (!Material)
+	{
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimImagery"), RF_Transient);
+		UMaterialExpressionVertexColor* Color = NewObject<UMaterialExpressionVertexColor>(M);
+		UMaterialExpressionTextureSampleParameter2D* Photo = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		Photo->ParameterName = TEXT("Imagery");
+		Photo->Texture = LoadObject<UTexture2D>(nullptr, TEXT("/Engine/EngineResources/DefaultTexture.DefaultTexture"));
+		Photo->SamplerType = SAMPLERTYPE_Color;
+		UMaterialExpressionScalarParameter* Brightness = NewObject<UMaterialExpressionScalarParameter>(M);
+		Brightness->ParameterName = TEXT("Brightness");
+		Brightness->DefaultValue = 1.0f;
+		UMaterialExpressionMultiply* Scaled = NewObject<UMaterialExpressionMultiply>(M);
+		Scaled->A.Connect(0, Photo); // RGB
+		Scaled->B.Connect(0, Brightness);
+		UMaterialExpressionLinearInterpolate* Mix = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		Mix->A.Connect(0, Color);
+		Mix->B.Connect(0, Scaled);
+		Mix->Alpha.Connect(4, Photo); // A
+		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
+		Roughness->R = 0.9f;
+		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
+		Specular->R = 0.25f; // the photo has its own highlights
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Color, Photo, Brightness, Scaled, Mix, Roughness, Specular})
+		{
+			M->GetExpressionCollection().AddExpression(E);
+		}
+		M->GetEditorOnlyData()->BaseColor.Connect(0, Mix);
+		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
+		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
+		M->PostEditChange();
+		Material.Reset(M);
+	}
+	return Material.Get();
+#else
+	return VertexColorMaterial();
+#endif
+}
+
+/**
+ * An sRGB texture of a chunk's imagery with a full mip chain, each level the coverage-weighted
+ * mean of 2 × 2 texels of the one before, so transparent texels do not darken their neighbours.
+ */
+UTexture2D* MakeImageryTexture(const FNosimImageryChunk& Chunk)
+{
+	UTexture2D* Texture = UTexture2D::CreateTransient(Chunk.Size, Chunk.Size, PF_B8G8R8A8);
+	if (!Texture)
+	{
+		return nullptr;
+	}
+	FTexturePlatformData* Data = Texture->GetPlatformData();
+	auto Fill = [](FTexture2DMipMap& Mip, const TArray<FColor>& Pixels)
+	{
+		Mip.BulkData.Lock(LOCK_READ_WRITE);
+		FMemory::Memcpy(Mip.BulkData.Realloc(Pixels.Num() * sizeof(FColor)), Pixels.GetData(), Pixels.Num() * sizeof(FColor));
+		Mip.BulkData.Unlock();
+	};
+	Fill(Data->Mips[0], Chunk.Pixels);
+	TArray<FColor> Level = Chunk.Pixels;
+	for (int32 Size = Chunk.Size; Size > 1; Size /= 2)
+	{
+		const int32 Half = Size / 2;
+		TArray<FColor> Next;
+		Next.SetNumZeroed(Half * Half);
+		for (int32 J = 0; J < Half; ++J)
+		{
+			for (int32 I = 0; I < Half; ++I)
+			{
+				uint32 R = 0, G = 0, B = 0, A = 0;
+				for (const FIntPoint D : {FIntPoint(0, 0), FIntPoint(1, 0), FIntPoint(0, 1), FIntPoint(1, 1)})
+				{
+					const FColor& C = Level[(2 * J + D.Y) * Size + 2 * I + D.X];
+					R += C.R * C.A;
+					G += C.G * C.A;
+					B += C.B * C.A;
+					A += C.A;
+				}
+				if (A > 0)
+				{
+					Next[J * Half + I] = FColor((R + A / 2) / A, (G + A / 2) / A, (B + A / 2) / A, (A + 2) / 4);
+				}
+			}
+		}
+		Data->Mips.Add(new FTexture2DMipMap(Half, Half, 1));
+		Fill(Data->Mips.Last(), Next);
+		Level = MoveTemp(Next);
+	}
+	Texture->SRGB = true;
+	Texture->NeverStream = true;
+	Texture->AddressX = TA_Clamp;
+	Texture->AddressY = TA_Clamp;
+	Texture->LODGroup = TEXTUREGROUP_World;
+	Texture->UpdateResource();
+	return Texture;
 }
 
 const FLinearColor VehicleColors[3] = {
@@ -420,6 +530,9 @@ void ANosimWorld::BuildScene()
 	TreeCount = 0;
 	TerrainTiles = 0;
 	LandcoverTiles = 0;
+	ImageryTiles = 0;
+	ImageryZoom = -1;
+	ImageryTextures.Reset();
 	WorldName.Reset();
 	bCameraPlaced = false;
 
@@ -592,64 +705,115 @@ void ANosimWorld::BuildScene()
 		return H.IsSet() ? H.GetValue() : GroundZ;
 	};
 
-	// Terrain: a grid over the area at the DEM's heights, coloured by land-cover class.
-	FMeshBuffer TerrainMesh;
+	// Terrain: one mesh section per chunk, a tile three zooms above the imagery's (8 × 8 imagery
+	// tiles, one texture), or a z14 tile without imagery. Each chunk is a grid over its part of
+	// the area whose edges lie on the tile's, so neighbours meet exactly. Heights and slopes come
+	// from the DEM, colour from the land cover, under the photo where there is one.
+	struct FTerrainChunk
+	{
+		FMeshBuffer Mesh;
+		UTexture2D* Texture = nullptr;
+	};
+	TArray<FTerrainChunk> Chunks;
+	const FString ImageryDir = World.IsEmpty() || !bDrawImagery ? FString() : FPaths::Combine(World, TEXT("imagery"));
+	ImageryZoom = ImageryDir.IsEmpty() ? -1 : NosimImagery::DeepestZoom(ImageryDir, ImageryMaxZoom);
 	if (Heights.IsValid())
 	{
+		const int32 ChunkZoom = ImageryZoom >= 3 ? ImageryZoom - 3 : 14;
+		const double Tiles = static_cast<double>(1 << ChunkZoom);
+		auto TileLon = [Tiles](double X) { return X / Tiles * 360.0 - 180.0; };
+		auto TileLat = [Tiles](double Y) { return FMath::RadiansToDegrees(FMath::Atan(FMath::Sinh(PI * (1.0 - 2.0 * Y / Tiles)))); };
+		const FVector2D Nw = FNosimRasterMosaic::TileXY(Area.min_lon, Area.max_lat, ChunkZoom);
+		const FVector2D Se = FNosimRasterMosaic::TileXY(Area.max_lon, Area.min_lat, ChunkZoom);
+		TArray<FIntPoint> Keys;
+		for (int32 Cy = FMath::FloorToInt32(Nw.Y); Cy <= FMath::FloorToInt32(Se.Y); ++Cy)
+		{
+			for (int32 Cx = FMath::FloorToInt32(Nw.X); Cx <= FMath::FloorToInt32(Se.X); ++Cx)
+			{
+				Keys.Add(FIntPoint(Cx, Cy));
+			}
+		}
+		Chunks.SetNum(Keys.Num());
+		// Decoding the imagery is the slow part, and the chunks are independent.
+		TArray<FNosimImageryChunk> Photos;
+		Photos.SetNum(Keys.Num());
+		if (ImageryZoom >= 0)
+		{
+			ParallelFor(Keys.Num(), [&](int32 K) { NosimImagery::LoadChunk(ImageryDir, ImageryZoom, ChunkZoom, Keys[K].X, Keys[K].Y, Photos[K]); });
+		}
 		const double LatStep = TerrainSpacingM / 111320.0, LonStep = LatStep / CosLat;
-		const int32 Nx = FMath::Min(FMath::CeilToInt32((Area.max_lon - Area.min_lon) / LonStep) + 1, 2000);
-		const int32 Ny = FMath::Min(FMath::CeilToInt32((Area.max_lat - Area.min_lat) / LatStep) + 1, 2000);
-		TArray<bool> Valid;
-		Valid.Init(false, Nx * Ny);
-		TerrainMesh.Vertices.SetNum(Nx * Ny);
-		TerrainMesh.Colors.SetNum(Nx * Ny);
 		double MinH = TNumericLimits<double>::Max();
-		for (int32 J = 0; J < Ny; ++J)
+		for (int32 K = 0; K < Keys.Num(); ++K)
 		{
-			const double Lat = Area.max_lat - J * LatStep;
-			for (int32 I = 0; I < Nx; ++I)
+			const FIntPoint Key = Keys[K];
+			const double West = FMath::Max(Area.min_lon, TileLon(Key.X)), East = FMath::Min(Area.max_lon, TileLon(Key.X + 1));
+			const double North = FMath::Min(Area.max_lat, TileLat(Key.Y)), South = FMath::Max(Area.min_lat, TileLat(Key.Y + 1));
+			if (East <= West || North <= South)
 			{
-				const double Lon = Area.min_lon + I * LonStep;
-				const TOptional<double> H = Heights.Height(Lon, Lat);
-				const int32 K = J * Nx + I;
-				Valid[K] = H.IsSet();
-				TerrainMesh.Vertices[K] = GeoToLocal(Lon, Lat, H.Get(0.0));
-				TerrainMesh.Colors[K] = LandcoverColor(Classes.Byte(Lon, Lat));
-				if (H.IsSet())
+				continue;
+			}
+			const int32 Nx = FMath::Clamp(FMath::CeilToInt32((East - West) / LonStep) + 1, 2, 2000);
+			const int32 Ny = FMath::Clamp(FMath::CeilToInt32((North - South) / LatStep) + 1, 2, 2000);
+			FMeshBuffer& M = Chunks[K].Mesh;
+			TArray<bool> Valid;
+			Valid.Init(false, Nx * Ny);
+			M.Vertices.SetNum(Nx * Ny);
+			M.Colors.SetNum(Nx * Ny);
+			M.Normals.SetNum(Nx * Ny);
+			M.UVs.SetNum(Nx * Ny);
+			for (int32 J = 0; J < Ny; ++J)
+			{
+				const double Lat = North - (North - South) * J / (Ny - 1);
+				for (int32 I = 0; I < Nx; ++I)
 				{
-					MinH = FMath::Min(MinH, H.GetValue());
+					const double Lon = West + (East - West) * I / (Nx - 1);
+					const TOptional<double> H = Heights.Height(Lon, Lat);
+					const int32 V = J * Nx + I;
+					Valid[V] = H.IsSet();
+					M.Vertices[V] = GeoToLocal(Lon, Lat, H.Get(0.0));
+					M.Colors[V] = LandcoverColor(Classes.Byte(Lon, Lat));
+					// The DEM's slope across a spacing each way; local X is east and Y south.
+					auto At = [&](double DLon, double DLat) { return Heights.Height(Lon + DLon, Lat + DLat).Get(H.Get(0.0)); };
+					const double East_ = (At(LonStep, 0) - At(-LonStep, 0)) / (2.0 * TerrainSpacingM);
+					const double North_ = (At(0, LatStep) - At(0, -LatStep)) / (2.0 * TerrainSpacingM);
+					M.Normals[V] = FVector(-East_, North_, 1.0).GetSafeNormal();
+					M.UVs[V] = FNosimRasterMosaic::TileXY(Lon, Lat, ChunkZoom) - FVector2D(Key.X, Key.Y);
+					if (H.IsSet())
+					{
+						MinH = FMath::Min(MinH, H.GetValue());
+					}
 				}
 			}
-		}
-		TerrainMesh.Normals.SetNum(Nx * Ny);
-		TerrainMesh.UVs.SetNum(Nx * Ny);
-		for (int32 J = 0; J < Ny; ++J)
-		{
-			for (int32 I = 0; I < Nx; ++I)
+			for (int32 J = 0; J + 1 < Ny; ++J)
 			{
-				const FVector& E = TerrainMesh.Vertices[J * Nx + FMath::Min(I + 1, Nx - 1)];
-				const FVector& W = TerrainMesh.Vertices[J * Nx + FMath::Max(I - 1, 0)];
-				const FVector& S = TerrainMesh.Vertices[FMath::Min(J + 1, Ny - 1) * Nx + I];
-				const FVector& N = TerrainMesh.Vertices[FMath::Max(J - 1, 0) * Nx + I];
-				FVector Normal = FVector::CrossProduct(E - W, N - S).GetSafeNormal();
-				TerrainMesh.Normals[J * Nx + I] = Normal.Z < 0 ? -Normal : Normal;
-				TerrainMesh.UVs[J * Nx + I] = FVector2D(I, J);
-			}
-		}
-		for (int32 J = 0; J + 1 < Ny; ++J)
-		{
-			for (int32 I = 0; I + 1 < Nx; ++I)
-			{
-				const int32 A = J * Nx + I, B = A + 1, C = A + Nx + 1, D = A + Nx;
-				if (Valid[A] && Valid[B] && Valid[C] && Valid[D])
+				for (int32 I = 0; I + 1 < Nx; ++I)
 				{
-					TerrainMesh.Triangles.Append({A, B, C, A, C, D});
-					TerrainMesh.Triangles.Append({A, C, B, A, D, C});
+					const int32 A = J * Nx + I, B = A + 1, C = A + Nx + 1, D = A + Nx;
+					if (Valid[A] && Valid[B] && Valid[C] && Valid[D])
+					{
+						M.Triangles.Append({A, B, C, A, C, D});
+						M.Triangles.Append({A, C, B, A, D, C});
+					}
 				}
 			}
+			if (Photos[K].Size > 0 && M.Triangles.Num() > 0)
+			{
+				Chunks[K].Texture = MakeImageryTexture(Photos[K]);
+				ImageryTiles += Photos[K].Tiles;
+			}
+			Photos[K] = FNosimImageryChunk(); // the texture holds its own copy
 		}
-		GroundZ = MinH - 2.0;
+		if (MinH < TNumericLimits<double>::Max())
+		{
+			GroundZ = MinH - 2.0;
+		}
+		if (ImageryZoom >= 0)
+		{
+			UE_LOG(LogNosim, Log, TEXT("Imagery: %d tile(s) at z%d over %d chunk(s) at z%d"), ImageryTiles, ImageryZoom, Chunks.Num(), ChunkZoom);
+		}
 	}
+	// Over a photo, the photo shows the pavement; only the runway markings are drawn on it.
+	const bool bPavement = ImageryTiles == 0 || bDrawPavementOverImagery;
 	const double GroundCm = GroundZ * 100.0;
 	ViewTargetZ = GroundM(Anchor.lon_deg, Anchor.lat_deg);
 
@@ -666,10 +830,13 @@ void ANosimWorld::BuildScene()
 		{
 			Bottom = FMath::Min(Bottom, C.Z - 300.0);
 		}
-		Mesh[S_Runway].Quad(R.Corners[0], R.Corners[1], R.Corners[2], R.Corners[3]);
-		for (int32 I = 0; I < 4; ++I)
+		if (bPavement)
 		{
-			Mesh[S_Runway].Skirt(R.Corners[I], R.Corners[(I + 1) % 4], Bottom, Centre);
+			Mesh[S_Runway].Quad(R.Corners[0], R.Corners[1], R.Corners[2], R.Corners[3]);
+			for (int32 I = 0; I < 4; ++I)
+			{
+				Mesh[S_Runway].Skirt(R.Corners[I], R.Corners[(I + 1) % 4], Bottom, Centre);
+			}
 		}
 
 		// Markings in the runway's own frame: S metres along from the start, C metres right.
@@ -803,6 +970,10 @@ void ANosimWorld::BuildScene()
 				continue; // drawn from CIFP
 			}
 			G.ZOffsetCm = Class == TEXT("runway") ? 40.0 : 30.0;
+			if (!bPavement)
+			{
+				continue;
+			}
 			Mesh[Class == TEXT("runway") ? S_Runway : S_Taxiway].Ribbon(G.Local, G.HalfWidthCm, 0, G.ZOffsetCm);
 			if (Class != TEXT("runway"))
 			{
@@ -812,7 +983,10 @@ void ANosimWorld::BuildScene()
 		else
 		{
 			G.ZOffsetCm = (S.bridge ? 60.0 : 25.0) + FMath::Clamp(S.layer, -2, 5) * 2.0;
-			Mesh[S_Road].Ribbon(G.Local, G.HalfWidthCm, 0, G.ZOffsetCm);
+			if (bPavement)
+			{
+				Mesh[S_Road].Ribbon(G.Local, G.HalfWidthCm, 0, G.ZOffsetCm);
+			}
 		}
 	}
 
@@ -944,11 +1118,32 @@ void ANosimWorld::BuildScene()
 		Materials.Add(Mid);
 	}
 	UMaterialInterface* VertexColored = VertexColorMaterial();
-	if (TerrainMesh.Triangles.Num() > 0)
+	int32 TerrainSection = 0;
+	for (const FTerrainChunk& Chunk : Chunks)
 	{
-		Terrain->CreateMeshSection_LinearColor(0, TerrainMesh.Vertices, TerrainMesh.Triangles, TerrainMesh.Normals, TerrainMesh.UVs,
-			TerrainMesh.Colors, TArray<FProcMeshTangent>(), false);
-		Terrain->SetMaterial(0, VertexColored);
+		if (Chunk.Mesh.Triangles.Num() == 0)
+		{
+			continue;
+		}
+		Terrain->CreateMeshSection_LinearColor(TerrainSection, Chunk.Mesh.Vertices, Chunk.Mesh.Triangles, Chunk.Mesh.Normals, Chunk.Mesh.UVs,
+			Chunk.Mesh.Colors, TArray<FProcMeshTangent>(), false);
+		if (Chunk.Texture)
+		{
+			UMaterialInstanceDynamic* Mid = UMaterialInstanceDynamic::Create(ImageryMaterial(), this);
+			Mid->SetTextureParameterValue(TEXT("Imagery"), Chunk.Texture);
+			Mid->SetScalarParameterValue(TEXT("Brightness"), ImageryBrightness);
+			Terrain->SetMaterial(TerrainSection, Mid);
+			Materials.Add(Mid);
+			ImageryTextures.Add(Chunk.Texture);
+		}
+		else
+		{
+			Terrain->SetMaterial(TerrainSection, VertexColored);
+		}
+		++TerrainSection;
+	}
+	if (TerrainSection > 0)
+	{
 		Scenery->SetMeshSectionVisible(S_Ground, false);
 	}
 	if (ModelMesh.Triangles.Num() > 0)
@@ -1107,8 +1302,8 @@ void ANosimWorld::BuildScene()
 			EntryEdges.Add(E);
 		}
 	}
-	UE_LOG(LogNosim, Log, TEXT("%s with %s: %d runways, %d splines, %d buildings, %d models, %d trees, terrain %d tiles, land cover %d tiles, drive graph %d nodes / %d edges, %d entry edges"),
-		*PackageId, *WorldName, RunwayCount, SplineCount, BuildingCount, ModelCount, TreeCount, TerrainTiles, LandcoverTiles,
+	UE_LOG(LogNosim, Log, TEXT("%s with %s: %d runways, %d splines, %d buildings, %d models, %d trees, terrain %d tiles, land cover %d tiles, imagery %d tiles, drive graph %d nodes / %d edges, %d entry edges"),
+		*PackageId, *WorldName, RunwayCount, SplineCount, BuildingCount, ModelCount, TreeCount, TerrainTiles, LandcoverTiles, ImageryTiles,
 		static_cast<int32>(nosim_graph_node_count(Graph)), static_cast<int32>(NumEdges), EntryEdges.Num());
 }
 
@@ -1331,8 +1526,9 @@ void ANosimWorld::ShowStatus() const
 		FString::Printf(TEXT("%s UTC   sun az %.1f el %.1f   moon az %.1f el %.1f   (x%.0f)"), *SunUtc.ToString(TEXT("%Y-%m-%d %H:%M")),
 			SunAzimuthDeg, SunElevationDeg, MoonAzimuthDeg, MoonElevationDeg, SunTimeScale));
 	GEngine->AddOnScreenDebugMessage(Key + 1, 0.5f, FColor::Cyan,
-		FString::Printf(TEXT("world %s   terrain %d tiles   land cover %d tiles   %d buildings   %d models   %d trees"), *WorldName,
-			TerrainTiles, LandcoverTiles, BuildingCount, ModelCount, TreeCount));
+		FString::Printf(TEXT("world %s   terrain %d tiles   land cover %d tiles   imagery %s   %d buildings   %d models   %d trees"), *WorldName,
+			TerrainTiles, LandcoverTiles, ImageryTiles > 0 ? *FString::Printf(TEXT("%d tiles at z%d"), ImageryTiles, ImageryZoom) : TEXT("none"),
+			BuildingCount, ModelCount, TreeCount));
 	GEngine->AddOnScreenDebugMessage(Key + 2, 0.5f, FColor::Green,
 		FString::Printf(TEXT("CTM t=%llu s   entered %.1f   exited %.1f   on network %.1f"), static_cast<unsigned long long>(Totals.steps),
 			Totals.entered, Totals.exited, Totals.on_network));

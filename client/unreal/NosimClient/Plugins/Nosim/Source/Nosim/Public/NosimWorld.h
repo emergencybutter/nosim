@@ -8,6 +8,7 @@ class ADirectionalLight;
 class UInstancedStaticMeshComponent;
 class UMaterialInstanceDynamic;
 class UProceduralMeshComponent;
+class UTexture2D;
 
 /** A drive-graph edge as drawn: its polyline in local centimetres, and animation state. */
 struct FNosimEdgeVis
@@ -49,8 +50,9 @@ public:
 
 	/**
 	 * A compiled world (tools/make_world.sh): `terrain/` and `landcover/` from the compiler, and
-	 * optionally `splines.geoparquet`, `areas/buildings.geoparquet` and `cifp.txt`, which then
-	 * replace the package's own tables. Empty: <repo>/target/world/kjfk-fixture when it exists.
+	 * optionally `imagery/`, `splines.geoparquet`, `areas/buildings.geoparquet` and `cifp.txt`,
+	 * the last three replacing the package's own tables. Empty: <repo>/target/world/kjfk-fixture
+	 * when it exists.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Nosim|Data")
 	FString WorldDir;
@@ -62,6 +64,28 @@ public:
 	/** Spacing of the terrain mesh's vertices. */
 	UPROPERTY(EditAnywhere, Category = "Nosim|Terrain", meta = (ClampMin = "5"))
 	float TerrainSpacingM = 20.f;
+
+	/** Drape the world's aerial imagery over the terrain, where it has some. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Terrain")
+	bool bDrawImagery = true;
+
+	/**
+	 * Deepest imagery zoom used. z17 is about 0.9 m a pixel here and costs about 22 MB of video
+	 * memory per 2 km square; each zoom less quarters that.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Terrain", meta = (ClampMin = "10", ClampMax = "19", EditCondition = "bDrawImagery"))
+	int32 ImageryMaxZoom = 17;
+
+	/**
+	 * Draw runway, taxiway and road surfaces over the imagery too. Off, the photo shows them, and
+	 * only the runway markings are drawn over it.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Terrain", meta = (EditCondition = "bDrawImagery"))
+	bool bDrawPavementOverImagery = false;
+
+	/** Scales the imagery's colour: survey photos are brighter than the ground's albedo. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Terrain", meta = (ClampMin = "0.1", ClampMax = "2", EditCondition = "bDrawImagery"))
+	float ImageryBrightness = 0.75f;
 
 	/** Scatter trees over the land cover's tree mask. */
 	UPROPERTY(EditAnywhere, Category = "Nosim|Terrain")
@@ -154,6 +178,9 @@ private:
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UMaterialInstanceDynamic>> Materials;
 
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UTexture2D>> ImageryTextures;
+
 	NosimPackage* Package = nullptr;
 	NosimVfs* Vfs = nullptr;
 	NosimSplineTable* Splines = nullptr;
@@ -172,6 +199,8 @@ private:
 	int32 TreeCount = 0;
 	int32 TerrainTiles = 0;
 	int32 LandcoverTiles = 0;
+	int32 ImageryTiles = 0;
+	int32 ImageryZoom = -1;
 	FString WorldName;
 
 	TArray<FNosimEdgeVis> Edges;

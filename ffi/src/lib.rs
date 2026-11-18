@@ -2659,6 +2659,42 @@ pub unsafe extern "C" fn nosim_tile_read_bytes(
     NosimStatus::Ok
 }
 
+/// Decodes an imagery tile (`imagery/z/x/y.png`, as `world-compiler imagery` writes them)
+/// into RGBA bytes, four per pixel, row-major from the north-west corner. RGB and greyscale
+/// tiles read as opaque; alpha is the fraction of the pixel the imagery covers. Sizing works
+/// as in `nosim_tile_read_heights`, with `capacity` counted in bytes.
+///
+/// # Safety
+/// `path` must be NULL or a NUL-terminated string; `out` must be NULL or point to `capacity`
+/// bytes; `size` must be NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_tile_read_rgba(
+    path: *const c_char,
+    out: *mut u8,
+    capacity: usize,
+    size: *mut NosimTileSize,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let Some(size) = (unsafe { opt_mut(size) }) else { return fail(NosimStatus::NullPointer, "size is NULL") };
+    // SAFETY: documented contract.
+    let bytes = match unsafe { read_tile_file(path) } {
+        Ok(b) => b,
+        Err(s) => return s,
+    };
+    let img = match nosim_compiler::raster::png::decode_rgba(&bytes) {
+        Ok(img) => img,
+        Err(e) => return fail(NosimStatus::Parse, e),
+    };
+    *size = NosimTileSize { width: img.width, height: img.height };
+    let n = img.data.len();
+    if out.is_null() || capacity < n {
+        return fail(NosimStatus::BufferTooSmall, format!("{n} bytes needed"));
+    }
+    // SAFETY: n <= capacity bytes, per the contract.
+    unsafe { ptr::copy_nonoverlapping(img.data.as_ptr(), out, n) };
+    NosimStatus::Ok
+}
+
 /// §5 scattering: Poisson-disk points (Bridson) in `[0, width) × [0, height)` metres, no two
 /// closer than `radius`, each kept with the probability `density` gives at its position.
 /// `density` is a `density_width × density_height` grid of 0–255 values (a land-cover mask,
