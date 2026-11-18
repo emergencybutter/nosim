@@ -597,15 +597,27 @@ fn end_keys(r: &SplineRow) -> (Key, Key) {
     }
 }
 
+/// Folds Unicode dashes (`‐`..=`―`, `−`) to ASCII `-`, so OSM edits between hyphens and
+/// en-dashes neither split a named deck nor break `--expect-over-water`.
+fn fold_dashes(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+            other => other,
+        })
+        .collect()
+}
+
 /// Chains of tagged bridge splines: consecutive splines with the same name and layer that
 /// meet end to end where no third bridge spline does. Each chain is `(row, reversed)` in
 /// deck order.
 fn chains(rows: &[&SplineRow]) -> Vec<Vec<(usize, bool)>> {
     type Group<'a> = (Key, i32, Option<&'a str>);
+    let names: Vec<Option<String>> = rows.iter().map(|r| r.name.as_deref().map(fold_dashes)).collect();
     let mut at: HashMap<Group, Vec<(usize, bool)>> = HashMap::new();
     for (i, r) in rows.iter().enumerate() {
         let (a, b) = end_keys(r);
-        let group = (r.layer, r.name.as_deref());
+        let group = (r.layer, names[i].as_deref());
         at.entry((a, group.0, group.1)).or_default().push((i, false));
         if a != b {
             at.entry((b, group.0, group.1)).or_default().push((i, true));
@@ -616,7 +628,7 @@ fn chains(rows: &[&SplineRow]) -> Vec<Vec<(usize, bool)>> {
         let r = rows[i];
         let (a, b) = end_keys(r);
         let key = if at_end { b } else { a };
-        let list = &at[&(key, r.layer, r.name.as_deref())];
+        let list = &at[&(key, r.layer, names[i].as_deref())];
         if list.len() != 2 {
             return None;
         }
@@ -736,14 +748,16 @@ pub fn detect(
 }
 
 /// Expectations `(name, metres)` that no deck meets: for each, a deck with that name must
-/// span at least that much water. Returns one message per unmet expectation.
+/// span at least that much water. Unicode dashes are folded to `-` on both sides. Returns
+/// one message per unmet expectation.
 pub fn unmet(bridges: &[Bridge], expect: &[(String, f64)]) -> Vec<String> {
     expect
         .iter()
         .filter_map(|(name, metres)| {
+            let want = fold_dashes(name);
             let best = bridges
                 .iter()
-                .filter(|b| b.name.as_deref() == Some(name.as_str()))
+                .filter(|b| b.name.as_deref().is_some_and(|n| fold_dashes(n) == want))
                 .map(|b| b.over_water_m)
                 .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))));
             match best {
@@ -983,5 +997,20 @@ mod tests {
         let dip: Vec<(f64, f64)> =
             (0..200).map(|i| (i as f64 * 5.0, 50.0 - 10.0 * (std::f64::consts::PI * i as f64 / 199.0).sin())).collect();
         assert!(gorges(&dip, 15.0, 0.08, 400.0).is_empty());
+    }
+
+    #[test]
+    fn unicode_dashes_match_in_chains_and_expectations() {
+        let lat = 40.6;
+        let water = Water::new(&[lake(0.005, 40.59, 0.025, 40.61)], &[], &[]);
+        let mut a = spline(1, &[(0.0, lat), (0.015, lat)], true);
+        let mut b = spline(2, &[(0.015, lat), (0.03, lat)], true);
+        a.name = Some("Verrazzano–Narrows Bridge".into()); // U+2013 en-dash
+        b.name = Some("Verrazzano-Narrows Bridge".into()); // U+002D hyphen
+        let (bridges, s) = detect(&[a, b], &water, None, None, &BridgeOptions::default()).unwrap();
+        assert_eq!(s.tagged_decks, 1);
+        assert_eq!(bridges[0].osm_ids, vec![1, 2]);
+        assert!(unmet(&bridges, &[("Verrazzano-Narrows Bridge".into(), 1000.0)]).is_empty());
+        assert!(unmet(&bridges, &[("Verrazzano–Narrows Bridge".into(), 1000.0)]).is_empty());
     }
 }

@@ -9,21 +9,20 @@
 //! 4. Any two segments sharing a point other than a common endpoint (a crossing, a vertex
 //!    lying on another segment, or a collinear overlap) mean the boundary self-intersects:
 //!    the area fails.
-//! 5. Segments are joined into rings; a ring is cut off whenever the walk revisits a
-//!    location, so rings touching at a point (an inner touching its outer, or two outers
-//!    touching) come out as separate simple rings.
-//! 6. Each ring's nesting depth (how many other rings contain it) decides its role: even
-//!    depths are outer rings, odd depths inner rings of the smallest outer ring containing
-//!    them. Outer rings are counter-clockwise, inner rings clockwise.
-//! 7. Where rings touch, step 5 may have paired the segments at the touching point the
-//!    wrong way: an inner ring touching its outer ring at two points cuts the polygon in
-//!    two, and must come out as two outer rings. So the oriented rings are retraced as region
-//!    boundaries, turning at each vertex onto the first edge clockwise, and nested again.
+//! 5. When every vertex has degree two, segments are joined directly into simple rings and
+//!    nested by containment depth: even depths are counter-clockwise outer rings, odd depths
+//!    clockwise inner rings of the smallest outer ring containing them.
+//! 6. Where rings touch (a vertex has degree four or more), an arbitrary walk can pair
+//!    segments into overlapping cycles and misorient a sliver between two parcels. Instead,
+//!    every segment is oriented directly from the even-odd Jordan parity of the plane so the
+//!    interior lies on its left, the directed edges are traced as region boundaries turning at
+//!    each vertex onto the first outgoing edge clockwise, and the resulting simple rings are
+//!    nested.
 //!
 //! Locations are OSM's own fixed point, 1e-7 degrees, so every test is exact integer
 //! arithmetic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// A location in 1e-7 degrees: `(lon, lat)`.
 pub type Pt = (i32, i32);
@@ -234,7 +233,12 @@ pub fn assemble(ways: &[&[Pt]]) -> Result<Vec<Polygon>, Problem> {
         return Err(Problem::Intersection(midpoint(s)));
     }
 
-    // 5: rings, cut at revisited locations.
+    if at.values().any(|v| v.len() > 2) {
+        // 6: rings touch somewhere; orient from Jordan parity and trace region boundaries.
+        return Ok(nest(retrace(&orient_segments(&segs))));
+    }
+
+    // 5: degree-two fast path — every component is already a unique simple ring.
     let mut used = vec![false; segs.len()];
     let next_free = |p: Pt, used: &mut [bool]| -> Option<Pt> {
         let k = *at[&p].iter().find(|&&k| !used[k])?;
@@ -247,35 +251,15 @@ pub fn assemble(ways: &[&[Pt]]) -> Result<Vec<Polygon>, Problem> {
             continue;
         }
         used[k] = true;
-        let mut path = vec![segs[k].0];
-        let mut pos: HashMap<Pt, usize> = HashMap::from([(segs[k].0, 0)]);
+        let mut ring = vec![segs[k].0];
         let mut cur = segs[k].1;
-        loop {
-            if let Some(&i) = pos.get(&cur) {
-                let mut ring = path.split_off(i + 1);
-                for p in &ring {
-                    pos.remove(p);
-                }
-                ring.insert(0, cur);
-                rings.push(ring);
-            } else {
-                pos.insert(cur, path.len());
-                path.push(cur);
-            }
-            match next_free(cur, &mut used) {
-                Some(n) => cur = n,
-                None => break, // only at the start of the walk, with every ring closed
-            }
+        while cur != segs[k].0 {
+            ring.push(cur);
+            cur = next_free(cur, &mut used).expect("even degree");
         }
+        rings.push(ring);
     }
-
-    // 6: nesting decides roles.
-    let polygons = nest(rings);
-    if at.values().all(|v| v.len() == 2) {
-        return Ok(polygons);
-    }
-    // 7: rings touch somewhere; retrace them as region boundaries.
-    Ok(nest(retrace(&polygons)))
+    Ok(nest(rings))
 }
 
 /// Assigns roles by nesting depth and orients the rings.
@@ -345,18 +329,78 @@ fn angle_cmp(a: (i64, i64), b: (i64, i64)) -> std::cmp::Ordering {
     })
 }
 
-/// Retraces oriented rings (interior on the left of every edge) as the boundaries of the
-/// regions they enclose: at each vertex the walk leaves by the first edge clockwise from
-/// the one it came in by, so it never crosses into another region. A boundary passing a
-/// vertex twice is cut there, as in step 5. Where an inner ring touches its outer ring at
-/// two or more points this turns the holed polygon into the separate pieces it really is.
-fn retrace(polygons: &[Polygon]) -> Vec<Vec<Pt>> {
-    let mut edges: Vec<(Pt, Pt)> = Vec::new();
-    for p in polygons {
-        for r in std::iter::once(&p.outer).chain(&p.inners) {
-            edges.extend((0..r.len()).map(|i| (r[i], r[(i + 1) % r.len()])));
+/// Orients every segment so the even-odd interior of `segs` lies on its left.
+///
+/// Around any vertex of an even-degree planar graph without crossings, the sectors alternate
+/// between interior and exterior, so incident edges alternate between outgoing and incoming in
+/// counter-clockwise order. A horizontal ray to −∞ from each connected component's leftmost
+/// (lowest-y) vertex fixes the parity of its unbounded sector, and a breadth-first walk
+/// propagates the alternation across the component.
+fn orient_segments(segs: &[Seg]) -> Vec<(Pt, Pt)> {
+    let dir = |a: Pt, b: Pt| (i64::from(b.0) - i64::from(a.0), i64::from(b.1) - i64::from(a.1));
+    let mut inc: HashMap<Pt, Vec<(usize, Pt)>> = HashMap::new();
+    for (k, &(a, b)) in segs.iter().enumerate() {
+        inc.entry(a).or_default().push((k, b));
+        inc.entry(b).or_default().push((k, a));
+    }
+    for (&p, list) in &mut inc {
+        list.sort_by(|a, b| angle_cmp(dir(p, a.1), dir(p, b.1)));
+    }
+    let mut vertices: Vec<Pt> = inc.keys().copied().collect();
+    vertices.sort_unstable();
+    let mut forward: Vec<Option<bool>> = vec![None; segs.len()];
+    let mut seen: HashSet<Pt> = HashSet::with_capacity(vertices.len());
+    let mut queue: VecDeque<Pt> = VecDeque::new();
+    for start in vertices {
+        if !seen.insert(start) {
+            continue;
+        }
+        let (x0, y0) = start;
+        let crossings = segs
+            .iter()
+            .filter(|&&(a, b)| {
+                if (a.1 > y0) == (b.1 > y0) {
+                    return false;
+                }
+                let (lo, hi) = if a.1 < b.1 { (a, b) } else { (b, a) };
+                (i128::from(x0) - i128::from(lo.0)) * (i128::from(hi.1) - i128::from(lo.1))
+                    > (i128::from(y0) - i128::from(lo.1)) * (i128::from(hi.0) - i128::from(lo.0))
+            })
+            .count();
+        let list = &inc[&start];
+        let idx = list.partition_point(|&(_, q)| angle_cmp(dir(start, q), (-1, 0)).is_lt()) % list.len();
+        let (k0, _) = list[idx];
+        let out0 = crossings.is_multiple_of(2);
+        forward[k0] = Some(out0 == (segs[k0].0 == start));
+        queue.push_back(start);
+        while let Some(v) = queue.pop_front() {
+            let vlist = &inc[&v];
+            let j0 = vlist.iter().position(|&(k, _)| forward[k].is_some()).expect("seeded");
+            let k_ref = vlist[j0].0;
+            let out_ref = forward[k_ref].expect("seeded") == (segs[k_ref].0 == v);
+            for (j, &(k, other)) in vlist.iter().enumerate() {
+                let out_here = if j % 2 == j0 % 2 { out_ref } else { !out_ref };
+                let fwd = out_here == (segs[k].0 == v);
+                debug_assert!(forward[k].is_none_or(|prev| prev == fwd));
+                forward[k] = Some(fwd);
+                if seen.insert(other) {
+                    queue.push_back(other);
+                }
+            }
         }
     }
+    segs.iter()
+        .zip(forward)
+        .map(|(&(a, b), fwd)| if fwd.expect("every segment oriented") { (a, b) } else { (b, a) })
+        .collect()
+}
+
+/// Traces oriented edges (interior on the left of every edge) as the boundaries of the
+/// regions they enclose: at each vertex the walk leaves by the first outgoing edge clockwise
+/// from the reverse of the incoming one, so it never crosses into another region. A boundary
+/// passing a vertex twice is cut into simple rings there. Where an inner ring touches its
+/// outer ring at two or more points this turns the holed polygon into separate pieces.
+fn retrace(edges: &[(Pt, Pt)]) -> Vec<Vec<Pt>> {
     let dir = |a: Pt, b: Pt| (i64::from(b.0) - i64::from(a.0), i64::from(b.1) - i64::from(a.1));
     let mut out: HashMap<Pt, Vec<usize>> = HashMap::new();
     for (k, e) in edges.iter().enumerate() {
@@ -492,6 +536,40 @@ mod tests {
         let p = assemble(&[&outer, &inner]).unwrap();
         assert_eq!((p.len(), p[0].inners.len()), (1, 1));
         assert_eq!(area2(&p[0].outer) + area2(&p[0].inners[0]), 200 - 48);
+    }
+
+    #[test]
+    fn outer_rings_touching_twice_keep_both_parcels() {
+        // Two parcels sharing two boundary corners with a sliver gap between them (from Old
+        // Croton Aqueduct State Park, OSM ways 441100903 and 441100945).
+        let south = ring(&[(2266, 1066), (0, 0), (682, 14550), (2998, 15319)]);
+        let north = ring(&[
+            (2998, 15319),
+            (2732, 15238),
+            (682, 14550),
+            (1846, 34116),
+            (6827, 51180),
+            (9396, 51748),
+            (4433, 34352),
+            (3041, 15885),
+        ]);
+        let p = assemble(&[&south, &north]).unwrap();
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert!(p.iter().all(|p| p.inners.is_empty()), "{p:?}");
+        let mut areas: Vec<i128> = p.iter().map(|p| area2(&p.outer)).collect();
+        areas.sort();
+        assert_eq!(areas, vec![64_690_328, 178_149_094]);
+        // Inside an enclosing square, the two touching holes merge around the sliver island
+        // trapped between them, preserving exact total area; holes touching once stay two holes.
+        let frame = square(-1000, -1000, 70_000);
+        let p = assemble(&[&frame, &south, &north]).unwrap();
+        let net: i128 = p.iter().map(|q| area2(&q.outer) + q.inners.iter().map(|r| area2(r)).sum::<i128>()).sum();
+        assert_eq!((p.len(), p[0].inners.len()), (2, 1));
+        assert_eq!(net, area2(&frame[..4]).abs() - 64_690_328 - 178_149_094);
+        let h1 = square(100, 100, 100);
+        let h2 = square(200, 200, 100);
+        let p = assemble(&[&frame, &h1, &h2]).unwrap();
+        assert_eq!((p.len(), p[0].inners.len()), (1, 2));
     }
 
     #[test]
