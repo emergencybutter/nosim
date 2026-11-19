@@ -632,11 +632,12 @@ UTexture2D* CurtainWallFacadeTexture()
 					const int32 Sub = Lx < 64 ? 0 : 1;
 					const uint32 Wh = Hash2D(Col * 2 + Sub, Row, 131u);
 					const float T = static_cast<float>(Ly - 22) / 96.f;
-					const float Var = ((Wh & 0xFF) / 255.f - 0.5f) * 32.f;
-					const bool bOfficeCeiling = T < 0.22f && ((Wh >> 8) & 1u) == 0u;
-					float R = 135.f + Var + (1.f - T) * 34.f + (bOfficeCeiling ? 24.f : 0.f);
-					float G = 152.f + Var + (1.f - T) * 38.f + (bOfficeCeiling ? 22.f : 0.f);
-					float B = 172.f + Var + (1.f - T) * 44.f + (bOfficeCeiling ? 18.f : 0.f);
+					const float Var = ((Wh & 0xFF) / 255.f - 0.5f) * 34.f;
+					const bool bOfficeCeiling = T < 0.24f && ((Wh >> 8) & 3u) == 0u;
+					const bool bWarmOffice = ((Wh >> 10) & 7u) == 0u && T > 0.15f && T < 0.80f;
+					float R = 128.f + Var + (1.f - T) * 38.f + (bOfficeCeiling ? 30.f : 0.f) + (bWarmOffice ? 48.f : 0.f);
+					float G = 148.f + Var + (1.f - T) * 42.f + (bOfficeCeiling ? 28.f : 0.f) + (bWarmOffice ? 36.f : 0.f);
+					float B = 172.f + Var + (1.f - T) * 48.f + (bOfficeCeiling ? 20.f : 0.f) + (bWarmOffice ? 10.f : 0.f);
 					Pixels[Y * Size + X] = FColor(
 						static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(R), 0, 255)),
 						static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(G), 0, 255)),
@@ -1126,6 +1127,95 @@ UMaterialInterface* VehicleCabinMaterial()
 		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
 		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
 		M->GetEditorOnlyData()->Metallic.Connect(0, Metallic);
+		M->PostEditChange();
+		Material.Reset(M);
+	}
+	return Material.Get();
+#else
+	return VertexColorMaterial();
+#endif
+}
+
+/** Alpha-masked grass-blade tuft texture (256 × 256) for close-up park lawns. */
+UTexture2D* GrassTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 256;
+		TArray<FColor> Pixels;
+		Pixels.Init(FColor(34, 62, 22, 0), Size * Size);
+		FRandomStream Rng(0x47524153);
+		for (int32 B = 0; B < 42; ++B)
+		{
+			const float BaseX = Rng.FRandRange(18.f, Size - 18.f);
+			const float Height = Rng.FRandRange(110.f, 235.f);
+			const float Lean = Rng.FRandRange(-36.f, 36.f);
+			const float HalfW = Rng.FRandRange(3.0f, 5.5f);
+			const float Hue = Rng.FRandRange(0.f, 1.f);
+			for (int32 S = 0; S < 240; ++S)
+			{
+				const float T = S / 240.f; // 0 bottom .. 1 tip
+				const float Px = BaseX + Lean * T * T;
+				const float Py = (Size - 2.f) - Height * T;
+				const float W = HalfW * (1.f - T * 0.92f);
+				// Darker roots at bottom, sunlit warm-green tips at top.
+				const float Shade = FMath::Lerp(0.28f, 1.0f, T);
+				const uint8 R = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(22.f, 88.f, Shade * (0.7f + 0.3f * Hue))), 0, 255));
+				const uint8 G = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(44.f, 126.f, Shade)), 0, 255));
+				const uint8 Bl = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(14.f, 40.f, Shade)), 0, 255));
+				const int32 Iy = FMath::RoundToInt(Py);
+				if (Iy < 2 || Iy >= Size) continue;
+				const int32 X0 = FMath::Max(2, FMath::FloorToInt(Px - W));
+				const int32 X1 = FMath::Min(Size - 3, FMath::CeilToInt(Px + W));
+				for (int32 Ix = X0; Ix <= X1; ++Ix)
+				{
+					Pixels[Iy * Size + Ix] = FColor(R, G, Bl, 255);
+				}
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
+}
+
+/** Two-sided subsurface-lit alpha-masked grass tuft material. */
+UMaterialInterface* GrassMaterial()
+{
+#if WITH_EDITORONLY_DATA
+	static TStrongObjectPtr<UMaterial> Material;
+	if (!Material)
+	{
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimGrass"), RF_Transient);
+		PRAGMA_DISABLE_DEPRECATION_WARNINGS
+		M->bUsedWithInstancedStaticMeshes = true;
+		PRAGMA_ENABLE_DEPRECATION_WARNINGS
+		M->BlendMode = BLEND_Masked;
+		M->SetShadingModel(MSM_TwoSidedFoliage);
+		M->TwoSided = true;
+		M->OpacityMaskClipValue = 0.45f;
+		UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		Tex->ParameterName = TEXT("Grass");
+		Tex->Texture = GrassTexture();
+		Tex->SamplerType = SAMPLERTYPE_Color;
+		UMaterialExpressionConstant* SssScale = NewObject<UMaterialExpressionConstant>(M);
+		SssScale->R = 0.50f;
+		UMaterialExpressionMultiply* Subsurface = NewObject<UMaterialExpressionMultiply>(M);
+		Subsurface->A.Connect(0, Tex);
+		Subsurface->B.Connect(0, SssScale);
+		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
+		Roughness->R = 0.85f;
+		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
+		Specular->R = 0.14f;
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Tex, SssScale, Subsurface, Roughness, Specular})
+		{
+			M->GetExpressionCollection().AddExpression(E);
+		}
+		M->GetEditorOnlyData()->BaseColor.Connect(0, Tex);
+		M->GetEditorOnlyData()->SubsurfaceColor.Connect(0, Subsurface);
+		M->GetEditorOnlyData()->OpacityMask.Connect(4, Tex);
+		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
+		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
 		M->PostEditChange();
 		Material.Reset(M);
 	}
@@ -1729,6 +1819,10 @@ ANosimWorld::ANosimWorld()
 	TreeTrunks->SetMobility(EComponentMobility::Static);
 	TreeTrunks->SetCullDistances(0, 150000); // trunks visible up to 1.5 km
 	TreeTrunks->SetCastShadow(false);
+	Grass = MakeVehicles(TEXT("Grass"));
+	Grass->SetMobility(EComponentMobility::Static);
+	Grass->SetCullDistances(0, 16000); // 160 m — eye-height park detail only
+	Grass->SetCastShadow(false);
 	StreetLights = MakeVehicles(TEXT("StreetLights"));
 	StreetLights->SetMobility(EComponentMobility::Static);
 	StreetLights->SetCullDistances(0, 75000); // 750 m
@@ -1849,7 +1943,7 @@ void ANosimWorld::BuildScene()
 	Scenery->ClearAllMeshSections();
 	Terrain->ClearAllMeshSections();
 	Models->ClearAllMeshSections();
-	for (UInstancedStaticMeshComponent* Ism : {Trees.Get(), TreeTrunks.Get(), StreetLights.Get(), StreetLampHeads.Get(),
+	for (UInstancedStaticMeshComponent* Ism : {Trees.Get(), TreeTrunks.Get(), Grass.Get(), StreetLights.Get(), StreetLampHeads.Get(),
 		VehiclesFree.Get(), VehiclesSlow.Get(), VehiclesJammed.Get(), VehicleCabins.Get()})
 	{
 		Ism->ClearInstances();
@@ -2662,8 +2756,8 @@ void ANosimWorld::BuildScene()
 		nosim_poisson_disk(WidthM, HeightM, TreeSpacingM, Seed, Density.GetData(), Dw, Dh, Xy.GetData(), Count);
 		TArray<FTransform> CanopyInstances;
 		TArray<FTransform> TrunkInstances;
-		CanopyInstances.Reserve(static_cast<int32>(Count * 5));
-		TrunkInstances.Reserve(static_cast<int32>(Count));
+		CanopyInstances.Reserve(static_cast<int32>(Count * 8));
+		TrunkInstances.Reserve(static_cast<int32>(Count * 4));
 		FRandomStream Random(static_cast<int32>(Seed));
 		for (size_t K = 0; K < Count; ++K)
 		{
@@ -2671,40 +2765,79 @@ void ANosimWorld::BuildScene()
 			const double Lat = Area.max_lat - Xy[2 * K + 1] / HeightM * (Area.max_lat - Area.min_lat);
 			const double G = GroundM(Lon, Lat);
 			const double TallM = Random.FRandRange(8.5f, 15.5f);
-			const double WideM = TallM * Random.FRandRange(0.62f, 0.85f);
-			const double TrunkH = TallM * 0.50;
-			const double TrunkW = Random.FRandRange(0.28f, 0.46f);
+			const double WideM = TallM * Random.FRandRange(0.58f, 0.80f);
+			const double TrunkH = TallM * 0.46;
+			const double TrunkW = Random.FRandRange(0.28f, 0.44f);
 			const FVector BasePos = GeoToLocal(Lon, Lat, G);
-			const double BaseYaw = Random.FRandRange(0.f, 180.f);
-			// Grounded furrowed-bark trunk (engine cylinder is 1 m diameter × 1 m tall about its centre).
-			TrunkInstances.Add(FTransform(FRotator(0, BaseYaw, 0),
+			const double BaseYaw = Random.FRandRange(0.f, 360.f);
+			// Grounded furrowed-bark main trunk.
+			TrunkInstances.Add(FTransform(FRotator(Random.FRandRange(-2.f, 2.f), BaseYaw, Random.FRandRange(-2.f, 2.f)),
 				BasePos + FVector(0, 0, TrunkH * 50.0), FVector(TrunkW, TrunkW, TrunkH)));
-			// 3 crossed vertical alpha-masked leafy bough cards + 2 angled upper-crown cards (visible from 1,000 ft too).
-			const FVector CrownCenter = BasePos + FVector(0, 0, TallM * 64.0);
-			const double CardH = TallM * 0.70;
-			for (int32 C = 0; C < 3; ++C)
+			// 3 angled secondary limbs forking out from the top of the trunk into the crown.
+			const FVector ForkPos = BasePos + FVector(0, 0, TrunkH * 92.0);
+			for (int32 B = 0; B < 3; ++B)
 			{
-				const double Yaw = BaseYaw + C * 60.0 + Random.FRandRange(-8.f, 8.f);
-				const double Tilt = Random.FRandRange(82.f, 98.f);
-				CanopyInstances.Add(FTransform(FRotator(Tilt, Yaw, Random.FRandRange(-8.f, 8.f)),
-					CrownCenter + FVector(Random.FRandRange(-35.f, 35.f), Random.FRandRange(-35.f, 35.f), Random.FRandRange(-30.f, 30.f)),
-					FVector(CardH, WideM, 1.0)));
+				const double LimbYaw = BaseYaw + B * 120.0 + Random.FRandRange(-18.f, 18.f);
+				const double LimbLen = TallM * Random.FRandRange(0.26f, 0.36f);
+				const double LimbW = TrunkW * 0.48;
+				const double TiltDeg = Random.FRandRange(28.f, 44.f);
+				const FRotator LimbRot(TiltDeg, LimbYaw, 0.0);
+				const FVector LimbUp = LimbRot.RotateVector(FVector::UpVector);
+				const FVector LimbTip = ForkPos + LimbUp * (LimbLen * 100.0);
+				TrunkInstances.Add(FTransform(LimbRot, ForkPos + LimbUp * (LimbLen * 50.0), FVector(LimbW, LimbW, LimbLen)));
+				// 2 angled leafy bough cards clustered around each limb tip.
+				const double BoughW = WideM * Random.FRandRange(0.50f, 0.64f);
+				const double BoughH = TallM * Random.FRandRange(0.40f, 0.52f);
+				CanopyInstances.Add(FTransform(FRotator(Random.FRandRange(62.f, 82.f), LimbYaw + Random.FRandRange(-25.f, 25.f), Random.FRandRange(-12.f, 12.f)),
+					LimbTip + FVector(0, 0, BoughH * 14.0), FVector(BoughH, BoughW, 1.0)));
+				CanopyInstances.Add(FTransform(FRotator(Random.FRandRange(24.f, 44.f), LimbYaw + 90.0 + Random.FRandRange(-20.f, 20.f), Random.FRandRange(-15.f, 15.f)),
+					LimbTip + FVector(0, 0, BoughH * 22.0), FVector(BoughW * 0.92, BoughW * 0.88, 1.0)));
 			}
-			for (int32 C = 0; C < 2; ++C)
-			{
-				const double Yaw = BaseYaw + C * 90.0 + 30.0;
-				CanopyInstances.Add(FTransform(FRotator(Random.FRandRange(18.f, 32.f), Yaw, Random.FRandRange(-12.f, 12.f)),
-					CrownCenter + FVector(0, 0, TallM * (C == 0 ? 12.0 : -4.0)),
-					FVector(WideM * 0.92, WideM * 0.88, 1.0)));
-			}
+			// 2 crown-top cap cards so the tree reads full from both eye height and 1,000 ft.
+			const FVector CrownTop = BasePos + FVector(0, 0, TallM * 78.0);
+			CanopyInstances.Add(FTransform(FRotator(Random.FRandRange(68.f, 86.f), BaseYaw + 45.0, Random.FRandRange(-10.f, 10.f)),
+				CrownTop, FVector(TallM * 0.46, WideM * 0.66, 1.0)));
+			CanopyInstances.Add(FTransform(FRotator(Random.FRandRange(14.f, 28.f), BaseYaw + 15.0, Random.FRandRange(-12.f, 12.f)),
+				CrownTop + FVector(0, 0, TallM * 8.0), FVector(WideM * 0.78, WideM * 0.74, 1.0)));
 		}
-		Trees->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane")));
+		UStaticMesh* PlaneMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane"));
+		Trees->SetStaticMesh(PlaneMesh);
 		Trees->SetMaterial(0, FoliageMaterial());
 		Trees->AddInstances(CanopyInstances, false, false);
 		TreeTrunks->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cylinder.Cylinder")));
 		TreeTrunks->SetMaterial(0, BarkMaterial());
 		TreeTrunks->AddInstances(TrunkInstances, false, false);
-		TreeCount = TrunkInstances.Num();
+		TreeCount = static_cast<int32>(Count);
+
+		// 3D grass tufts across nearby park/grassland/tree-cover ground (within 450 m of anchor, culled at 160 m).
+		TArray<FTransform> GrassInstances;
+		constexpr double GrassRadM = 450.0;
+		const double GrassLatSpan = GrassRadM / 111320.0;
+		const double GrassLonSpan = GrassLatSpan / CosLat;
+		FRandomStream GrassRng(static_cast<int32>(Seed ^ 0x47524153));
+		for (int32 GIdx = 0; GIdx < 60000; ++GIdx)
+		{
+			const double Lon = Anchor.lon_deg + GrassRng.FRandRange(-GrassLonSpan, GrassLonSpan);
+			const double Lat = Anchor.lat_deg + GrassRng.FRandRange(-GrassLatSpan, GrassLatSpan);
+			const uint8 Cls = Classes.Byte(Lon, Lat);
+			if (Cls != 10 && Cls != 30)
+			{
+				continue;
+			}
+			const FVector BaseP = GeoToLocal(Lon, Lat, GroundM(Lon, Lat));
+			const double H = GrassRng.FRandRange(0.16f, 0.28f);
+			const double W = GrassRng.FRandRange(0.55f, 0.90f);
+			const double Yaw = GrassRng.FRandRange(0.f, 180.f);
+			// Roll +90 deg stands the plane upright with texture V pointing up (blades grow vertically).
+			GrassInstances.Add(FTransform(FRotator(0.0, Yaw, 90.0), BaseP + FVector(0, 0, H * 46.0), FVector(W, H, 1.0)));
+			GrassInstances.Add(FTransform(FRotator(0.0, Yaw + 70.0, 90.0), BaseP + FVector(0, 0, H * 46.0), FVector(W, H, 1.0)));
+		}
+		if (GrassInstances.Num() > 0)
+		{
+			Grass->SetStaticMesh(PlaneMesh);
+			Grass->SetMaterial(0, GrassMaterial());
+			Grass->AddInstances(GrassInstances, false, false);
+		}
 	}
 
 	// Traffic: nosim's drive graph and hybrid near-field IDM/MOBIL + routed CTM. Each edge borrows its spline's shape.
