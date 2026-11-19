@@ -183,6 +183,9 @@ private:
 	TObjectPtr<UInstancedStaticMeshComponent> Trees;
 
 	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UInstancedStaticMeshComponent> TreeTrunks;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
 	TObjectPtr<UInstancedStaticMeshComponent> VehiclesFree;
 
 	UPROPERTY(VisibleAnywhere, Category = "Nosim")

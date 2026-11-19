@@ -19,6 +19,7 @@
 #include "Materials/Material.h"
 #include "Async/ParallelFor.h"
 #include "Materials/MaterialExpressionConstant.h"
+#include "Materials/MaterialExpressionConstant3Vector.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionMultiply.h"
 #include "Materials/MaterialExpressionScalarParameter.h"
@@ -119,6 +120,8 @@ UMaterialInterface* VertexColorMaterial()
 /**
  * The terrain's material where it has imagery: the `Imagery` texture's colour, scaled by
  * `Brightness`, over the land-cover vertex colour, mixed by the texture's alpha (its coverage).
+ * Vertex colour alpha encodes the ESA WorldCover water mask (1 = permanent water), blending
+ * seamlessly into glossy estuarine water with no polygon seams or frozen aerial wakes.
  */
 UMaterialInterface* ImageryMaterial()
 {
@@ -138,21 +141,49 @@ UMaterialInterface* ImageryMaterial()
 		UMaterialExpressionMultiply* Scaled = NewObject<UMaterialExpressionMultiply>(M);
 		Scaled->A.Connect(0, Photo); // RGB
 		Scaled->B.Connect(0, Brightness);
-		UMaterialExpressionLinearInterpolate* Mix = NewObject<UMaterialExpressionLinearInterpolate>(M);
-		Mix->A.Connect(0, Color);
-		Mix->B.Connect(0, Scaled);
-		Mix->Alpha.Connect(4, Photo); // A
-		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
-		Roughness->R = 0.9f;
-		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
-		Specular->R = 0.25f; // the photo has its own highlights
-		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Color, Photo, Brightness, Scaled, Mix, Roughness, Specular})
+		UMaterialExpressionLinearInterpolate* LandMix = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		LandMix->A.Connect(0, Color);
+		LandMix->B.Connect(0, Scaled);
+		LandMix->Alpha.Connect(4, Photo); // A
+		UMaterialExpressionConstant3Vector* WaterColor = NewObject<UMaterialExpressionConstant3Vector>(M);
+		WaterColor->Constant = FLinearColor(0.015f, 0.042f, 0.062f);
+		UMaterialExpressionLinearInterpolate* BaseColor = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		BaseColor->A.Connect(0, LandMix);
+		BaseColor->B.Connect(0, WaterColor);
+		BaseColor->Alpha.Connect(4, Color); // vertex alpha = WorldCover water mask
+		UMaterialExpressionConstant* LandRough = NewObject<UMaterialExpressionConstant>(M);
+		LandRough->R = 0.90f;
+		UMaterialExpressionConstant* WaterRough = NewObject<UMaterialExpressionConstant>(M);
+		WaterRough->R = 0.08f;
+		UMaterialExpressionLinearInterpolate* Roughness = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		Roughness->A.Connect(0, LandRough);
+		Roughness->B.Connect(0, WaterRough);
+		Roughness->Alpha.Connect(4, Color);
+		UMaterialExpressionConstant* LandSpec = NewObject<UMaterialExpressionConstant>(M);
+		LandSpec->R = 0.25f;
+		UMaterialExpressionConstant* WaterSpec = NewObject<UMaterialExpressionConstant>(M);
+		WaterSpec->R = 0.92f;
+		UMaterialExpressionLinearInterpolate* Specular = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		Specular->A.Connect(0, LandSpec);
+		Specular->B.Connect(0, WaterSpec);
+		Specular->Alpha.Connect(4, Color);
+		UMaterialExpressionConstant* LandMetal = NewObject<UMaterialExpressionConstant>(M);
+		LandMetal->R = 0.0f;
+		UMaterialExpressionConstant* WaterMetal = NewObject<UMaterialExpressionConstant>(M);
+		WaterMetal->R = 0.08f;
+		UMaterialExpressionLinearInterpolate* Metallic = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		Metallic->A.Connect(0, LandMetal);
+		Metallic->B.Connect(0, WaterMetal);
+		Metallic->Alpha.Connect(4, Color);
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{
+			Color, Photo, Brightness, Scaled, LandMix, WaterColor, BaseColor, LandRough, WaterRough, Roughness, LandSpec, WaterSpec, Specular, LandMetal, WaterMetal, Metallic})
 		{
 			M->GetExpressionCollection().AddExpression(E);
 		}
-		M->GetEditorOnlyData()->BaseColor.Connect(0, Mix);
+		M->GetEditorOnlyData()->BaseColor.Connect(0, BaseColor);
 		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
 		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
+		M->GetEditorOnlyData()->Metallic.Connect(0, Metallic);
 		M->PostEditChange();
 		Material.Reset(M);
 	}
@@ -741,6 +772,169 @@ UMaterialInterface* BuildingRoofMaterial()
 #endif
 }
 
+/** Tileable matte dark asphalt with aggregate grain, pale curb edges, and dashed centreline. */
+UTexture2D* RoadAsphaltTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 256;
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const float Grain = ((Hash2D(X, Y, 211u) & 0xFF) / 255.f - 0.5f) * 16.f;
+				const float Tire = FMath::Abs(static_cast<float>(X) - 72.f) < 18.f || FMath::Abs(static_cast<float>(X) - 184.f) < 18.f ? -5.f : 0.f;
+				float V = 36.f + Grain + Tire;
+				// Subtle sidewalk curb edges along left/right borders.
+				if (X < 8 || X >= Size - 8)
+				{
+					V = 78.f + Grain * 0.6f;
+				}
+				// Subtle dashed centreline (12 m repeat cycle).
+				else if (X >= 126 && X < 130 && Y < 96)
+				{
+					V = 155.f + Grain * 0.4f;
+				}
+				const uint8 C = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(V), 0, 255));
+				Pixels[Y * Size + X] = FColor(C, C, static_cast<uint8>(FMath::Min(C + 2, 255)), 255);
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
+}
+
+/** Matte asphalt road material (no midday plastic glare). */
+UMaterialInterface* RoadAsphaltMaterial()
+{
+#if WITH_EDITORONLY_DATA
+	static TStrongObjectPtr<UMaterial> Material;
+	if (!Material)
+	{
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimRoadAsphalt"), RF_Transient);
+		UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		Tex->ParameterName = TEXT("Asphalt");
+		Tex->Texture = RoadAsphaltTexture();
+		Tex->SamplerType = SAMPLERTYPE_Color;
+		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
+		Roughness->R = 0.93f;
+		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
+		Specular->R = 0.18f;
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Tex, Roughness, Specular})
+		{
+			M->GetExpressionCollection().AddExpression(E);
+		}
+		M->GetEditorOnlyData()->BaseColor.Connect(0, Tex);
+		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
+		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
+		M->PostEditChange();
+		Material.Reset(M);
+	}
+	return Material.Get();
+#else
+	return VertexColorMaterial();
+#endif
+}
+
+/** Organic dappled leaf-cluster foliage texture (256 × 256) so canopy meshes never look like smooth balloons. */
+UTexture2D* FoliageTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 256;
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const float Fine = (Hash2D(X, Y, 307u) & 0xFF) / 255.f;
+				const float Leaf = (Hash2D(X / 4, Y / 4, 311u) & 0xFF) / 255.f;
+				const float Clump = (Hash2D(X / 16, Y / 16, 313u) & 0xFF) / 255.f;
+				const float Shade = 0.25f * Fine + 0.45f * Leaf + 0.30f * Clump;
+				const float R = FMath::Lerp(14.f, 64.f, Shade);
+				const float G = FMath::Lerp(28.f, 102.f, Shade);
+				const float B = FMath::Lerp(10.f, 36.f, Shade);
+				Pixels[Y * Size + X] = FColor(
+					static_cast<uint8>(FMath::RoundToInt(R)),
+					static_cast<uint8>(FMath::RoundToInt(G)),
+					static_cast<uint8>(FMath::RoundToInt(B)),
+					255);
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
+}
+
+/** Matte leafy canopy material. */
+UMaterialInterface* FoliageMaterial()
+{
+#if WITH_EDITORONLY_DATA
+	static TStrongObjectPtr<UMaterial> Material;
+	if (!Material)
+	{
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimFoliage"), RF_Transient);
+		M->bUsedWithInstancedStaticMeshes = true;
+		UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		Tex->ParameterName = TEXT("Foliage");
+		Tex->Texture = FoliageTexture();
+		Tex->SamplerType = SAMPLERTYPE_Color;
+		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
+		Roughness->R = 0.90f;
+		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
+		Specular->R = 0.14f;
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Tex, Roughness, Specular})
+		{
+			M->GetExpressionCollection().AddExpression(E);
+		}
+		M->GetEditorOnlyData()->BaseColor.Connect(0, Tex);
+		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
+		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
+		M->PostEditChange();
+		Material.Reset(M);
+	}
+	return Material.Get();
+#else
+	return VertexColorMaterial();
+#endif
+}
+
+/** Matte tree bark material for trunks. */
+UMaterialInterface* BarkMaterial()
+{
+#if WITH_EDITORONLY_DATA
+	static TStrongObjectPtr<UMaterial> Material;
+	if (!Material)
+	{
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimBark"), RF_Transient);
+		M->bUsedWithInstancedStaticMeshes = true;
+		UMaterialExpressionConstant3Vector* Color = NewObject<UMaterialExpressionConstant3Vector>(M);
+		Color->Constant = FLinearColor(0.048f, 0.033f, 0.022f);
+		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
+		Roughness->R = 0.95f;
+		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
+		Specular->R = 0.12f;
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Color, Roughness, Specular})
+		{
+			M->GetExpressionCollection().AddExpression(E);
+		}
+		M->GetEditorOnlyData()->BaseColor.Connect(0, Color);
+		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
+		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
+		M->PostEditChange();
+		Material.Reset(M);
+	}
+	return Material.Get();
+#else
+	return VertexColorMaterial();
+#endif
+}
+
 /**
  * Deterministic architectural style (glass curtain wall, stone/precast, or brick) and PBR-calibrated
  * linear wall/roof tints from OSM `building=*` tag, height, and spatial seed.
@@ -883,9 +1077,15 @@ struct FMeshBuffer
 			Left.Add(P + Side * (OffsetCm - HalfWidthCm));
 			Right.Add(P + Side * (OffsetCm + HalfWidthCm));
 		}
+		double DistCm = 0.0;
 		for (int32 I = 0; I + 1 < N; ++I)
 		{
-			Quad(Left[I], Right[I], Right[I + 1], Left[I + 1]);
+			const double SegCm = FVector::Dist2D(Points[I], Points[I + 1]);
+			const double V0 = DistCm / 1200.0; // 12 m road marking cycle
+			const double V1 = (DistCm + SegCm) / 1200.0;
+			DistCm += SegCm;
+			QuadUV(Left[I], Right[I], Right[I + 1], Left[I + 1], FVector::UpVector,
+				FVector2D(0.0, V0), FVector2D(1.0, V0), FVector2D(1.0, V1), FVector2D(0.0, V1), FLinearColor::White);
 		}
 	}
 
@@ -1046,6 +1246,10 @@ ANosimWorld::ANosimWorld()
 	Trees->SetMobility(EComponentMobility::Static);
 	Trees->SetCullDistances(0, 800000); // 8 km
 	Trees->SetCastShadow(false); // 60k+ non-Nanite instances overflow the VSM marking job queue
+	TreeTrunks = MakeVehicles(TEXT("TreeTrunks"));
+	TreeTrunks->SetMobility(EComponentMobility::Static);
+	TreeTrunks->SetCullDistances(0, 150000); // trunks visible up to 1.5 km
+	TreeTrunks->SetCastShadow(false);
 	VehiclesFree = MakeVehicles(TEXT("VehiclesFree"));
 	VehiclesSlow = MakeVehicles(TEXT("VehiclesSlow"));
 	VehiclesJammed = MakeVehicles(TEXT("VehiclesJammed"));
@@ -1157,7 +1361,7 @@ void ANosimWorld::BuildScene()
 	Scenery->ClearAllMeshSections();
 	Terrain->ClearAllMeshSections();
 	Models->ClearAllMeshSections();
-	for (UInstancedStaticMeshComponent* Ism : {Trees.Get(), VehiclesFree.Get(), VehiclesSlow.Get(), VehiclesJammed.Get()})
+	for (UInstancedStaticMeshComponent* Ism : {Trees.Get(), TreeTrunks.Get(), VehiclesFree.Get(), VehiclesSlow.Get(), VehiclesJammed.Get()})
 	{
 		Ism->ClearInstances();
 	}
@@ -1419,7 +1623,10 @@ void ANosimWorld::BuildScene()
 					const int32 V = J * Nx + I;
 					Valid[V] = H.IsSet();
 					M.Vertices[V] = GeoToLocal(Lon, Lat, H.Get(0.0));
-					M.Colors[V] = LandcoverColor(Classes.Byte(Lon, Lat));
+					const uint8 Class = Classes.Byte(Lon, Lat);
+					FLinearColor Lc = LandcoverColor(Class);
+					Lc.A = Class == 80 ? 1.0f : 0.0f; // WorldCover 80 = permanent water
+					M.Colors[V] = Lc;
 					// The DEM's slope across a spacing each way; local X is east and Y south.
 					auto At = [&](double DLon, double DLat) { return Heights.Height(Lon + DLon, Lat + DLat).Get(H.Get(0.0)); };
 					const double East_ = (At(LonStep, 0) - At(-LonStep, 0)) / (2.0 * TerrainSpacingM);
@@ -1724,87 +1931,7 @@ void ANosimWorld::BuildScene()
 		}
 	}
 
-	// Water: rivers, bays and ponds from `areas/water.geoparquet` rendered with a glossy water surface.
-	if (const FString WaterPath = WorldFile(TEXT("areas/water.geoparquet")); !WaterPath.IsEmpty())
-	{
-		if (NosimPolygonTable* WaterPolys = nosim_polygon_table_load(TCHAR_TO_UTF8(*WaterPath)))
-		{
-			TArray<double> Pts;
-			for (size_t A = 0; A < nosim_polygon_table_count(WaterPolys); ++A)
-			{
-				NosimArea Info;
-				if (nosim_polygon_table_get(WaterPolys, A, &Info) != NOSIM_STATUS_OK)
-				{
-					continue;
-				}
-				TArray<TArray<TArray<FVector2D>>> Parts;
-				Parts.SetNum(static_cast<int32>(Info.polygon_count));
-				double LevelSum = 0.0;
-				int32 LevelN = 0;
-				bool bInside = false;
-				for (size_t K = 0; K < Info.ring_count; ++K)
-				{
-					NosimRing Ring;
-					if (nosim_polygon_table_ring(WaterPolys, A, K, &Ring) != NOSIM_STATUS_OK || Ring.point_count < 3)
-					{
-						continue;
-					}
-					Pts.SetNumUninitialized(static_cast<int32>(Ring.point_count * 2));
-					nosim_polygon_table_ring_points(WaterPolys, A, K, Pts.GetData(), Ring.point_count);
-					TArray<FVector2D>& Out = Parts[static_cast<int32>(Ring.polygon)].AddDefaulted_GetRef();
-					for (size_t P = 0; P < Ring.point_count; ++P)
-					{
-						const double Lon = Pts[2 * P], Lat = Pts[2 * P + 1];
-						bInside |= Lon >= Area.min_lon && Lon <= Area.max_lon && Lat >= Area.min_lat && Lat <= Area.max_lat;
-						const FVector L = LonLatToLocal(Lon, Lat);
-						Out.Add(FVector2D(L.X, L.Y));
-						if (P % 4 == 0)
-						{
-							LevelSum += GroundM(Lon, Lat);
-							++LevelN;
-						}
-					}
-				}
-				if (!bInside)
-				{
-					continue;
-				}
-				const double WaterZCm = (LevelN > 0 ? LevelSum / LevelN : GroundZ) * 100.0 + 35.0;
-				constexpr double WaterTileCm = 4000.0; // 40 m ripple tile
-				for (const TArray<TArray<FVector2D>>& Rings : Parts)
-				{
-					if (Rings.Num() == 0)
-					{
-						continue;
-					}
-					using namespace UE::Geometry;
-					FGeneralPolygon2d Poly{FPolygon2d(Rings[0])};
-					for (int32 R = 1; R < Rings.Num(); ++R)
-					{
-						Poly.AddHole(FPolygon2d(Rings[R]), false, false);
-					}
-					FDelaunay2 Delaunay;
-					Delaunay.bAutomaticallyFixEdgesToDuplicateVertices = true;
-					TArray<FIndex3i> Tris;
-					TArray<FVector2d> Verts;
-					if (Delaunay.Triangulate(Poly, &Tris, &Verts, true))
-					{
-						for (const FIndex3i& T : Tris)
-						{
-							const FVector2d& PA = Verts[T.A];
-							const FVector2d& PB = Verts[T.B];
-							const FVector2d& PC = Verts[T.C];
-							Mesh[S_Water].TriangleUV(FVector(PA, WaterZCm), FVector(PB, WaterZCm), FVector(PC, WaterZCm), FVector::UpVector,
-								FVector2D(PA.X / WaterTileCm, PA.Y / WaterTileCm),
-								FVector2D(PB.X / WaterTileCm, PB.Y / WaterTileCm),
-								FVector2D(PC.X / WaterTileCm, PC.Y / WaterTileCm), FLinearColor::White);
-						}
-					}
-				}
-			}
-			nosim_polygon_table_free(WaterPolys);
-		}
-	}
+	// Water is shaded seamlessly on the terrain mesh from WorldCover class 80 (permanent water).
 
 	// Models the packages anchor in the area, where the mesh is a readable glTF binary.
 	FMeshBuffer ModelMesh;
@@ -1854,7 +1981,11 @@ void ANosimWorld::BuildScene()
 	{
 		Scenery->CreateMeshSection_LinearColor(I, Mesh[I].Vertices, Mesh[I].Triangles, Mesh[I].Normals, Mesh[I].UVs,
 			Mesh[I].Colors, TArray<FProcMeshTangent>(), false);
-		if (I == S_BuildingGlass)
+		if (I == S_Road)
+		{
+			Scenery->SetMaterial(I, RoadAsphaltMaterial());
+		}
+		else if (I == S_BuildingGlass)
 		{
 			Scenery->SetMaterial(I, BuildingGlassMaterial());
 		}
@@ -1951,25 +2082,46 @@ void ANosimWorld::BuildScene()
 		TArray<double> Xy;
 		Xy.SetNumUninitialized(static_cast<int32>(Count * 2));
 		nosim_poisson_disk(WidthM, HeightM, TreeSpacingM, Seed, Density.GetData(), Dw, Dh, Xy.GetData(), Count);
-		TArray<FTransform> Instances;
-		Instances.Reserve(static_cast<int32>(Count));
+		TArray<FTransform> CanopyInstances;
+		TArray<FTransform> TrunkInstances;
+		CanopyInstances.Reserve(static_cast<int32>(Count * 3));
+		TrunkInstances.Reserve(static_cast<int32>(Count));
 		FRandomStream Random(static_cast<int32>(Seed));
 		for (size_t K = 0; K < Count; ++K)
 		{
 			const double Lon = Area.min_lon + Xy[2 * K] / WidthM * (Area.max_lon - Area.min_lon);
 			const double Lat = Area.max_lat - Xy[2 * K + 1] / HeightM * (Area.max_lat - Area.min_lat);
-			const double TallM = Random.FRandRange(8.f, 15.f), WideM = TallM * Random.FRandRange(0.55f, 0.80f);
-			// Rounded deciduous canopy ellipsoid (engine sphere is 1 m across about its centre).
-			Instances.Add(FTransform(FRotator(0, Random.FRandRange(0.f, 360.f), 0), GeoToLocal(Lon, Lat, GroundM(Lon, Lat) + TallM * 0.48),
-				FVector(WideM, WideM, TallM * 0.78)));
+			const double G = GroundM(Lon, Lat);
+			const double TallM = Random.FRandRange(8.f, 15.f);
+			const double WideM = TallM * Random.FRandRange(0.48f, 0.70f);
+			const double TrunkH = TallM * 0.48;
+			const double TrunkW = Random.FRandRange(0.32f, 0.52f);
+			const FVector BasePos = GeoToLocal(Lon, Lat, G);
+			// Grounded trunk (engine cylinder is 1 m diameter × 1 m tall about its centre).
+			TrunkInstances.Add(FTransform(FRotator(0, Random.FRandRange(0.f, 360.f), 0),
+				BasePos + FVector(0, 0, TrunkH * 50.0), FVector(TrunkW, TrunkW, TrunkH)));
+			// Three overlapping organic canopy clusters around the crown.
+			const FVector CrownBase = BasePos + FVector(0, 0, TallM * 62.0);
+			CanopyInstances.Add(FTransform(FRotator(Random.FRandRange(-10.f, 10.f), Random.FRandRange(0.f, 360.f), Random.FRandRange(-10.f, 10.f)),
+				CrownBase + FVector(0, 0, TallM * 8.0), FVector(WideM * 0.85, WideM * 0.80, TallM * 0.48)));
+			for (int32 L = 0; L < 2; ++L)
+			{
+				const double Ang = Random.FRandRange(0.f, 2.f * PI);
+				const double RadCm = WideM * 26.0;
+				const double SubW = WideM * Random.FRandRange(0.55f, 0.72f);
+				const double SubH = TallM * Random.FRandRange(0.34f, 0.44f);
+				CanopyInstances.Add(FTransform(FRotator(Random.FRandRange(-12.f, 12.f), Random.FRandRange(0.f, 360.f), Random.FRandRange(-12.f, 12.f)),
+					CrownBase + FVector(FMath::Cos(Ang) * RadCm, FMath::Sin(Ang) * RadCm, Random.FRandRange(-60.f, 80.f)),
+					FVector(SubW, SubW * 0.92, SubH)));
+			}
 		}
 		Trees->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Sphere.Sphere")));
-		UMaterialInstanceDynamic* Mid = UMaterialInstanceDynamic::Create(Base, this);
-		Mid->SetVectorParameterValue(TEXT("Color"), FLinearColor(0.032f, 0.068f, 0.022f));
-		Trees->SetMaterial(0, Mid);
-		Materials.Add(Mid);
-		Trees->AddInstances(Instances, false, false);
-		TreeCount = Instances.Num();
+		Trees->SetMaterial(0, FoliageMaterial());
+		Trees->AddInstances(CanopyInstances, false, false);
+		TreeTrunks->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cylinder.Cylinder")));
+		TreeTrunks->SetMaterial(0, BarkMaterial());
+		TreeTrunks->AddInstances(TrunkInstances, false, false);
+		TreeCount = TrunkInstances.Num();
 	}
 
 	// Traffic: nosim's drive graph and hybrid near-field IDM/MOBIL + routed CTM. Each edge borrows its spline's shape.
