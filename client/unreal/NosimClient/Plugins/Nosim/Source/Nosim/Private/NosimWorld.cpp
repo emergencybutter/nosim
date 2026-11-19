@@ -50,8 +50,11 @@ enum ESection : int32
 	S_Taxiway,
 	S_TaxiLine,
 	S_Road,
-	S_Building,
+	S_BuildingGlass,
+	S_BuildingStone,
+	S_BuildingBrick,
 	S_Roof,
+	S_Water,
 	S_SectionCount
 };
 
@@ -61,9 +64,12 @@ const FLinearColor SectionColors[S_SectionCount] = {
 	FLinearColor(0.85f, 0.85f, 0.85f), // white markings
 	FLinearColor(0.09f, 0.09f, 0.10f), // taxiway
 	FLinearColor(0.80f, 0.55f, 0.02f), // taxiway centreline
-	FLinearColor(0.06f, 0.06f, 0.065f), // road
-	FLinearColor(0.42f, 0.40f, 0.37f), // building walls
-	FLinearColor(0.20f, 0.20f, 0.21f), // roofs
+	FLinearColor(0.038f, 0.040f, 0.044f), // road asphalt
+	FLinearColor(0.18f, 0.24f, 0.30f), // glass curtain-wall towers
+	FLinearColor(0.24f, 0.23f, 0.21f), // stone / concrete facades
+	FLinearColor(0.22f, 0.14f, 0.11f), // brick / residential facades
+	FLinearColor(0.15f, 0.15f, 0.16f), // roofs
+	FLinearColor(0.022f, 0.055f, 0.072f), // water
 };
 
 /** Ground colour for an ESA WorldCover class (0 = no data). */
@@ -272,11 +278,11 @@ uint32 Hash2D(int32 X, int32 Y, uint32 Salt)
 }
 
 /**
- * Tileable 4-bay × 4-storey facade texture (512 × 512, covering 12.8 m × 13.6 m).
+ * Tileable 4-bay × 4-storey stone / precast facade texture (512 × 512, covering 12.8 m × 13.6 m).
  * RGB holds wall shading (near-white, multiplied by per-building vertex colour) or window glass;
  * A = 0 for matte wall/mullions and 255 for reflective glass panes.
  */
-UTexture2D* FacadeTexture()
+UTexture2D* StoneFacadeTexture()
 {
 	static TStrongObjectPtr<UTexture2D> Cached;
 	if (!Cached)
@@ -294,29 +300,29 @@ UTexture2D* FacadeTexture()
 				const int32 Col = X / Cell;
 				const int32 Lx = X % Cell;
 				const float Grain = ((Hash2D(X, Y, 11u) & 0xFF) / 255.f - 0.5f) * 14.f;
-				const float PanelVar = ((Hash2D(Col, Row, 23u) & 0xFF) / 255.f - 0.5f) * 12.f;
+				const float PanelVar = ((Hash2D(Col, Row, 23u) & 0xFF) / 255.f - 0.5f) * 14.f;
 
-				// Default matte wall surface with subtle horizontal course and vertical panel joints.
-				float Wall = 232.f + Grain + PanelVar;
-				if (Ly < 18 || Ly >= 112)
+				// Matte limestone / precast panels with strong vertical piers and floor spandrel bands.
+				float Wall = 228.f + Grain + PanelVar;
+				if (Ly < 20 || Ly >= 112)
 				{
-					Wall -= 22.f; // spandrel / floor slab band
+					Wall -= 28.f; // spandrel / cornice band
 				}
-				if (Ly == 18 || Ly == 112 || Lx == 0 || Lx == 1)
+				if (Ly == 20 || Ly == 112 || Lx < 3 || Lx >= 126)
 				{
-					Wall -= 34.f; // architectural panel seam
+					Wall -= 42.f; // deep vertical pier / slab joint
 				}
 				else if ((Ly % 16) == 0)
 				{
-					Wall -= 8.f; // subtle masonry course line
+					Wall -= 9.f;
 				}
 
 				const bool bInWindow = Lx >= 20 && Lx < 108 && Ly >= 26 && Ly < 98;
 				const bool bSill = Lx >= 16 && Lx < 112 && Ly >= 98 && Ly < 104;
-				const bool bLintelShadow = Lx >= 20 && Lx < 108 && Ly >= 22 && Ly < 26;
+				const bool bLintelShadow = Lx >= 20 && Lx < 108 && Ly >= 21 && Ly < 26;
 				if (bSill)
 				{
-					const uint8 V = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(212.f + Grain * 0.5f), 0, 255));
+					const uint8 V = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(208.f + Grain * 0.5f), 0, 255));
 					Pixels[Y * Size + X] = FColor(V, V, V, 0);
 				}
 				else if (bInWindow)
@@ -325,25 +331,25 @@ UTexture2D* FacadeTexture()
 						|| (Lx >= 62 && Lx < 66) || (Ly >= 46 && Ly < 49);
 					if (bFrame)
 					{
-						const uint8 F = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(68.f + Grain * 0.3f), 0, 255));
+						const uint8 F = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(58.f + Grain * 0.3f), 0, 255));
 						Pixels[Y * Size + X] = FColor(F, F, F, 0);
 					}
 					else
 					{
 						const int32 Sub = Lx < 64 ? 0 : 1;
 						const uint32 Wh = Hash2D(Col * 2 + Sub, Row, 97u);
-						const float T = static_cast<float>(Ly - 30) / 64.f; // 0 top .. 1 bottom
+						const float T = static_cast<float>(Ly - 30) / 64.f;
 						const bool bBlinds = (Wh & 3u) == 0u && T < 0.45f;
 						const float Lit = ((Wh >> 4) & 0xFF) / 255.f;
-						float R = 28.f + Lit * 22.f + (1.f - T) * 16.f;
-						float G = 38.f + Lit * 24.f + (1.f - T) * 20.f;
-						float B = 52.f + Lit * 24.f + (1.f - T) * 26.f;
+						float R = 24.f + Lit * 18.f + (1.f - T) * 16.f;
+						float G = 34.f + Lit * 20.f + (1.f - T) * 20.f;
+						float B = 48.f + Lit * 22.f + (1.f - T) * 26.f;
 						if (bBlinds)
 						{
 							const float Slat = (Ly % 4 == 0) ? 0.85f : 1.0f;
-							R = (R + 75.f) * Slat;
-							G = (G + 78.f) * Slat;
-							B = (B + 74.f) * Slat;
+							R = (R + 68.f) * Slat;
+							G = (G + 70.f) * Slat;
+							B = (B + 66.f) * Slat;
 						}
 						Pixels[Y * Size + X] = FColor(
 							static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(R), 0, 255)),
@@ -356,11 +362,178 @@ UTexture2D* FacadeTexture()
 				{
 					if (bLintelShadow)
 					{
-						Wall -= 28.f;
+						Wall -= 32.f;
 					}
 					const uint8 V = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Wall), 0, 255));
 					Pixels[Y * Size + X] = FColor(V, V, V, 0);
 				}
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
+}
+
+/**
+ * Tileable 4-bay × 4-storey modern glass curtain-wall texture (512 × 512, covering 12.8 m × 13.6 m).
+ * High glass ratio (~78%) with dark aluminum mullions, horizontal floor spandrels, and a darker
+ * mechanical/structural band on row 0 so supertalls keep crisp horizontal articulation at distance.
+ */
+UTexture2D* CurtainWallFacadeTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 512;
+		constexpr int32 Cell = 128;
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			const int32 Row = Y / Cell;
+			const int32 Ly = Y % Cell;
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const int32 Col = X / Cell;
+				const int32 Lx = X % Cell;
+				const float Grain = ((Hash2D(X, Y, 19u) & 0xFF) / 255.f - 0.5f) * 8.f;
+				const bool bSpandrel = Ly < 22 || Ly >= 118;
+				const bool bMullion = Lx < 5 || Lx >= 124 || (Lx >= 62 && Lx < 66);
+				if (bMullion)
+				{
+					const uint8 M = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(52.f + Grain), 0, 255));
+					Pixels[Y * Size + X] = FColor(M, M, M, 0);
+				}
+				else if (bSpandrel)
+				{
+					// Dark metallic floor-slab spandrel; deeper on row 0 for rhythmic tower bands.
+					const float Base = Row == 0 ? 78.f : 112.f;
+					const uint8 S = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Base + Grain), 0, 255));
+					Pixels[Y * Size + X] = FColor(S, S, static_cast<uint8>(FMath::Min(S + 10, 255)), 80);
+				}
+				else
+				{
+					const int32 Sub = Lx < 64 ? 0 : 1;
+					const uint32 Wh = Hash2D(Col * 2 + Sub, Row, 131u);
+					const float T = static_cast<float>(Ly - 22) / 96.f;
+					const float Var = ((Wh & 0xFF) / 255.f - 0.5f) * 32.f;
+					const bool bOfficeCeiling = T < 0.22f && ((Wh >> 8) & 1u) == 0u;
+					float R = 135.f + Var + (1.f - T) * 34.f + (bOfficeCeiling ? 24.f : 0.f);
+					float G = 152.f + Var + (1.f - T) * 38.f + (bOfficeCeiling ? 22.f : 0.f);
+					float B = 172.f + Var + (1.f - T) * 44.f + (bOfficeCeiling ? 18.f : 0.f);
+					Pixels[Y * Size + X] = FColor(
+						static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(R), 0, 255)),
+						static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(G), 0, 255)),
+						static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(B), 0, 255)),
+						255);
+				}
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
+}
+
+/**
+ * Tileable 4-bay × 4-storey residential brick / brownstone facade texture (512 × 512).
+ * Running-bond brick courses with smaller recessed residential windows and light stone sills/lintels.
+ */
+UTexture2D* BrickFacadeTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 512;
+		constexpr int32 Cell = 128;
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			const int32 Row = Y / Cell;
+			const int32 Ly = Y % Cell;
+			const int32 Course = Y / 8;
+			const int32 BrickOffset = (Course & 1) ? 10 : 0;
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const int32 Col = X / Cell;
+				const int32 Lx = X % Cell;
+				const bool bMortar = (Y % 8) == 0 || ((X + BrickOffset) % 20) == 0;
+				const int32 Bx = (X + BrickOffset) / 20;
+				const float BrickVar = ((Hash2D(Bx, Course, 41u) & 0xFF) / 255.f - 0.5f) * 26.f;
+				const float Grain = ((Hash2D(X, Y, 43u) & 0xFF) / 255.f - 0.5f) * 12.f;
+
+				const bool bInWindow = Lx >= 32 && Lx < 96 && Ly >= 28 && Ly < 96;
+				const bool bTrim = Lx >= 28 && Lx < 100 && ((Ly >= 20 && Ly < 28) || (Ly >= 96 && Ly < 103));
+				if (bTrim)
+				{
+					const uint8 T = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(196.f + Grain * 0.4f), 0, 255));
+					Pixels[Y * Size + X] = FColor(T, T, T, 0);
+				}
+				else if (bInWindow)
+				{
+					const bool bFrame = Lx < 36 || Lx >= 92 || Ly < 32 || Ly >= 92
+						|| (Ly >= 60 && Ly < 64) || (Lx >= 62 && Lx < 66);
+					if (bFrame)
+					{
+						const uint8 F = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(82.f + Grain * 0.3f), 0, 255));
+						Pixels[Y * Size + X] = FColor(F, F, F, 0);
+					}
+					else
+					{
+						const uint32 Wh = Hash2D(Col, Row, 157u);
+						const float T = static_cast<float>(Ly - 32) / 60.f;
+						const bool bCurtain = (Wh & 3u) == 0u;
+						const float Lit = ((Wh >> 4) & 0xFF) / 255.f;
+						float R = 26.f + Lit * 22.f + (1.f - T) * 12.f + (bCurtain ? 38.f : 0.f);
+						float G = 32.f + Lit * 22.f + (1.f - T) * 14.f + (bCurtain ? 36.f : 0.f);
+						float B = 42.f + Lit * 20.f + (1.f - T) * 18.f + (bCurtain ? 30.f : 0.f);
+						Pixels[Y * Size + X] = FColor(
+							static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(R), 0, 255)),
+							static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(G), 0, 255)),
+							static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(B), 0, 255)),
+							255);
+					}
+				}
+				else
+				{
+					const float V = bMortar ? 168.f + Grain * 0.5f : 226.f + BrickVar + Grain;
+					const uint8 C = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(V), 0, 255));
+					Pixels[Y * Size + X] = FColor(C, C, C, 0);
+				}
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
+}
+
+/** Tileable water ripple texture (256 × 256) for subtle estuarine surface variation. */
+UTexture2D* WaterTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 256;
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			const float Fy = static_cast<float>(Y) / Size * 2.f * PI;
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const float Fx = static_cast<float>(X) / Size * 2.f * PI;
+				const float W = 0.5f
+					+ 0.22f * FMath::Sin(Fx * 3.f + Fy * 7.f)
+					+ 0.16f * FMath::Sin(Fx * 11.f - Fy * 5.f)
+					+ 0.12f * FMath::Cos(Fx * 19.f + Fy * 13.f);
+				const float R = FMath::Lerp(14.f, 28.f, W);
+				const float G = FMath::Lerp(34.f, 58.f, W);
+				const float B = FMath::Lerp(46.f, 76.f, W);
+				Pixels[Y * Size + X] = FColor(
+					static_cast<uint8>(FMath::RoundToInt(R)),
+					static_cast<uint8>(FMath::RoundToInt(G)),
+					static_cast<uint8>(FMath::RoundToInt(B)),
+					255);
 			}
 		}
 		Cached.Reset(MakeTilingTexture(Size, Pixels));
@@ -410,56 +583,116 @@ UTexture2D* RoofTexture()
 	return Cached.Get();
 }
 
-/** Procedural lit facade material: wall colour tinted by vertex colour, reflective glass windows via alpha mask. */
-UMaterialInterface* BuildingFacadeMaterial()
+/** Helper to build a lit facade material: wall/glass blend driven by the texture's alpha glass mask. */
+UMaterialInterface* MakeFacadeMaterial(TStrongObjectPtr<UMaterial>& Cache, const TCHAR* Name, UTexture2D* Texture,
+	bool bTintGlass, float WallRoughness, float GlassRoughness, float WallSpec, float GlassSpec, float WallMetal, float GlassMetal)
+{
+#if WITH_EDITORONLY_DATA
+	if (!Cache)
+	{
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), Name, RF_Transient);
+		UMaterialExpressionVertexColor* Tint = NewObject<UMaterialExpressionVertexColor>(M);
+		UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		Tex->ParameterName = TEXT("Facade");
+		Tex->Texture = Texture;
+		Tex->SamplerType = SAMPLERTYPE_Color;
+		UMaterialExpressionMultiply* Tinted = NewObject<UMaterialExpressionMultiply>(M);
+		Tinted->A.Connect(0, Tex);
+		Tinted->B.Connect(0, Tint);
+		UMaterialExpression* BaseOut = Tinted;
+		TArray<UMaterialExpression*> Exprs = {Tint, Tex, Tinted};
+		if (!bTintGlass)
+		{
+			UMaterialExpressionLinearInterpolate* BaseLerp = NewObject<UMaterialExpressionLinearInterpolate>(M);
+			BaseLerp->A.Connect(0, Tinted);
+			BaseLerp->B.Connect(0, Tex);
+			BaseLerp->Alpha.Connect(4, Tex);
+			BaseOut = BaseLerp;
+			Exprs.Add(BaseLerp);
+		}
+		UMaterialExpressionConstant* WR = NewObject<UMaterialExpressionConstant>(M);
+		WR->R = WallRoughness;
+		UMaterialExpressionConstant* GR = NewObject<UMaterialExpressionConstant>(M);
+		GR->R = GlassRoughness;
+		UMaterialExpressionLinearInterpolate* Roughness = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		Roughness->A.Connect(0, WR);
+		Roughness->B.Connect(0, GR);
+		Roughness->Alpha.Connect(4, Tex);
+		UMaterialExpressionConstant* WS = NewObject<UMaterialExpressionConstant>(M);
+		WS->R = WallSpec;
+		UMaterialExpressionConstant* GS = NewObject<UMaterialExpressionConstant>(M);
+		GS->R = GlassSpec;
+		UMaterialExpressionLinearInterpolate* Specular = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		Specular->A.Connect(0, WS);
+		Specular->B.Connect(0, GS);
+		Specular->Alpha.Connect(4, Tex);
+		UMaterialExpressionConstant* WM = NewObject<UMaterialExpressionConstant>(M);
+		WM->R = WallMetal;
+		UMaterialExpressionConstant* GM = NewObject<UMaterialExpressionConstant>(M);
+		GM->R = GlassMetal;
+		UMaterialExpressionLinearInterpolate* Metallic = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		Metallic->A.Connect(0, WM);
+		Metallic->B.Connect(0, GM);
+		Metallic->Alpha.Connect(4, Tex);
+		Exprs.Append({WR, GR, Roughness, WS, GS, Specular, WM, GM, Metallic});
+		for (UMaterialExpression* E : Exprs)
+		{
+			M->GetExpressionCollection().AddExpression(E);
+		}
+		M->GetEditorOnlyData()->BaseColor.Connect(0, BaseOut);
+		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
+		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
+		M->GetEditorOnlyData()->Metallic.Connect(0, Metallic);
+		M->PostEditChange();
+		Cache.Reset(M);
+	}
+	return Cache.Get();
+#else
+	return VertexColorMaterial();
+#endif
+}
+
+UMaterialInterface* BuildingGlassMaterial()
+{
+	static TStrongObjectPtr<UMaterial> Material;
+	return MakeFacadeMaterial(Material, TEXT("NosimBuildingGlass"), CurtainWallFacadeTexture(), true, 0.55f, 0.08f, 0.45f, 0.95f, 0.20f, 0.28f);
+}
+
+UMaterialInterface* BuildingStoneMaterial()
+{
+	static TStrongObjectPtr<UMaterial> Material;
+	return MakeFacadeMaterial(Material, TEXT("NosimBuildingStone"), StoneFacadeTexture(), false, 0.86f, 0.14f, 0.35f, 0.85f, 0.0f, 0.12f);
+}
+
+UMaterialInterface* BuildingBrickMaterial()
+{
+	static TStrongObjectPtr<UMaterial> Material;
+	return MakeFacadeMaterial(Material, TEXT("NosimBuildingBrick"), BrickFacadeTexture(), false, 0.90f, 0.16f, 0.30f, 0.80f, 0.0f, 0.08f);
+}
+
+/** Procedural glossy estuarine water material for `areas/water.geoparquet`. */
+UMaterialInterface* WaterMaterial()
 {
 #if WITH_EDITORONLY_DATA
 	static TStrongObjectPtr<UMaterial> Material;
 	if (!Material)
 	{
-		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimBuildingFacade"), RF_Transient);
-		UMaterialExpressionVertexColor* Tint = NewObject<UMaterialExpressionVertexColor>(M);
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimWater"), RF_Transient);
 		UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
-		Tex->ParameterName = TEXT("Facade");
-		Tex->Texture = FacadeTexture();
+		Tex->ParameterName = TEXT("Water");
+		Tex->Texture = WaterTexture();
 		Tex->SamplerType = SAMPLERTYPE_Color;
-		UMaterialExpressionMultiply* WallTinted = NewObject<UMaterialExpressionMultiply>(M);
-		WallTinted->A.Connect(0, Tex); // RGB
-		WallTinted->B.Connect(0, Tint);
-		UMaterialExpressionLinearInterpolate* BaseColor = NewObject<UMaterialExpressionLinearInterpolate>(M);
-		BaseColor->A.Connect(0, WallTinted);
-		BaseColor->B.Connect(0, Tex); // un-tinted reflective glass
-		BaseColor->Alpha.Connect(4, Tex); // A = glass mask
-		UMaterialExpressionConstant* WallRough = NewObject<UMaterialExpressionConstant>(M);
-		WallRough->R = 0.86f;
-		UMaterialExpressionConstant* GlassRough = NewObject<UMaterialExpressionConstant>(M);
-		GlassRough->R = 0.14f;
-		UMaterialExpressionLinearInterpolate* Roughness = NewObject<UMaterialExpressionLinearInterpolate>(M);
-		Roughness->A.Connect(0, WallRough);
-		Roughness->B.Connect(0, GlassRough);
-		Roughness->Alpha.Connect(4, Tex);
-		UMaterialExpressionConstant* WallSpec = NewObject<UMaterialExpressionConstant>(M);
-		WallSpec->R = 0.35f;
-		UMaterialExpressionConstant* GlassSpec = NewObject<UMaterialExpressionConstant>(M);
-		GlassSpec->R = 0.85f;
-		UMaterialExpressionLinearInterpolate* Specular = NewObject<UMaterialExpressionLinearInterpolate>(M);
-		Specular->A.Connect(0, WallSpec);
-		Specular->B.Connect(0, GlassSpec);
-		Specular->Alpha.Connect(4, Tex);
-		UMaterialExpressionConstant* WallMetal = NewObject<UMaterialExpressionConstant>(M);
-		WallMetal->R = 0.0f;
-		UMaterialExpressionConstant* GlassMetal = NewObject<UMaterialExpressionConstant>(M);
-		GlassMetal->R = 0.12f;
-		UMaterialExpressionLinearInterpolate* Metallic = NewObject<UMaterialExpressionLinearInterpolate>(M);
-		Metallic->A.Connect(0, WallMetal);
-		Metallic->B.Connect(0, GlassMetal);
-		Metallic->Alpha.Connect(4, Tex);
-		for (UMaterialExpression* E : TArray<UMaterialExpression*>{
-			Tint, Tex, WallTinted, BaseColor, WallRough, GlassRough, Roughness, WallSpec, GlassSpec, Specular, WallMetal, GlassMetal, Metallic})
+		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
+		Roughness->R = 0.09f;
+		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
+		Specular->R = 0.90f;
+		UMaterialExpressionConstant* Metallic = NewObject<UMaterialExpressionConstant>(M);
+		Metallic->R = 0.06f;
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Tex, Roughness, Specular, Metallic})
 		{
 			M->GetExpressionCollection().AddExpression(E);
 		}
-		M->GetEditorOnlyData()->BaseColor.Connect(0, BaseColor);
+		M->GetEditorOnlyData()->BaseColor.Connect(0, Tex);
 		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
 		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
 		M->GetEditorOnlyData()->Metallic.Connect(0, Metallic);
@@ -508,66 +741,58 @@ UMaterialInterface* BuildingRoofMaterial()
 #endif
 }
 
-/** Deterministic wall and roof tints from OSM `building=*` tag, height, and spatial seed. */
-void BuildingPalette(const FString& Tag, double HeightM, uint64 Seed, FLinearColor& OutWall, FLinearColor& OutRoof)
+/**
+ * Deterministic architectural style (glass curtain wall, stone/precast, or brick) and PBR-calibrated
+ * linear wall/roof tints from OSM `building=*` tag, height, and spatial seed.
+ */
+ESection BuildingStyleAndPalette(const FString& Tag, double HeightM, uint64 Seed, FLinearColor& OutWall, FLinearColor& OutRoof)
 {
 	const float U = static_cast<float>(Seed & 0xFFFFu) / 65535.f;
 	const float V = static_cast<float>((Seed >> 16) & 0xFFFFu) / 65535.f;
+	const uint64 Pick = Seed >> 32;
 	const bool bTerminal = Tag.Contains(TEXT("terminal")) || Tag.Contains(TEXT("transportation")) || Tag.Contains(TEXT("public"));
 	const bool bIndustrial = Tag.Contains(TEXT("hangar")) || Tag.Contains(TEXT("industrial")) || Tag.Contains(TEXT("warehouse"));
-	const bool bCommercial = Tag.Contains(TEXT("commercial")) || Tag.Contains(TEXT("office")) || Tag.Contains(TEXT("retail")) || HeightM >= 18.0;
+	const bool bOffice = Tag.Contains(TEXT("commercial")) || Tag.Contains(TEXT("office")) || Tag.Contains(TEXT("hotel"));
 	const bool bResidential = Tag.Contains(TEXT("house")) || Tag.Contains(TEXT("residential")) || Tag.Contains(TEXT("apartments"))
 		|| Tag.Contains(TEXT("detached")) || Tag.Contains(TEXT("terrace"));
 
-	if (bTerminal)
+	// Tall skyscrapers & modern offices/terminals get curtain-wall glass (~60% of towers >= 45 m).
+	if ((bOffice && HeightM >= 25.0) || (HeightM >= 45.0 && (Pick % 5) != 0) || (bTerminal && (Pick % 2) == 0))
 	{
-		// Cool architectural concrete / light steel panels and bright membrane roof.
-		const float G = FMath::Lerp(0.46f, 0.58f, U);
-		OutWall = FLinearColor(G, G * 1.01f, G * 1.04f);
-		const float R = FMath::Lerp(0.30f, 0.40f, V);
-		OutRoof = FLinearColor(R, R, R * 1.02f);
-	}
-	else if (bIndustrial)
-	{
-		const float G = FMath::Lerp(0.36f, 0.50f, U);
-		OutWall = FLinearColor(G * 1.02f, G, G * 0.96f);
-		const float R = FMath::Lerp(0.22f, 0.34f, V);
-		OutRoof = FLinearColor(R, R, R * 1.02f);
-	}
-	else if (bCommercial)
-	{
-		const FLinearColor Swatches[3] = {
-			FLinearColor(0.42f, 0.44f, 0.47f), // steel grey
-			FLinearColor(0.50f, 0.46f, 0.40f), // limestone
-			FLinearColor(0.36f, 0.34f, 0.33f), // dark granite
+		const FLinearColor GlassSwatches[4] = {
+			FLinearColor(0.22f, 0.34f, 0.44f), // cool blue-steel glass
+			FLinearColor(0.26f, 0.36f, 0.38f), // sea-green curtain wall
+			FLinearColor(0.32f, 0.34f, 0.38f), // silver-slate glass
+			FLinearColor(0.30f, 0.26f, 0.22f), // warm bronze architectural glass
 		};
-		OutWall = Swatches[(Seed >> 32) % 3] * FMath::Lerp(0.88f, 1.12f, U);
-		const float R = FMath::Lerp(0.18f, 0.28f, V);
-		OutRoof = FLinearColor(R, R, R);
+		OutWall = GlassSwatches[Pick % 4] * FMath::Lerp(0.82f, 1.12f, U);
+		const float R = FMath::Lerp(0.11f, 0.19f, V);
+		OutRoof = FLinearColor(R, R, R * 1.03f);
+		return S_BuildingGlass;
 	}
-	else if (bResidential)
+	if (bResidential || (HeightM < 18.0 && !bIndustrial && !bTerminal && (Pick % 3) != 0))
 	{
-		const FLinearColor Swatches[4] = {
-			FLinearColor(0.42f, 0.24f, 0.19f), // brick
-			FLinearColor(0.54f, 0.49f, 0.42f), // warm stucco
-			FLinearColor(0.48f, 0.45f, 0.40f), // clapboard beige
-			FLinearColor(0.38f, 0.40f, 0.43f), // muted slate
+		const FLinearColor BrickSwatches[4] = {
+			FLinearColor(0.24f, 0.11f, 0.08f), // NYC red brick
+			FLinearColor(0.22f, 0.15f, 0.11f), // brownstone
+			FLinearColor(0.28f, 0.22f, 0.17f), // warm tan brick
+			FLinearColor(0.20f, 0.19f, 0.18f), // charcoal / dark brick
 		};
-		OutWall = Swatches[(Seed >> 32) % 4] * FMath::Lerp(0.88f, 1.12f, U);
-		OutRoof = FLinearColor(FMath::Lerp(0.14f, 0.24f, V), FMath::Lerp(0.13f, 0.21f, V), FMath::Lerp(0.13f, 0.20f, V));
+		OutWall = BrickSwatches[Pick % 4] * FMath::Lerp(0.85f, 1.15f, U);
+		OutRoof = FLinearColor(FMath::Lerp(0.08f, 0.15f, V), FMath::Lerp(0.08f, 0.14f, V), FMath::Lerp(0.08f, 0.14f, V));
+		return S_BuildingBrick;
 	}
-	else
-	{
-		const FLinearColor Swatches[4] = {
-			FLinearColor(0.46f, 0.43f, 0.39f), // warm concrete
-			FLinearColor(0.40f, 0.41f, 0.43f), // cool grey
-			FLinearColor(0.44f, 0.32f, 0.26f), // muted brick
-			FLinearColor(0.50f, 0.47f, 0.41f), // sandstone
-		};
-		OutWall = Swatches[(Seed >> 32) % 4] * FMath::Lerp(0.88f, 1.12f, U);
-		const float R = FMath::Lerp(0.16f, 0.26f, V);
-		OutRoof = FLinearColor(R, R, R * 1.02f);
-	}
+	// Stone / Art Deco limestone / precast concrete / industrial.
+	const FLinearColor StoneSwatches[4] = {
+		FLinearColor(0.26f, 0.24f, 0.21f), // Indiana limestone
+		FLinearColor(0.22f, 0.23f, 0.25f), // cool precast concrete
+		FLinearColor(0.29f, 0.26f, 0.22f), // warm travertine
+		FLinearColor(0.18f, 0.18f, 0.19f), // dark granite
+	};
+	OutWall = StoneSwatches[Pick % 4] * FMath::Lerp(0.85f, 1.15f, U);
+	const float R = FMath::Lerp(0.10f, 0.18f, V);
+	OutRoof = FLinearColor(R, R, R * 1.02f);
+	return S_BuildingStone;
 }
 
 const FLinearColor VehicleColors[3] = {
@@ -1405,11 +1630,9 @@ void ANosimWorld::BuildScene()
 		}
 		else
 		{
-			G.ZOffsetCm = (S.bridge ? 60.0 : 25.0) + FMath::Clamp(S.layer, -2, 5) * 2.0;
-			if (bPavement)
-			{
-				Mesh[S_Road].Ribbon(G.Local, G.HalfWidthCm, 0, G.ZOffsetCm);
-			}
+			G.ZOffsetCm = (S.bridge ? 60.0 : 12.0) + FMath::Clamp(S.layer, -2, 5) * 2.0;
+			// Always draw roads and bridges as crisp dark asphalt so street-level views don't rely on blurry aerial pixels.
+			Mesh[S_Road].Ribbon(G.Local, G.HalfWidthCm, 0, G.ZOffsetCm);
 		}
 	}
 
@@ -1485,19 +1708,101 @@ void ANosimWorld::BuildScene()
 				const double HeightM = Info.height_m > 0 ? Info.height_m : 8.0;
 				const uint64 Seed = nosim_spatial_seed(SeedLat, SeedLon, 0x6275696c64696e67ull /* "building" */);
 				FLinearColor WallColor, RoofColor;
-				BuildingPalette(UTF8_TO_TCHAR(TagBuf), HeightM, Seed, WallColor, RoofColor);
+				const ESection Style = BuildingStyleAndPalette(UTF8_TO_TCHAR(TagBuf), HeightM, Seed, WallColor, RoofColor);
 				const double TopCm = (Base + HeightM) * 100.0;
 				const double BottomCm = (Base + Info.min_height_m) * 100.0 - (Info.min_height_m > 0 ? 0.0 : 100.0);
 				for (const TArray<TArray<FVector2D>>& Rings : Parts)
 				{
 					if (Rings.Num() > 0)
 					{
-						Mesh[S_Building].Extrude(Rings, BottomCm, TopCm, Mesh[S_Roof], WallColor, RoofColor);
+						Mesh[Style].Extrude(Rings, BottomCm, TopCm, Mesh[S_Roof], WallColor, RoofColor);
 					}
 				}
 				++BuildingCount;
 			}
 			nosim_polygon_table_free(Polygons);
+		}
+	}
+
+	// Water: rivers, bays and ponds from `areas/water.geoparquet` rendered with a glossy water surface.
+	if (const FString WaterPath = WorldFile(TEXT("areas/water.geoparquet")); !WaterPath.IsEmpty())
+	{
+		if (NosimPolygonTable* WaterPolys = nosim_polygon_table_load(TCHAR_TO_UTF8(*WaterPath)))
+		{
+			TArray<double> Pts;
+			for (size_t A = 0; A < nosim_polygon_table_count(WaterPolys); ++A)
+			{
+				NosimArea Info;
+				if (nosim_polygon_table_get(WaterPolys, A, &Info) != NOSIM_STATUS_OK)
+				{
+					continue;
+				}
+				TArray<TArray<TArray<FVector2D>>> Parts;
+				Parts.SetNum(static_cast<int32>(Info.polygon_count));
+				double LevelSum = 0.0;
+				int32 LevelN = 0;
+				bool bInside = false;
+				for (size_t K = 0; K < Info.ring_count; ++K)
+				{
+					NosimRing Ring;
+					if (nosim_polygon_table_ring(WaterPolys, A, K, &Ring) != NOSIM_STATUS_OK || Ring.point_count < 3)
+					{
+						continue;
+					}
+					Pts.SetNumUninitialized(static_cast<int32>(Ring.point_count * 2));
+					nosim_polygon_table_ring_points(WaterPolys, A, K, Pts.GetData(), Ring.point_count);
+					TArray<FVector2D>& Out = Parts[static_cast<int32>(Ring.polygon)].AddDefaulted_GetRef();
+					for (size_t P = 0; P < Ring.point_count; ++P)
+					{
+						const double Lon = Pts[2 * P], Lat = Pts[2 * P + 1];
+						bInside |= Lon >= Area.min_lon && Lon <= Area.max_lon && Lat >= Area.min_lat && Lat <= Area.max_lat;
+						const FVector L = LonLatToLocal(Lon, Lat);
+						Out.Add(FVector2D(L.X, L.Y));
+						if (P % 4 == 0)
+						{
+							LevelSum += GroundM(Lon, Lat);
+							++LevelN;
+						}
+					}
+				}
+				if (!bInside)
+				{
+					continue;
+				}
+				const double WaterZCm = (LevelN > 0 ? LevelSum / LevelN : GroundZ) * 100.0 + 35.0;
+				constexpr double WaterTileCm = 4000.0; // 40 m ripple tile
+				for (const TArray<TArray<FVector2D>>& Rings : Parts)
+				{
+					if (Rings.Num() == 0)
+					{
+						continue;
+					}
+					using namespace UE::Geometry;
+					FGeneralPolygon2d Poly{FPolygon2d(Rings[0])};
+					for (int32 R = 1; R < Rings.Num(); ++R)
+					{
+						Poly.AddHole(FPolygon2d(Rings[R]), false, false);
+					}
+					FDelaunay2 Delaunay;
+					Delaunay.bAutomaticallyFixEdgesToDuplicateVertices = true;
+					TArray<FIndex3i> Tris;
+					TArray<FVector2d> Verts;
+					if (Delaunay.Triangulate(Poly, &Tris, &Verts, true))
+					{
+						for (const FIndex3i& T : Tris)
+						{
+							const FVector2d& PA = Verts[T.A];
+							const FVector2d& PB = Verts[T.B];
+							const FVector2d& PC = Verts[T.C];
+							Mesh[S_Water].TriangleUV(FVector(PA, WaterZCm), FVector(PB, WaterZCm), FVector(PC, WaterZCm), FVector::UpVector,
+								FVector2D(PA.X / WaterTileCm, PA.Y / WaterTileCm),
+								FVector2D(PB.X / WaterTileCm, PB.Y / WaterTileCm),
+								FVector2D(PC.X / WaterTileCm, PC.Y / WaterTileCm), FLinearColor::White);
+						}
+					}
+				}
+			}
+			nosim_polygon_table_free(WaterPolys);
 		}
 	}
 
@@ -1549,13 +1854,25 @@ void ANosimWorld::BuildScene()
 	{
 		Scenery->CreateMeshSection_LinearColor(I, Mesh[I].Vertices, Mesh[I].Triangles, Mesh[I].Normals, Mesh[I].UVs,
 			Mesh[I].Colors, TArray<FProcMeshTangent>(), false);
-		if (I == S_Building)
+		if (I == S_BuildingGlass)
 		{
-			Scenery->SetMaterial(I, BuildingFacadeMaterial());
+			Scenery->SetMaterial(I, BuildingGlassMaterial());
+		}
+		else if (I == S_BuildingStone)
+		{
+			Scenery->SetMaterial(I, BuildingStoneMaterial());
+		}
+		else if (I == S_BuildingBrick)
+		{
+			Scenery->SetMaterial(I, BuildingBrickMaterial());
 		}
 		else if (I == S_Roof)
 		{
 			Scenery->SetMaterial(I, BuildingRoofMaterial());
+		}
+		else if (I == S_Water)
+		{
+			Scenery->SetMaterial(I, WaterMaterial());
 		}
 		else
 		{
@@ -1641,14 +1958,14 @@ void ANosimWorld::BuildScene()
 		{
 			const double Lon = Area.min_lon + Xy[2 * K] / WidthM * (Area.max_lon - Area.min_lon);
 			const double Lat = Area.max_lat - Xy[2 * K + 1] / HeightM * (Area.max_lat - Area.min_lat);
-			const double TallM = Random.FRandRange(9.f, 17.f), WideM = TallM * Random.FRandRange(0.35f, 0.5f);
-			// The engine cone is 1 m across and 1 m tall about its centre.
-			Instances.Add(FTransform(FRotator(0, Random.FRandRange(0.f, 360.f), 0), GeoToLocal(Lon, Lat, GroundM(Lon, Lat) + TallM * 0.5),
-				FVector(WideM, WideM, TallM)));
+			const double TallM = Random.FRandRange(8.f, 15.f), WideM = TallM * Random.FRandRange(0.55f, 0.80f);
+			// Rounded deciduous canopy ellipsoid (engine sphere is 1 m across about its centre).
+			Instances.Add(FTransform(FRotator(0, Random.FRandRange(0.f, 360.f), 0), GeoToLocal(Lon, Lat, GroundM(Lon, Lat) + TallM * 0.48),
+				FVector(WideM, WideM, TallM * 0.78)));
 		}
-		Trees->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cone.Cone")));
+		Trees->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Sphere.Sphere")));
 		UMaterialInstanceDynamic* Mid = UMaterialInstanceDynamic::Create(Base, this);
-		Mid->SetVectorParameterValue(TEXT("Color"), FLinearColor(0.02f, 0.07f, 0.02f));
+		Mid->SetVectorParameterValue(TEXT("Color"), FLinearColor(0.032f, 0.068f, 0.022f));
 		Trees->SetMaterial(0, Mid);
 		Materials.Add(Mid);
 		Trees->AddInstances(Instances, false, false);
@@ -1799,6 +2116,9 @@ void ANosimWorld::SpawnEnvironment()
 		ASkyLight* Sky = World->SpawnActorDeferred<ASkyLight>(ASkyLight::StaticClass(), Origin);
 		Sky->GetLightComponent()->SetMobility(EComponentMobility::Movable);
 		Sky->GetLightComponent()->bRealTimeCapture = true;
+		Sky->GetLightComponent()->Intensity = 2.0f;
+		Sky->GetLightComponent()->bLowerHemisphereIsBlack = false;
+		Sky->GetLightComponent()->LowerHemisphereColor = FLinearColor(0.14f, 0.13f, 0.12f);
 		Sky->FinishSpawning(Origin);
 	}
 	if (!TActorIterator<AExponentialHeightFog>(World))
