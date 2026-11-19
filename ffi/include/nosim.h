@@ -221,7 +221,8 @@ typedef struct NosimSplineTable NosimSplineTable;
 typedef struct NosimStarCatalog NosimStarCatalog;
 
 /**
- * A far-field CTM run on a graph, stepped by the caller.
+ * A traffic run on a graph (far-field CTM alone, or hybrid with near-field vehicles),
+ * stepped by the caller.
  */
 typedef struct NosimTraffic NosimTraffic;
 
@@ -915,6 +916,32 @@ typedef struct NosimTrafficTotals {
    */
   double on_network;
 } NosimTrafficTotals;
+
+/**
+ * One microscopic vehicle in the near field of a hybrid traffic run.
+ */
+typedef struct NosimNearVehicle {
+  /**
+   * Stable vehicle identifier across steps and edges.
+   */
+  uint64_t id;
+  /**
+   * Directed graph edge index (`0..nosim_graph_edge_count`).
+   */
+  uint32_t edge;
+  /**
+   * Lane index on that edge (`0..edge.lanes`, 0 = rightmost / first lane).
+   */
+  uint32_t lane;
+  /**
+   * Distance of the front bumper from the edge's upstream end, metres.
+   */
+  double distance_m;
+  /**
+   * Current speed, m/s.
+   */
+  double speed_mps;
+} NosimNearVehicle;
 
 /**
  * A tile address.
@@ -1936,6 +1963,22 @@ struct NosimTraffic *nosim_traffic_new(const struct NosimGraph *g,
                                        struct NosimTrafficOptions options);
 
 /**
+ * Builds a hybrid traffic run for a graph: individual IDM / MOBIL vehicles on edges whose
+ * endpoints lie within `near_radius_m` of `(near_lon_deg, near_lat_deg)`, coupled to the
+ * CTM beyond, with `near_substeps` near-field substeps per CTM step `options.dt_s`. NULL on
+ * failure.
+ *
+ * # Safety
+ * `g` must be NULL or live.
+ */
+struct NosimTraffic *nosim_traffic_new_hybrid(const struct NosimGraph *g,
+                                              struct NosimTrafficOptions options,
+                                              double near_lon_deg,
+                                              double near_lat_deg,
+                                              double near_radius_m,
+                                              uint32_t near_substeps);
+
+/**
  * Releases a traffic run. NULL is ignored.
  *
  * # Safety
@@ -1944,7 +1987,7 @@ struct NosimTraffic *nosim_traffic_new(const struct NosimGraph *g,
 void nosim_traffic_free(struct NosimTraffic *t);
 
 /**
- * Advances `steps` steps and writes the running totals to `out` (which may be NULL).
+ * Advances `steps` CTM steps and writes the running totals to `out` (which may be NULL).
  *
  * # Safety
  * `t` must be NULL or live; `out` must be NULL or writable.
@@ -1954,9 +1997,20 @@ enum NosimStatus nosim_traffic_step(struct NosimTraffic *t,
                                     struct NosimTrafficTotals *out);
 
 /**
+ * Advances `substeps` near-field substeps (each `dt_s / near_substeps` for a hybrid run, or
+ * one CTM step for a pure CTM run), stepping the far-field CTM at the start of each cycle,
+ * and writes the running totals to `out` (which may be NULL).
+ *
+ * # Safety
+ * `t` must be NULL or live; `out` must be NULL or writable.
+ */
+enum NosimStatus nosim_traffic_substep(struct NosimTraffic *t,
+                                       uint32_t substeps,
+                                       struct NosimTrafficTotals *out);
+
+/**
  * Puts up to `vehicles` on graph edge `edge` at fraction `at` of its length (0 its start, 1
- * its end), counted as entered: the far field's side of a near-field handoff. Returns how
- * many fitted (0 for a bad handle or index).
+ * its end), counted as entered. Returns how many fitted (0 for a bad handle or index).
  *
  * # Safety
  * `t` must be NULL or live.
@@ -1970,6 +2024,34 @@ double nosim_traffic_inject(struct NosimTraffic *t, size_t edge, double at, doub
  * `t` must be NULL or live.
  */
 double nosim_traffic_edge_vehicles(const struct NosimTraffic *t, size_t edge);
+
+/**
+ * Whether graph edge `edge` is simulated vehicle by vehicle in the near field.
+ *
+ * # Safety
+ * `t` must be NULL or live.
+ */
+bool nosim_traffic_is_near_edge(const struct NosimTraffic *t, size_t edge);
+
+/**
+ * Number of graph edges simulated vehicle by vehicle in the near field (0 for a pure CTM
+ * run or NULL).
+ *
+ * # Safety
+ * `t` must be NULL or live.
+ */
+size_t nosim_traffic_near_edge_count(const struct NosimTraffic *t);
+
+/**
+ * Writes up to `capacity` live near-field vehicles into `out` (when non-NULL) and returns
+ * the total number of live near-field vehicles.
+ *
+ * # Safety
+ * `t` must be NULL or live; `out` must be NULL or point to `capacity` writable elements.
+ */
+size_t nosim_traffic_near_vehicles(const struct NosimTraffic *t,
+                                   struct NosimNearVehicle *out,
+                                   size_t capacity);
 
 /**
  * The tile of `layer` containing a point at zoom `z`.

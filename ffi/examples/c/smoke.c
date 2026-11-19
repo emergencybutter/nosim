@@ -127,6 +127,20 @@ int main(int argc, char **argv) {
            nosim_graph_edge_count(graph), (unsigned long long)totals.steps, totals.entered, totals.exited,
            totals.on_network);
     nosim_traffic_free(traffic);
+
+    /* Hybrid traffic: near-field IDM/MOBIL vehicles around the terminal area coupled to CTM. */
+    NosimTraffic *hybrid = nosim_traffic_new_hybrid(graph, nosim_traffic_options_default(), -73.780, 40.643, 1500.0, 5);
+    CHECK(hybrid != NULL && nosim_traffic_near_edge_count(hybrid) > 0);
+    for (size_t e = 0; e < nosim_graph_edge_count(graph); e++) {
+        if (nosim_traffic_is_near_edge(hybrid, e)) {
+            CHECK(nosim_traffic_inject(hybrid, e, 0.0, 1.0) == 1.0);
+            break;
+        }
+    }
+    CHECK(nosim_traffic_substep(hybrid, 5, &totals) == NOSIM_STATUS_OK);
+    NosimNearVehicle nv;
+    CHECK(nosim_traffic_near_vehicles(hybrid, &nv, 1) >= 1 && nv.distance_m > 0.0);
+    nosim_traffic_free(hybrid);
     nosim_graph_free(graph);
     nosim_spline_table_free(splines);
 

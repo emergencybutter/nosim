@@ -213,6 +213,363 @@ UTexture2D* MakeImageryTexture(const FNosimImageryChunk& Chunk)
 	return Texture;
 }
 
+/** An sRGB tiling texture with a full 2 × 2 box-filtered mip chain. */
+UTexture2D* MakeTilingTexture(int32 Size, const TArray<FColor>& Pixels)
+{
+	UTexture2D* Texture = UTexture2D::CreateTransient(Size, Size, PF_B8G8R8A8);
+	if (!Texture)
+	{
+		return nullptr;
+	}
+	FTexturePlatformData* Data = Texture->GetPlatformData();
+	auto Fill = [](FTexture2DMipMap& Mip, const TArray<FColor>& Src)
+	{
+		Mip.BulkData.Lock(LOCK_READ_WRITE);
+		FMemory::Memcpy(Mip.BulkData.Realloc(Src.Num() * sizeof(FColor)), Src.GetData(), Src.Num() * sizeof(FColor));
+		Mip.BulkData.Unlock();
+	};
+	Fill(Data->Mips[0], Pixels);
+	TArray<FColor> Level = Pixels;
+	for (int32 Cur = Size; Cur > 1; Cur /= 2)
+	{
+		const int32 Half = Cur / 2;
+		TArray<FColor> Next;
+		Next.SetNumZeroed(Half * Half);
+		for (int32 J = 0; J < Half; ++J)
+		{
+			for (int32 I = 0; I < Half; ++I)
+			{
+				uint32 R = 0, G = 0, B = 0, A = 0;
+				for (const FIntPoint D : {FIntPoint(0, 0), FIntPoint(1, 0), FIntPoint(0, 1), FIntPoint(1, 1)})
+				{
+					const FColor& C = Level[(2 * J + D.Y) * Cur + 2 * I + D.X];
+					R += C.R;
+					G += C.G;
+					B += C.B;
+					A += C.A;
+				}
+				Next[J * Half + I] = FColor((R + 2) / 4, (G + 2) / 4, (B + 2) / 4, (A + 2) / 4);
+			}
+		}
+		Data->Mips.Add(new FTexture2DMipMap(Half, Half, 1));
+		Fill(Data->Mips.Last(), Next);
+		Level = MoveTemp(Next);
+	}
+	Texture->SRGB = true;
+	Texture->NeverStream = true;
+	Texture->AddressX = TA_Wrap;
+	Texture->AddressY = TA_Wrap;
+	Texture->LODGroup = TEXTUREGROUP_World;
+	Texture->UpdateResource();
+	return Texture;
+}
+
+uint32 Hash2D(int32 X, int32 Y, uint32 Salt)
+{
+	uint32 H = static_cast<uint32>(X) * 374761393u + static_cast<uint32>(Y) * 668265263u + Salt * 2246822519u;
+	H = (H ^ (H >> 13)) * 1274126177u;
+	return H ^ (H >> 16);
+}
+
+/**
+ * Tileable 4-bay × 4-storey facade texture (512 × 512, covering 12.8 m × 13.6 m).
+ * RGB holds wall shading (near-white, multiplied by per-building vertex colour) or window glass;
+ * A = 0 for matte wall/mullions and 255 for reflective glass panes.
+ */
+UTexture2D* FacadeTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 512;
+		constexpr int32 Cell = 128; // 4 × 4 cells
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			const int32 Row = Y / Cell;
+			const int32 Ly = Y % Cell;
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const int32 Col = X / Cell;
+				const int32 Lx = X % Cell;
+				const float Grain = ((Hash2D(X, Y, 11u) & 0xFF) / 255.f - 0.5f) * 14.f;
+				const float PanelVar = ((Hash2D(Col, Row, 23u) & 0xFF) / 255.f - 0.5f) * 12.f;
+
+				// Default matte wall surface with subtle horizontal course and vertical panel joints.
+				float Wall = 232.f + Grain + PanelVar;
+				if (Ly < 18 || Ly >= 112)
+				{
+					Wall -= 22.f; // spandrel / floor slab band
+				}
+				if (Ly == 18 || Ly == 112 || Lx == 0 || Lx == 1)
+				{
+					Wall -= 34.f; // architectural panel seam
+				}
+				else if ((Ly % 16) == 0)
+				{
+					Wall -= 8.f; // subtle masonry course line
+				}
+
+				const bool bInWindow = Lx >= 20 && Lx < 108 && Ly >= 26 && Ly < 98;
+				const bool bSill = Lx >= 16 && Lx < 112 && Ly >= 98 && Ly < 104;
+				const bool bLintelShadow = Lx >= 20 && Lx < 108 && Ly >= 22 && Ly < 26;
+				if (bSill)
+				{
+					const uint8 V = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(212.f + Grain * 0.5f), 0, 255));
+					Pixels[Y * Size + X] = FColor(V, V, V, 0);
+				}
+				else if (bInWindow)
+				{
+					const bool bFrame = Lx < 24 || Lx >= 104 || Ly < 30 || Ly >= 94
+						|| (Lx >= 62 && Lx < 66) || (Ly >= 46 && Ly < 49);
+					if (bFrame)
+					{
+						const uint8 F = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(68.f + Grain * 0.3f), 0, 255));
+						Pixels[Y * Size + X] = FColor(F, F, F, 0);
+					}
+					else
+					{
+						const int32 Sub = Lx < 64 ? 0 : 1;
+						const uint32 Wh = Hash2D(Col * 2 + Sub, Row, 97u);
+						const float T = static_cast<float>(Ly - 30) / 64.f; // 0 top .. 1 bottom
+						const bool bBlinds = (Wh & 3u) == 0u && T < 0.45f;
+						const float Lit = ((Wh >> 4) & 0xFF) / 255.f;
+						float R = 28.f + Lit * 22.f + (1.f - T) * 16.f;
+						float G = 38.f + Lit * 24.f + (1.f - T) * 20.f;
+						float B = 52.f + Lit * 24.f + (1.f - T) * 26.f;
+						if (bBlinds)
+						{
+							const float Slat = (Ly % 4 == 0) ? 0.85f : 1.0f;
+							R = (R + 75.f) * Slat;
+							G = (G + 78.f) * Slat;
+							B = (B + 74.f) * Slat;
+						}
+						Pixels[Y * Size + X] = FColor(
+							static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(R), 0, 255)),
+							static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(G), 0, 255)),
+							static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(B), 0, 255)),
+							255);
+					}
+				}
+				else
+				{
+					if (bLintelShadow)
+					{
+						Wall -= 28.f;
+					}
+					const uint8 V = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Wall), 0, 255));
+					Pixels[Y * Size + X] = FColor(V, V, V, 0);
+				}
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
+}
+
+/** Tileable roof gravel / membrane texture (512 × 512, covering 20 m × 20 m). */
+UTexture2D* RoofTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 512;
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const float Fine = ((Hash2D(X, Y, 31u) & 0xFF) / 255.f - 0.5f) * 28.f;
+				const float Coarse = ((Hash2D(X / 8, Y / 8, 53u) & 0xFF) / 255.f - 0.5f) * 20.f;
+				float V = 216.f + Fine + Coarse;
+				// Membrane / gravel expansion seams every 128 px (5 m).
+				if ((X % 128) < 2 || (Y % 128) < 2)
+				{
+					V -= 30.f;
+				}
+				// Scattered rooftop HVAC boxes / skylight outlines.
+				const int32 Bx = X / 128, By = Y / 128;
+				const uint32 Bh = Hash2D(Bx, By, 71u);
+				if ((Bh & 3u) == 0u)
+				{
+					const int32 Lx = X % 128, Ly = Y % 128;
+					if (Lx >= 44 && Lx < 84 && Ly >= 48 && Ly < 78)
+					{
+						const bool bEdge = Lx < 47 || Lx >= 81 || Ly < 51 || Ly >= 75;
+						V = bEdge ? 145.f : 190.f + Fine * 0.4f;
+					}
+				}
+				const uint8 C = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(V), 0, 255));
+				Pixels[Y * Size + X] = FColor(C, C, C, 255);
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
+}
+
+/** Procedural lit facade material: wall colour tinted by vertex colour, reflective glass windows via alpha mask. */
+UMaterialInterface* BuildingFacadeMaterial()
+{
+#if WITH_EDITORONLY_DATA
+	static TStrongObjectPtr<UMaterial> Material;
+	if (!Material)
+	{
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimBuildingFacade"), RF_Transient);
+		UMaterialExpressionVertexColor* Tint = NewObject<UMaterialExpressionVertexColor>(M);
+		UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		Tex->ParameterName = TEXT("Facade");
+		Tex->Texture = FacadeTexture();
+		Tex->SamplerType = SAMPLERTYPE_Color;
+		UMaterialExpressionMultiply* WallTinted = NewObject<UMaterialExpressionMultiply>(M);
+		WallTinted->A.Connect(0, Tex); // RGB
+		WallTinted->B.Connect(0, Tint);
+		UMaterialExpressionLinearInterpolate* BaseColor = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		BaseColor->A.Connect(0, WallTinted);
+		BaseColor->B.Connect(0, Tex); // un-tinted reflective glass
+		BaseColor->Alpha.Connect(4, Tex); // A = glass mask
+		UMaterialExpressionConstant* WallRough = NewObject<UMaterialExpressionConstant>(M);
+		WallRough->R = 0.86f;
+		UMaterialExpressionConstant* GlassRough = NewObject<UMaterialExpressionConstant>(M);
+		GlassRough->R = 0.14f;
+		UMaterialExpressionLinearInterpolate* Roughness = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		Roughness->A.Connect(0, WallRough);
+		Roughness->B.Connect(0, GlassRough);
+		Roughness->Alpha.Connect(4, Tex);
+		UMaterialExpressionConstant* WallSpec = NewObject<UMaterialExpressionConstant>(M);
+		WallSpec->R = 0.35f;
+		UMaterialExpressionConstant* GlassSpec = NewObject<UMaterialExpressionConstant>(M);
+		GlassSpec->R = 0.85f;
+		UMaterialExpressionLinearInterpolate* Specular = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		Specular->A.Connect(0, WallSpec);
+		Specular->B.Connect(0, GlassSpec);
+		Specular->Alpha.Connect(4, Tex);
+		UMaterialExpressionConstant* WallMetal = NewObject<UMaterialExpressionConstant>(M);
+		WallMetal->R = 0.0f;
+		UMaterialExpressionConstant* GlassMetal = NewObject<UMaterialExpressionConstant>(M);
+		GlassMetal->R = 0.12f;
+		UMaterialExpressionLinearInterpolate* Metallic = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		Metallic->A.Connect(0, WallMetal);
+		Metallic->B.Connect(0, GlassMetal);
+		Metallic->Alpha.Connect(4, Tex);
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{
+			Tint, Tex, WallTinted, BaseColor, WallRough, GlassRough, Roughness, WallSpec, GlassSpec, Specular, WallMetal, GlassMetal, Metallic})
+		{
+			M->GetExpressionCollection().AddExpression(E);
+		}
+		M->GetEditorOnlyData()->BaseColor.Connect(0, BaseColor);
+		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
+		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
+		M->GetEditorOnlyData()->Metallic.Connect(0, Metallic);
+		M->PostEditChange();
+		Material.Reset(M);
+	}
+	return Material.Get();
+#else
+	return VertexColorMaterial();
+#endif
+}
+
+/** Procedural lit roof material: gravel / membrane texture tinted by per-building vertex colour. */
+UMaterialInterface* BuildingRoofMaterial()
+{
+#if WITH_EDITORONLY_DATA
+	static TStrongObjectPtr<UMaterial> Material;
+	if (!Material)
+	{
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimBuildingRoof"), RF_Transient);
+		UMaterialExpressionVertexColor* Tint = NewObject<UMaterialExpressionVertexColor>(M);
+		UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		Tex->ParameterName = TEXT("Roof");
+		Tex->Texture = RoofTexture();
+		Tex->SamplerType = SAMPLERTYPE_Color;
+		UMaterialExpressionMultiply* BaseColor = NewObject<UMaterialExpressionMultiply>(M);
+		BaseColor->A.Connect(0, Tex);
+		BaseColor->B.Connect(0, Tint);
+		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
+		Roughness->R = 0.88f;
+		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
+		Specular->R = 0.25f;
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Tint, Tex, BaseColor, Roughness, Specular})
+		{
+			M->GetExpressionCollection().AddExpression(E);
+		}
+		M->GetEditorOnlyData()->BaseColor.Connect(0, BaseColor);
+		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
+		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
+		M->PostEditChange();
+		Material.Reset(M);
+	}
+	return Material.Get();
+#else
+	return VertexColorMaterial();
+#endif
+}
+
+/** Deterministic wall and roof tints from OSM `building=*` tag, height, and spatial seed. */
+void BuildingPalette(const FString& Tag, double HeightM, uint64 Seed, FLinearColor& OutWall, FLinearColor& OutRoof)
+{
+	const float U = static_cast<float>(Seed & 0xFFFFu) / 65535.f;
+	const float V = static_cast<float>((Seed >> 16) & 0xFFFFu) / 65535.f;
+	const bool bTerminal = Tag.Contains(TEXT("terminal")) || Tag.Contains(TEXT("transportation")) || Tag.Contains(TEXT("public"));
+	const bool bIndustrial = Tag.Contains(TEXT("hangar")) || Tag.Contains(TEXT("industrial")) || Tag.Contains(TEXT("warehouse"));
+	const bool bCommercial = Tag.Contains(TEXT("commercial")) || Tag.Contains(TEXT("office")) || Tag.Contains(TEXT("retail")) || HeightM >= 18.0;
+	const bool bResidential = Tag.Contains(TEXT("house")) || Tag.Contains(TEXT("residential")) || Tag.Contains(TEXT("apartments"))
+		|| Tag.Contains(TEXT("detached")) || Tag.Contains(TEXT("terrace"));
+
+	if (bTerminal)
+	{
+		// Cool architectural concrete / light steel panels and bright membrane roof.
+		const float G = FMath::Lerp(0.46f, 0.58f, U);
+		OutWall = FLinearColor(G, G * 1.01f, G * 1.04f);
+		const float R = FMath::Lerp(0.30f, 0.40f, V);
+		OutRoof = FLinearColor(R, R, R * 1.02f);
+	}
+	else if (bIndustrial)
+	{
+		const float G = FMath::Lerp(0.36f, 0.50f, U);
+		OutWall = FLinearColor(G * 1.02f, G, G * 0.96f);
+		const float R = FMath::Lerp(0.22f, 0.34f, V);
+		OutRoof = FLinearColor(R, R, R * 1.02f);
+	}
+	else if (bCommercial)
+	{
+		const FLinearColor Swatches[3] = {
+			FLinearColor(0.42f, 0.44f, 0.47f), // steel grey
+			FLinearColor(0.50f, 0.46f, 0.40f), // limestone
+			FLinearColor(0.36f, 0.34f, 0.33f), // dark granite
+		};
+		OutWall = Swatches[(Seed >> 32) % 3] * FMath::Lerp(0.88f, 1.12f, U);
+		const float R = FMath::Lerp(0.18f, 0.28f, V);
+		OutRoof = FLinearColor(R, R, R);
+	}
+	else if (bResidential)
+	{
+		const FLinearColor Swatches[4] = {
+			FLinearColor(0.42f, 0.24f, 0.19f), // brick
+			FLinearColor(0.54f, 0.49f, 0.42f), // warm stucco
+			FLinearColor(0.48f, 0.45f, 0.40f), // clapboard beige
+			FLinearColor(0.38f, 0.40f, 0.43f), // muted slate
+		};
+		OutWall = Swatches[(Seed >> 32) % 4] * FMath::Lerp(0.88f, 1.12f, U);
+		OutRoof = FLinearColor(FMath::Lerp(0.14f, 0.24f, V), FMath::Lerp(0.13f, 0.21f, V), FMath::Lerp(0.13f, 0.20f, V));
+	}
+	else
+	{
+		const FLinearColor Swatches[4] = {
+			FLinearColor(0.46f, 0.43f, 0.39f), // warm concrete
+			FLinearColor(0.40f, 0.41f, 0.43f), // cool grey
+			FLinearColor(0.44f, 0.32f, 0.26f), // muted brick
+			FLinearColor(0.50f, 0.47f, 0.41f), // sandstone
+		};
+		OutWall = Swatches[(Seed >> 32) % 4] * FMath::Lerp(0.88f, 1.12f, U);
+		const float R = FMath::Lerp(0.16f, 0.26f, V);
+		OutRoof = FLinearColor(R, R, R * 1.02f);
+	}
+}
+
 const FLinearColor VehicleColors[3] = {
 	FLinearColor(0.05f, 0.55f, 0.10f), // near free flow
 	FLinearColor(0.80f, 0.45f, 0.02f), // slowed
@@ -238,12 +595,36 @@ struct FMeshBuffer
 		Triangles.Append({I, I + 1, I + 2, I, I + 2, I + 1});
 	}
 
+	/** A triangle with explicit UVs and vertex colour, emitted in both windings. */
+	void TriangleUV(const FVector& A, const FVector& B, const FVector& C, const FVector& Normal,
+		const FVector2D& UvA, const FVector2D& UvB, const FVector2D& UvC, const FLinearColor& Color)
+	{
+		const int32 I = Vertices.Num();
+		Vertices.Append({A, B, C});
+		Normals.Append({Normal, Normal, Normal});
+		UVs.Append({UvA, UvB, UvC});
+		Colors.Append({Color, Color, Color});
+		Triangles.Append({I, I + 1, I + 2, I, I + 2, I + 1});
+	}
+
 	void Quad(const FVector& A, const FVector& B, const FVector& C, const FVector& D, const FVector& Normal = FVector::UpVector)
 	{
 		const int32 I = Vertices.Num();
 		Vertices.Append({A, B, C, D});
 		Normals.Append({Normal, Normal, Normal, Normal});
 		UVs.Append({FVector2D(0, 0), FVector2D(1, 0), FVector2D(1, 1), FVector2D(0, 1)});
+		Triangles.Append({I, I + 1, I + 2, I, I + 2, I + 3});
+		Triangles.Append({I, I + 2, I + 1, I, I + 3, I + 2});
+	}
+
+	void QuadUV(const FVector& A, const FVector& B, const FVector& C, const FVector& D, const FVector& Normal,
+		const FVector2D& UvA, const FVector2D& UvB, const FVector2D& UvC, const FVector2D& UvD, const FLinearColor& Color)
+	{
+		const int32 I = Vertices.Num();
+		Vertices.Append({A, B, C, D});
+		Normals.Append({Normal, Normal, Normal, Normal});
+		UVs.Append({UvA, UvB, UvC, UvD});
+		Colors.Append({Color, Color, Color, Color});
 		Triangles.Append({I, I + 1, I + 2, I, I + 2, I + 3});
 		Triangles.Append({I, I + 2, I + 1, I, I + 3, I + 2});
 	}
@@ -285,11 +666,18 @@ struct FMeshBuffer
 
 	/**
 	 * A solid from a footprint: `Rings` holds the outer ring then its holes, open, in local
-	 * centimetres. Walls go here, from `BottomCm` to `TopCm`; the flat roof goes to `Roof`.
+	 * centimetres. Walls go here with metric facade UVs (12.8 m × 13.6 m per tile), from
+	 * `BottomCm` to `TopCm`; the flat roof goes to `Roof` with 20 m world-space UVs.
 	 */
-	void Extrude(const TArray<TArray<FVector2D>>& Rings, double BottomCm, double TopCm, FMeshBuffer& Roof)
+	void Extrude(const TArray<TArray<FVector2D>>& Rings, double BottomCm, double TopCm, FMeshBuffer& Roof,
+		const FLinearColor& WallColor, const FLinearColor& RoofColor)
 	{
 		using namespace UE::Geometry;
+		constexpr double TileWidthCm = 1280.0; // 4 bays × 3.2 m
+		constexpr double TileHeightCm = 1360.0; // 4 storeys × 3.4 m
+		constexpr double RoofTileCm = 2000.0; // 20 m × 20 m
+		const double VTop = 0.0;
+		const double VBot = FMath::Max(TopCm - BottomCm, 0.0) / TileHeightCm;
 		for (int32 R = 0; R < Rings.Num(); ++R)
 		{
 			const TArray<FVector2D>& Ring = Rings[R];
@@ -302,12 +690,18 @@ struct FMeshBuffer
 			}
 			// Walls face away from the solid: out of the outer ring, into a hole.
 			const double Out = (Twice > 0 ? 1.0 : -1.0) * (R == 0 ? 1.0 : -1.0);
+			double DistCm = 0.0;
 			for (int32 I = 0; I < Ring.Num(); ++I)
 			{
 				const FVector2D& A = Ring[I];
 				const FVector2D& B = Ring[(I + 1) % Ring.Num()];
+				const double EdgeLenCm = FVector2D::Distance(A, B);
+				const double U0 = DistCm / TileWidthCm;
+				const double U1 = (DistCm + EdgeLenCm) / TileWidthCm;
+				DistCm += EdgeLenCm;
 				const FVector Normal = FVector((B.Y - A.Y) * Out, -(B.X - A.X) * Out, 0).GetSafeNormal();
-				Quad(FVector(A, BottomCm), FVector(B, BottomCm), FVector(B, TopCm), FVector(A, TopCm), Normal);
+				QuadUV(FVector(A, BottomCm), FVector(B, BottomCm), FVector(B, TopCm), FVector(A, TopCm), Normal,
+					FVector2D(U0, VBot), FVector2D(U1, VBot), FVector2D(U1, VTop), FVector2D(U0, VTop), WallColor);
 			}
 		}
 		FGeneralPolygon2d Footprint{FPolygon2d(Rings[0])};
@@ -323,7 +717,13 @@ struct FMeshBuffer
 		{
 			for (const FIndex3i& T : Tris)
 			{
-				Roof.Triangle(FVector(Verts[T.A], TopCm), FVector(Verts[T.B], TopCm), FVector(Verts[T.C], TopCm), FVector::UpVector);
+				const FVector2d& PA = Verts[T.A];
+				const FVector2d& PB = Verts[T.B];
+				const FVector2d& PC = Verts[T.C];
+				Roof.TriangleUV(FVector(PA, TopCm), FVector(PB, TopCm), FVector(PC, TopCm), FVector::UpVector,
+					FVector2D(PA.X / RoofTileCm, PA.Y / RoofTileCm),
+					FVector2D(PB.X / RoofTileCm, PB.Y / RoofTileCm),
+					FVector2D(PC.X / RoofTileCm, PC.Y / RoofTileCm), RoofColor);
 			}
 		}
 	}
@@ -414,11 +814,13 @@ ANosimWorld::ANosimWorld()
 	Terrain = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("Terrain"));
 	Terrain->SetupAttachment(RootComponent);
 	Terrain->bUseAsyncCooking = true;
+	Terrain->SetCastShadow(false);
 	Models = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("Models"));
 	Models->SetupAttachment(RootComponent);
 	Trees = MakeVehicles(TEXT("Trees"));
 	Trees->SetMobility(EComponentMobility::Static);
 	Trees->SetCullDistances(0, 800000); // 8 km
+	Trees->SetCastShadow(false); // 60k+ non-Nanite instances overflow the VSM marking job queue
 	VehiclesFree = MakeVehicles(TEXT("VehiclesFree"));
 	VehiclesSlow = MakeVehicles(TEXT("VehiclesSlow"));
 	VehiclesJammed = MakeVehicles(TEXT("VehiclesJammed"));
@@ -446,6 +848,21 @@ void ANosimWorld::BeginPlay()
 {
 	Super::BeginPlay();
 	BuildScene();
+	if (Traffic && TrafficWarmupSeconds > 0.f && EntryEdges.Num() > 0 && TrafficDt > 0.0)
+	{
+		const int32 WarmupSteps = FMath::RoundToInt32(TrafficWarmupSeconds / TrafficDt);
+		for (int32 S = 0; S < WarmupSteps; ++S)
+		{
+			InjectDebt += TrafficDt * VehiclesPerMinute / 60.0;
+			for (int32 Guard = 0; InjectDebt >= 1.0 && Guard < 1000; ++Guard)
+			{
+				nosim_traffic_inject(Traffic, EntryEdges[EntryCursor++ % EntryEdges.Num()], 0.0, 1.0);
+				InjectDebt -= 1.0;
+			}
+			nosim_traffic_step(Traffic, 1, &Totals);
+		}
+		NearVehicleCount = static_cast<int32>(nosim_traffic_near_vehicles(Traffic, nullptr, 0));
+	}
 	if (bSpawnEnvironment)
 	{
 		SpawnEnvironment();
@@ -521,6 +938,12 @@ void ANosimWorld::BuildScene()
 	}
 	Edges.Reset();
 	EntryEdges.Reset();
+	EntryCursor = 0;
+	InjectDebt = 0;
+	TrafficDebt = 0;
+	NearEdgeCount = 0;
+	NearVehicleCount = 0;
+	NearVehicleLateralCm.Reset();
 	Totals = {0, 0, 0, 0};
 	Problem.Reset();
 	RunwayCount = 0;
@@ -1025,6 +1448,8 @@ void ANosimWorld::BuildScene()
 				TArray<TArray<TArray<FVector2D>>> Parts;
 				Parts.SetNum(static_cast<int32>(Info.polygon_count));
 				double Base = TNumericLimits<double>::Max();
+				double SeedLon = Anchor.lon_deg, SeedLat = Anchor.lat_deg;
+				bool bHasSeed = false;
 				bool bInside = false;
 				for (size_t K = 0; K < Info.ring_count; ++K)
 				{
@@ -1039,6 +1464,12 @@ void ANosimWorld::BuildScene()
 					for (size_t P = 0; P < Ring.point_count; ++P)
 					{
 						const double Lon = Pts[2 * P], Lat = Pts[2 * P + 1];
+						if (!bHasSeed)
+						{
+							SeedLon = Lon;
+							SeedLat = Lat;
+							bHasSeed = true;
+						}
 						bInside |= Lon >= Area.min_lon && Lon <= Area.max_lon && Lat >= Area.min_lat && Lat <= Area.max_lat;
 						const FVector L = LonLatToLocal(Lon, Lat);
 						Out.Add(FVector2D(L.X, L.Y));
@@ -1049,13 +1480,19 @@ void ANosimWorld::BuildScene()
 				{
 					continue;
 				}
-				const double TopCm = (Base + (Info.height_m > 0 ? Info.height_m : 8.0)) * 100.0;
+				char TagBuf[64] = {0};
+				nosim_polygon_table_tag(Polygons, A, TagBuf, sizeof TagBuf);
+				const double HeightM = Info.height_m > 0 ? Info.height_m : 8.0;
+				const uint64 Seed = nosim_spatial_seed(SeedLat, SeedLon, 0x6275696c64696e67ull /* "building" */);
+				FLinearColor WallColor, RoofColor;
+				BuildingPalette(UTF8_TO_TCHAR(TagBuf), HeightM, Seed, WallColor, RoofColor);
+				const double TopCm = (Base + HeightM) * 100.0;
 				const double BottomCm = (Base + Info.min_height_m) * 100.0 - (Info.min_height_m > 0 ? 0.0 : 100.0);
 				for (const TArray<TArray<FVector2D>>& Rings : Parts)
 				{
 					if (Rings.Num() > 0)
 					{
-						Mesh[S_Building].Extrude(Rings, BottomCm, TopCm, Mesh[S_Roof]);
+						Mesh[S_Building].Extrude(Rings, BottomCm, TopCm, Mesh[S_Roof], WallColor, RoofColor);
 					}
 				}
 				++BuildingCount;
@@ -1111,11 +1548,22 @@ void ANosimWorld::BuildScene()
 	for (int32 I = 0; I < S_SectionCount; ++I)
 	{
 		Scenery->CreateMeshSection_LinearColor(I, Mesh[I].Vertices, Mesh[I].Triangles, Mesh[I].Normals, Mesh[I].UVs,
-			TArray<FLinearColor>(), TArray<FProcMeshTangent>(), false);
-		UMaterialInstanceDynamic* Mid = UMaterialInstanceDynamic::Create(Base, this);
-		Mid->SetVectorParameterValue(TEXT("Color"), SectionColors[I]);
-		Scenery->SetMaterial(I, Mid);
-		Materials.Add(Mid);
+			Mesh[I].Colors, TArray<FProcMeshTangent>(), false);
+		if (I == S_Building)
+		{
+			Scenery->SetMaterial(I, BuildingFacadeMaterial());
+		}
+		else if (I == S_Roof)
+		{
+			Scenery->SetMaterial(I, BuildingRoofMaterial());
+		}
+		else
+		{
+			UMaterialInstanceDynamic* Mid = UMaterialInstanceDynamic::Create(Base, this);
+			Mid->SetVectorParameterValue(TEXT("Color"), SectionColors[I]);
+			Scenery->SetMaterial(I, Mid);
+			Materials.Add(Mid);
+		}
 	}
 	UMaterialInterface* VertexColored = VertexColorMaterial();
 	int32 TerrainSection = 0;
@@ -1207,7 +1655,7 @@ void ANosimWorld::BuildScene()
 		TreeCount = Instances.Num();
 	}
 
-	// Traffic: nosim's drive graph and routed CTM. Each edge borrows its spline's shape.
+	// Traffic: nosim's drive graph and hybrid near-field IDM/MOBIL + routed CTM. Each edge borrows its spline's shape.
 	Graph = Splines ? nosim_graph_build(Splines, NOSIM_GRAPH_MODE_DRIVE, false) : nullptr;
 	if (!Graph)
 	{
@@ -1216,12 +1664,23 @@ void ANosimWorld::BuildScene()
 	}
 	const NosimTrafficOptions Options = nosim_traffic_options_default();
 	TrafficDt = Options.dt_s;
-	Traffic = nosim_traffic_new(Graph, Options);
+	if (bNearFieldTraffic && NearFieldRadiusM > 0.f)
+	{
+		const int32 Substeps = FMath::Clamp(NearFieldSubsteps, 1, 20);
+		Traffic = nosim_traffic_new_hybrid(Graph, Options, Anchor.lon_deg, Anchor.lat_deg, NearFieldRadiusM, static_cast<uint32>(Substeps));
+		TrafficSubstepDt = Options.dt_s / Substeps;
+	}
+	else
+	{
+		Traffic = nosim_traffic_new(Graph, Options);
+		TrafficSubstepDt = Options.dt_s;
+	}
 	if (!Traffic)
 	{
 		UE_LOG(LogNosim, Warning, TEXT("No traffic: %s"), *FNosimModule::LastError());
 		return;
 	}
+	NearEdgeCount = static_cast<int32>(nosim_traffic_near_edge_count(Traffic));
 	const size_t NumEdges = nosim_graph_edge_count(Graph);
 	for (size_t E = 0; E < NumEdges; ++E)
 	{
@@ -1235,6 +1694,8 @@ void ANosimWorld::BuildScene()
 		V.LengthM = Edge.length_m;
 		V.SpeedMps = Edge.speed_mps;
 		V.Lanes = FMath::Max<uint32>(Edge.lanes, 1);
+		V.bTwoWay = Edge.reverse >= 0;
+		V.bNear = nosim_traffic_is_near_edge(Traffic, E);
 		if (From.in_degree == 0)
 		{
 			EntryEdges.Add(static_cast<int32>(E));
@@ -1292,8 +1753,9 @@ void ANosimWorld::BuildScene()
 		{
 			V.Stations.Add(V.Stations.Last() + FVector::Dist(V.Points[K], V.Points[K - 1]) / 100.0);
 		}
+		V.HalfWidthCm = HalfWidthCm;
 		// Two-way roads carry each direction on its own half.
-		V.LateralCm = Edge.reverse >= 0 ? HalfWidthCm * 0.5 : 0.0;
+		V.LateralCm = V.bTwoWay ? HalfWidthCm * 0.5 : 0.0;
 	}
 	if (EntryEdges.Num() == 0)
 	{
@@ -1302,9 +1764,9 @@ void ANosimWorld::BuildScene()
 			EntryEdges.Add(E);
 		}
 	}
-	UE_LOG(LogNosim, Log, TEXT("%s with %s: %d runways, %d splines, %d buildings, %d models, %d trees, terrain %d tiles, land cover %d tiles, imagery %d tiles, drive graph %d nodes / %d edges, %d entry edges"),
+	UE_LOG(LogNosim, Log, TEXT("%s with %s: %d runways, %d splines, %d buildings, %d models, %d trees, terrain %d tiles, land cover %d tiles, imagery %d tiles, drive graph %d nodes / %d edges (%d near), %d entry edges"),
 		*PackageId, *WorldName, RunwayCount, SplineCount, BuildingCount, ModelCount, TreeCount, TerrainTiles, LandcoverTiles, ImageryTiles,
-		static_cast<int32>(nosim_graph_node_count(Graph)), static_cast<int32>(NumEdges), EntryEdges.Num());
+		static_cast<int32>(nosim_graph_node_count(Graph)), static_cast<int32>(NumEdges), NearEdgeCount, EntryEdges.Num());
 }
 
 void ANosimWorld::SpawnEnvironment()
@@ -1430,21 +1892,23 @@ void ANosimWorld::UpdateTraffic(float DeltaSeconds)
 		InjectDebt -= 1.0;
 	}
 	TrafficDebt += SimDt;
-	const uint32 Steps = static_cast<uint32>(FMath::Min(FMath::FloorToDouble(TrafficDebt / TrafficDt), 600.0));
-	if (Steps > 0)
+	const double StepDt = FMath::Max(TrafficSubstepDt, 1e-3);
+	const uint32 Substeps = static_cast<uint32>(FMath::Min(FMath::FloorToDouble(TrafficDebt / StepDt), 3000.0));
+	if (Substeps > 0)
 	{
-		nosim_traffic_step(Traffic, Steps, &Totals);
-		TrafficDebt -= Steps * TrafficDt;
+		nosim_traffic_substep(Traffic, Substeps, &Totals);
+		TrafficDebt -= Substeps * StepDt;
 	}
 
-	// Draw each edge's CTM count as evenly spaced vehicles moving at its equilibrium speed.
+	// Far-field edges draw their CTM count as evenly spaced vehicles moving at equilibrium speed;
+	// near-field edges draw each microscopic IDM/MOBIL vehicle at its exact lane and bumper position.
 	const NosimFundamentalDiagram Urban = nosim_ctm_diagram_urban();
 	TArray<FTransform> Buckets[3];
 	const FVector Scale(4.5, 1.9, 1.5);
 	for (int32 E = 0; E < Edges.Num(); ++E)
 	{
 		FNosimEdgeVis& V = Edges[E];
-		if (V.LengthM <= 0 || V.Points.Num() < 2)
+		if (V.bNear || V.LengthM <= 0 || V.Points.Num() < 2)
 		{
 			continue;
 		}
@@ -1466,6 +1930,52 @@ void ANosimWorld::UpdateTraffic(float DeltaSeconds)
 			Pos += FVector(-Dir.Y, Dir.X, 0).GetSafeNormal() * V.LateralCm;
 			Buckets[Bucket].Add(FTransform(Dir.Rotation(), Pos, Scale));
 		}
+	}
+	if (NearEdgeCount > 0)
+	{
+		const size_t Count = nosim_traffic_near_vehicles(Traffic, nullptr, 0);
+		NearVehicleCount = static_cast<int32>(Count);
+		TArray<NosimNearVehicle> Near;
+		Near.SetNumUninitialized(NearVehicleCount);
+		nosim_traffic_near_vehicles(Traffic, Near.GetData(), Near.Num());
+		TMap<uint64, double> NextLateral;
+		NextLateral.Reserve(Near.Num());
+		for (const NosimNearVehicle& Veh : Near)
+		{
+			if (!Edges.IsValidIndex(static_cast<int32>(Veh.edge)))
+			{
+				continue;
+			}
+			const FNosimEdgeVis& V = Edges[Veh.edge];
+			if (V.LengthM <= 0 || V.Points.Num() < 2)
+			{
+				continue;
+			}
+			const double DrawnLength = V.Stations.Last();
+			const double FrontM = FMath::Clamp(Veh.distance_m + Veh.speed_mps * TrafficDebt, 0.0, V.LengthM);
+			const double CentreM = FMath::Clamp(FrontM - FMath::Min(2.25, V.LengthM * 0.5), 0.0, V.LengthM);
+			const double StationM = CentreM / V.LengthM * DrawnLength;
+			const double Lanes = FMath::Max<double>(V.Lanes, 1);
+			const double Lane = FMath::Clamp<double>(Veh.lane, 0, Lanes - 1.0);
+			const double TargetLatCm = V.bTwoWay
+				? ((Lane + 0.5) / Lanes) * V.HalfWidthCm
+				: (V.Lanes <= 1 ? 0.0 : ((2.0 * (Lane + 0.5) / Lanes) - 1.0) * (V.HalfWidthCm * 0.75));
+			const double* PrevLat = NearVehicleLateralCm.Find(Veh.id);
+			const double LatCm = PrevLat ? FMath::FInterpTo(*PrevLat, TargetLatCm, DeltaSeconds, 8.0) : TargetLatCm;
+			NextLateral.Add(Veh.id, LatCm);
+
+			FVector Pos, Dir;
+			SampleAlong(V.Points, V.Stations, StationM, Pos, Dir);
+			Pos += FVector(-Dir.Y, Dir.X, 0).GetSafeNormal() * LatCm;
+			const double Ratio = V.SpeedMps > 0 ? Veh.speed_mps / V.SpeedMps : 1.0;
+			const int32 Bucket = Ratio > 0.7 ? 0 : Ratio > 0.3 ? 1 : 2;
+			Buckets[Bucket].Add(FTransform(Dir.Rotation(), Pos, Scale));
+		}
+		NearVehicleLateralCm = MoveTemp(NextLateral);
+	}
+	else
+	{
+		NearVehicleCount = 0;
 	}
 	UInstancedStaticMeshComponent* Isms[3] = {VehiclesFree, VehiclesSlow, VehiclesJammed};
 	for (int32 I = 0; I < 3; ++I)
@@ -1530,8 +2040,11 @@ void ANosimWorld::ShowStatus() const
 			TerrainTiles, LandcoverTiles, ImageryTiles > 0 ? *FString::Printf(TEXT("%d tiles at z%d"), ImageryTiles, ImageryZoom) : TEXT("none"),
 			BuildingCount, ModelCount, TreeCount));
 	GEngine->AddOnScreenDebugMessage(Key + 2, 0.5f, FColor::Green,
-		FString::Printf(TEXT("CTM t=%llu s   entered %.1f   exited %.1f   on network %.1f"), static_cast<unsigned long long>(Totals.steps),
-			Totals.entered, Totals.exited, Totals.on_network));
+		NearEdgeCount > 0
+			? FString::Printf(TEXT("traffic t=%llu s   near %d veh (%d/%d edges)   entered %.1f   exited %.1f   on network %.1f"),
+				static_cast<unsigned long long>(Totals.steps), NearVehicleCount, NearEdgeCount, EdgeCount, Totals.entered, Totals.exited, Totals.on_network)
+			: FString::Printf(TEXT("CTM t=%llu s   entered %.1f   exited %.1f   on network %.1f"),
+				static_cast<unsigned long long>(Totals.steps), Totals.entered, Totals.exited, Totals.on_network));
 	GEngine->AddOnScreenDebugMessage(Key, 0.5f, FColor::White,
 		FString::Printf(TEXT("nosim %hs   %s   %d runways   %d splines   drive graph %d nodes / %d edges"), nosim_version(), *PackageId,
 			RunwayCount, SplineCount, Nodes, EdgeCount));

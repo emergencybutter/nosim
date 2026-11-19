@@ -15,11 +15,15 @@ repository's KJFK fixture package over `target/world/kjfk-fixture` when that exi
 - **Taxiways and roads** from the world's or the package's spline table
   (`nosim_spline_table_*`), draped on the terrain.
 - **Buildings** extruded from the world's or the package's polygon tables
-  (`nosim_polygon_table_*`), the package's **glTF models** at their anchors, and **trees**
-  scattered over the land cover's tree mask (`nosim_poisson_disk`).
-- **Traffic**: the drive graph (`nosim_graph_build`) runs the routed CTM
-  (`nosim_traffic_*`). Vehicles are fed at the entry edges and drawn from each edge's count.
-  They move at the urban fundamental diagram's speed for the edge's density, coloured green
+  (`nosim_polygon_table_*`) with metric UVs, procedural facade and roof materials, and
+  deterministic per-building palettes from `building=*` tags and `nosim_spatial_seed`; the
+  package's **glTF models** at their anchors; and **trees** scattered over the land cover's
+  tree mask (`nosim_poisson_disk`).
+- **Traffic**: the drive graph (`nosim_graph_build`) runs hybrid near-field IDM/MOBIL
+  vehicles inside the near-field radius coupled to the routed CTM beyond
+  (`nosim_traffic_*`). Inside the near field each vehicle is drawn at its lane and bumper
+  position with smooth MOBIL lane changes; outside it, vehicles are drawn from each edge's
+  CTM count at the urban fundamental diagram's equilibrium speed. Both are coloured green
   (free flow), amber (slowed) or red (jammed).
 - **Sun and Moon** from nosim's ephemerides, time scales and sidereal time. The sun drives a
   directional light under a sky atmosphere; the clock runs 60× by default.
@@ -62,4 +66,4 @@ on screen.
 ## Not yet
 
 Texture compression and streaming for the imagery, glTF textures, taxiing aircraft,
-pedestrians (ORCA), stars and the near-field IDM vehicles.
+pedestrians (ORCA) and stars.

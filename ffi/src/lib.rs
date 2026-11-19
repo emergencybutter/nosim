@@ -2139,7 +2139,24 @@ pub struct NosimTrafficTotals {
     pub on_network: f64,
 }
 
-/// A far-field CTM run on a graph, stepped by the caller.
+/// One microscopic vehicle in the near field of a hybrid traffic run.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct NosimNearVehicle {
+    /// Stable vehicle identifier across steps and edges.
+    pub id: u64,
+    /// Directed graph edge index (`0..nosim_graph_edge_count`).
+    pub edge: u32,
+    /// Lane index on that edge (`0..edge.lanes`, 0 = rightmost / first lane).
+    pub lane: u32,
+    /// Distance of the front bumper from the edge's upstream end, metres.
+    pub distance_m: f64,
+    /// Current speed, m/s.
+    pub speed_mps: f64,
+}
+
+/// A traffic run on a graph (far-field CTM alone, or hybrid with near-field vehicles),
+/// stepped by the caller.
 pub struct NosimTraffic {
     inner: nosim_compiler::graph::Traffic,
 }
@@ -2175,6 +2192,59 @@ pub unsafe extern "C" fn nosim_traffic_new(g: *const NosimGraph, options: NosimT
     }
 }
 
+/// Builds a hybrid traffic run for a graph: individual IDM / MOBIL vehicles on edges whose
+/// endpoints lie within `near_radius_m` of `(near_lon_deg, near_lat_deg)`, coupled to the
+/// CTM beyond, with `near_substeps` near-field substeps per CTM step `options.dt_s`. NULL on
+/// failure.
+///
+/// # Safety
+/// `g` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_traffic_new_hybrid(
+    g: *const NosimGraph,
+    options: NosimTrafficOptions,
+    near_lon_deg: f64,
+    near_lat_deg: f64,
+    near_radius_m: f64,
+    near_substeps: u32,
+) -> *mut NosimTraffic {
+    // SAFETY: documented contract.
+    let Some(g) = (unsafe { opt_ref(g) }) else {
+        fail(NosimStatus::NullPointer, "graph is NULL");
+        return ptr::null_mut();
+    };
+    if !(options.dt_s > 0.0
+        && options.dt_s.is_finite()
+        && options.demand_veh_per_h >= 0.0
+        && near_lon_deg.is_finite()
+        && near_lat_deg.is_finite()
+        && near_radius_m >= 0.0
+        && near_radius_m.is_finite()
+        && near_substeps > 0)
+    {
+        fail(
+            NosimStatus::InvalidArgument,
+            "dt_s and near_substeps must be positive, demand and near_radius_m non-negative and finite",
+        );
+        return ptr::null_mut();
+    }
+    let o = nosim_compiler::graph::SimOptions {
+        dt_s: options.dt_s,
+        seconds: 0.0,
+        demand_veh_per_s: options.demand_veh_per_h / 3600.0,
+        routed: options.routed,
+        assign_iterations: options.assign_iterations as usize,
+    };
+    let near = nosim_compiler::graph::NearField { lon: near_lon_deg, lat: near_lat_deg, radius_m: near_radius_m };
+    match nosim_compiler::graph::Traffic::new_hybrid(&g.inner, &o, near, near_substeps) {
+        Ok(inner) => Box::into_raw(Box::new(NosimTraffic { inner })),
+        Err(e) => {
+            fail(NosimStatus::InvalidArgument, e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
 /// Releases a traffic run. NULL is ignored.
 ///
 /// # Safety
@@ -2187,7 +2257,7 @@ pub unsafe extern "C" fn nosim_traffic_free(t: *mut NosimTraffic) {
     }
 }
 
-/// Advances `steps` steps and writes the running totals to `out` (which may be NULL).
+/// Advances `steps` CTM steps and writes the running totals to `out` (which may be NULL).
 ///
 /// # Safety
 /// `t` must be NULL or live; `out` must be NULL or writable.
@@ -2215,9 +2285,38 @@ pub unsafe extern "C" fn nosim_traffic_step(
     NosimStatus::Ok
 }
 
+/// Advances `substeps` near-field substeps (each `dt_s / near_substeps` for a hybrid run, or
+/// one CTM step for a pure CTM run), stepping the far-field CTM at the start of each cycle,
+/// and writes the running totals to `out` (which may be NULL).
+///
+/// # Safety
+/// `t` must be NULL or live; `out` must be NULL or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_traffic_substep(
+    t: *mut NosimTraffic,
+    substeps: u32,
+    out: *mut NosimTrafficTotals,
+) -> NosimStatus {
+    // SAFETY: documented contract.
+    let Some(t) = (unsafe { opt_mut(t) }) else { return fail(NosimStatus::NullPointer, "traffic is NULL") };
+    for _ in 0..substeps {
+        t.inner.step_substep();
+    }
+    // SAFETY: documented contract.
+    if let Some(out) = unsafe { opt_mut(out) } {
+        let s = t.inner.totals();
+        *out = NosimTrafficTotals {
+            steps: s.steps as u64,
+            entered: s.entered,
+            exited: s.exited,
+            on_network: s.on_network,
+        };
+    }
+    NosimStatus::Ok
+}
+
 /// Puts up to `vehicles` on graph edge `edge` at fraction `at` of its length (0 its start, 1
-/// its end), counted as entered: the far field's side of a near-field handoff. Returns how
-/// many fitted (0 for a bad handle or index).
+/// its end), counted as entered. Returns how many fitted (0 for a bad handle or index).
 ///
 /// # Safety
 /// `t` must be NULL or live.
@@ -2235,6 +2334,53 @@ pub unsafe extern "C" fn nosim_traffic_inject(t: *mut NosimTraffic, edge: usize,
 pub unsafe extern "C" fn nosim_traffic_edge_vehicles(t: *const NosimTraffic, edge: usize) -> f64 {
     // SAFETY: documented contract.
     unsafe { opt_ref(t) }.and_then(|t| t.inner.edge_vehicles(edge)).unwrap_or(-1.0)
+}
+
+/// Whether graph edge `edge` is simulated vehicle by vehicle in the near field.
+///
+/// # Safety
+/// `t` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_traffic_is_near_edge(t: *const NosimTraffic, edge: usize) -> bool {
+    // SAFETY: documented contract.
+    unsafe { opt_ref(t) }.is_some_and(|t| t.inner.is_near_edge(edge))
+}
+
+/// Number of graph edges simulated vehicle by vehicle in the near field (0 for a pure CTM
+/// run or NULL).
+///
+/// # Safety
+/// `t` must be NULL or live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_traffic_near_edge_count(t: *const NosimTraffic) -> usize {
+    // SAFETY: documented contract.
+    unsafe { opt_ref(t) }.map_or(0, |t| t.inner.near_edge_count())
+}
+
+/// Writes up to `capacity` live near-field vehicles into `out` (when non-NULL) and returns
+/// the total number of live near-field vehicles.
+///
+/// # Safety
+/// `t` must be NULL or live; `out` must be NULL or point to `capacity` writable elements.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_traffic_near_vehicles(
+    t: *const NosimTraffic,
+    out: *mut NosimNearVehicle,
+    capacity: usize,
+) -> usize {
+    // SAFETY: documented contract.
+    let Some(t) = (unsafe { opt_ref(t) }) else { return 0 };
+    if out.is_null() || capacity == 0 {
+        return t.inner.near_vehicle_count();
+    }
+    let list = t.inner.near_vehicles();
+    // SAFETY: checked non-null and capacity > 0; caller provides capacity elements.
+    if let Some(dst) = unsafe { slice_out(out, capacity) } {
+        for (d, (edge, lane, v)) in dst.iter_mut().zip(&list) {
+            *d = NosimNearVehicle { id: v.id, edge: *edge as u32, lane: *lane as u32, distance_m: v.s, speed_mps: v.v };
+        }
+    }
+    list.len()
 }
 
 /// Tile layers the compiler writes.

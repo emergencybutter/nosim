@@ -18,8 +18,11 @@ struct FNosimEdgeVis
 	double LengthM = 0;
 	double SpeedMps = 0;
 	uint32 Lanes = 1;
+	double HalfWidthCm = 350.0;
 	double LateralCm = 0; // offset to the right of travel
 	double Phase = 0;
+	bool bTwoWay = false;
+	bool bNear = false;
 };
 
 /**
@@ -29,8 +32,8 @@ struct FNosimEdgeVis
  * from CIFP records by nosim's ARINC 424 decoder and extruder. Positions go geodetic → ECEF →
  * ENU about the package centre (nosim), then to Unreal as X east, Y south, Z up, centimetres,
  * with the Earth's curvature taken out so the ground is a plane. The drive graph runs nosim's
- * routed CTM; vehicles are drawn per edge from its counts, moving at the speed of the urban
- * fundamental diagram for the edge's density. The sun follows nosim's ephemeris.
+ * hybrid near-field IDM/MOBIL vehicles coupled to the routed CTM beyond. The sun follows
+ * nosim's ephemeris.
  */
 UCLASS()
 class NOSIM_API ANosimWorld : public AActor
@@ -105,7 +108,23 @@ public:
 
 	/** Vehicles injected at the network's entry edges, per simulated minute. */
 	UPROPERTY(EditAnywhere, Category = "Nosim|Traffic", meta = (ClampMin = "0"))
-	float VehiclesPerMinute = 40.f;
+	float VehiclesPerMinute = 120.f;
+
+	/** Simulated seconds to pre-warm traffic on BeginPlay so near-field roads are populated immediately. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Traffic", meta = (ClampMin = "0"))
+	float TrafficWarmupSeconds = 120.f;
+
+	/** Simulate individual IDM/MOBIL vehicles inside NearFieldRadiusM of the package centre, coupled to the CTM beyond. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Traffic")
+	bool bNearFieldTraffic = true;
+
+	/** Radius around the package centre where edges run microscopic IDM/MOBIL vehicles (metres). */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Traffic", meta = (ClampMin = "100", EditCondition = "bNearFieldTraffic"))
+	float NearFieldRadiusM = 1500.f;
+
+	/** Microscopic substeps per far-field CTM step. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Traffic", meta = (ClampMin = "1", ClampMax = "20", EditCondition = "bNearFieldTraffic"))
+	int32 NearFieldSubsteps = 5;
 
 	/** Start the sun at the wall clock instead of StartUtc. */
 	UPROPERTY(EditAnywhere, Category = "Nosim|Sun")
@@ -209,6 +228,10 @@ private:
 	double InjectDebt = 0;
 	double TrafficDebt = 0;
 	double TrafficDt = 1;
+	double TrafficSubstepDt = 1;
+	int32 NearEdgeCount = 0;
+	int32 NearVehicleCount = 0;
+	TMap<uint64, double> NearVehicleLateralCm;
 	NosimTrafficTotals Totals = {0, 0, 0, 0};
 
 	FDateTime SunUtc;

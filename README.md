@@ -267,10 +267,14 @@ needs no Parquet reader of its own:
   table.
 - **Graphs:** `nosim_graph_build` (drive, taxi or walk) or `nosim_graph_load` gives a graph,
   read back with `_node` and `_edge`.
-- **Traffic:** `nosim_traffic_new` builds the far-field CTM with routed demand.
-  `nosim_traffic_step` advances it and reports totals, `nosim_traffic_inject` adds vehicles
-  at a point along an edge (the far field's side of a near-field handoff), and
-  `nosim_traffic_edge_vehicles` reads it back.
+- **Traffic:** `nosim_traffic_new` builds the far-field CTM with routed demand, and
+  `nosim_traffic_new_hybrid` couples it to microscopic IDM / MOBIL vehicles on edges inside
+  a near-field circle. `nosim_traffic_step` and `nosim_traffic_substep` advance the
+  simulation and report totals, `nosim_traffic_inject` adds vehicles at a point along a near
+  or far edge, `nosim_traffic_edge_vehicles` reads an edge's count, and
+  `nosim_traffic_is_near_edge`, `nosim_traffic_near_edge_count` and
+  `nosim_traffic_near_vehicles` inspect the near field and read back individual vehicles
+  (`id`, `edge`, `lane`, `distance_m`, `speed_mps`).
 - **Tiles:** `nosim_tile_at`, `nosim_tile_bounds` and `nosim_tile_path` locate terrain-RGB,
   normal-map, quantized-mesh, land-cover and vector tiles in the compiler's output.
   `nosim_tile_read_heights` decodes a Terrain-RGB tile to metres, `nosim_tile_read_bytes`

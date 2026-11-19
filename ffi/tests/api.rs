@@ -511,8 +511,36 @@ fn client_hand_off() {
         assert_eq!(nosim_traffic_edge_vehicles(traffic, usize::MAX), -1.0);
         let bad = NosimTrafficOptions { dt_s: 0.0, ..nosim_traffic_options_default() };
         assert!(nosim_traffic_new(g, bad).is_null());
+        assert_eq!(nosim_traffic_near_edge_count(traffic), 0);
+        assert!(!nosim_traffic_is_near_edge(traffic, 0));
+        assert_eq!(nosim_traffic_near_vehicles(traffic, ptr::null_mut(), 0), 0);
         nosim_traffic_free(traffic);
         nosim_graph_free(g);
+
+        // Hybrid traffic on the drive graph: 1.5 km near field around the KJFK terminal area.
+        let dg = nosim_graph_build(t, NosimGraphMode::Drive, false);
+        assert!(!dg.is_null());
+        let hyb = nosim_traffic_new_hybrid(dg, nosim_traffic_options_default(), -73.780, 40.643, 1500.0, 5);
+        assert!(!hyb.is_null());
+        let near_edges = nosim_traffic_near_edge_count(hyb);
+        assert!(near_edges > 0 && near_edges < nosim_graph_edge_count(dg));
+        for k in 0..nosim_graph_edge_count(dg) {
+            if nosim_traffic_is_near_edge(hyb, k) {
+                assert_eq!(nosim_traffic_inject(hyb, k, 0.0, 1.0), 1.0);
+                break;
+            }
+        }
+        assert_eq!(nosim_traffic_substep(hyb, 10, &mut tot), NosimStatus::Ok);
+        assert_eq!(tot.steps, 2);
+        assert!((tot.entered - tot.exited - tot.on_network).abs() < 1e-12);
+        let nv = nosim_traffic_near_vehicles(hyb, ptr::null_mut(), 0);
+        assert!(nv >= 1);
+        let mut vehs = vec![NosimNearVehicle::default(); nv];
+        assert_eq!(nosim_traffic_near_vehicles(hyb, vehs.as_mut_ptr(), vehs.len()), nv);
+        assert!(vehs[0].distance_m > 0.0 && vehs[0].speed_mps > 0.0);
+        assert!(nosim_traffic_new_hybrid(dg, nosim_traffic_options_default(), -73.78, 40.64, 1500.0, 0).is_null());
+        nosim_traffic_free(hyb);
+        nosim_graph_free(dg);
         nosim_spline_table_free(t);
         // NULL and missing files.
         assert!(nosim_spline_table_load(ptr::null()).is_null());
@@ -521,7 +549,11 @@ fn client_hand_off() {
         assert!(nosim_graph_build(ptr::null(), NosimGraphMode::Drive, false).is_null());
         assert!(nosim_graph_load(missing.as_ptr()).is_null());
         assert!(nosim_traffic_new(ptr::null(), nosim_traffic_options_default()).is_null());
+        assert!(
+            nosim_traffic_new_hybrid(ptr::null(), nosim_traffic_options_default(), -73.78, 40.64, 1500.0, 5).is_null()
+        );
         assert_eq!(nosim_traffic_step(ptr::null_mut(), 1, ptr::null_mut()), NosimStatus::NullPointer);
+        assert_eq!(nosim_traffic_substep(ptr::null_mut(), 1, ptr::null_mut()), NosimStatus::NullPointer);
         assert_eq!(nosim_spline_table_count(ptr::null()), 0);
     }
     // Tiles: KJFK at z10 is Web-Mercator 302/385 (the tiler's test), and the mesh tile is on

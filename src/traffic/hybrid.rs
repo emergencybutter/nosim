@@ -187,6 +187,8 @@ pub struct Hybrid {
     next_id: u64,
     entered: Sum,
     exited: Sum,
+    ctm_steps: u64,
+    substep_in_step: u32,
     /// Positions clamped to avoid an overlap (should stay zero).
     pub clamps: u64,
     /// Arrivals held at the end of their edge because the merge had no room.
@@ -335,6 +337,8 @@ impl Hybrid {
             next_id: 0,
             entered: Sum::default(),
             exited: Sum::default(),
+            ctm_steps: 0,
+            substep_in_step: 0,
             clamps: 0,
             holds: 0,
             merging: std::collections::HashMap::new(),
@@ -366,7 +370,7 @@ impl Hybrid {
 
     /// Whether edge `k` is simulated vehicle by vehicle.
     pub fn is_near_edge(&self, k: usize) -> bool {
-        self.is_near[k]
+        self.is_near.get(k).copied().unwrap_or(false)
     }
 
     /// The far-field network (read-only).
@@ -390,6 +394,34 @@ impl Hybrid {
     /// Number of near-field vehicles.
     pub fn near_count(&self) -> usize {
         self.lanes.iter().flatten().map(Vec::len).sum()
+    }
+
+    /// Number of near-field edges.
+    pub fn near_edge_count(&self) -> usize {
+        self.is_near.iter().filter(|&&n| n).count()
+    }
+
+    /// Full CTM steps started so far.
+    pub fn ctm_steps(&self) -> u64 {
+        self.ctm_steps
+    }
+
+    /// Near-field substeps per CTM step.
+    pub fn substeps_per_step(&self) -> u32 {
+        self.cfg.substeps
+    }
+
+    /// Vehicles currently on graph edge `edge`: the CTM cell sum for a far-field link, or the
+    /// live vehicle count for a near-field edge.
+    pub fn edge_vehicles(&self, edge: usize) -> Option<f64> {
+        if edge >= self.edges.len() {
+            return None;
+        }
+        if self.is_near[edge] {
+            Some(self.lanes[edge].iter().map(|vs| vs.len() as f64).sum())
+        } else {
+            self.link_of[edge].map(|l| self.far.links()[l].vehicles().iter().sum())
+        }
     }
 
     /// Current totals.
@@ -495,6 +527,55 @@ impl Hybrid {
         let at = vs.partition_point(|x| x.s < s);
         vs.insert(at, veh);
         self.entered.add(1.0);
+    }
+
+    /// Puts up to `vehicles` on graph edge `edge` at fraction `at` of its length (0 its start,
+    /// 1 its end), counted as entered. On a far-field edge, injects into the CTM cell there;
+    /// on a near-field edge, places whole vehicles into lanes with at least the IDM jam gap
+    /// ahead and behind. Returns how many vehicles fitted.
+    pub fn inject(&mut self, edge: usize, at: f64, vehicles: f64) -> f64 {
+        if edge >= self.edges.len() || !vehicles.is_finite() || vehicles <= 0.0 {
+            return 0.0;
+        }
+        if let Some(link_idx) = self.link_of[edge] {
+            let link = self.far.link_mut(link_idx);
+            let cells = link.cell_count();
+            let cell = ((at.clamp(0.0, 1.0) * cells as f64) as usize).min(cells - 1);
+            let left = link.inject(cell, vehicles);
+            let added = vehicles.max(0.0) - left;
+            self.entered.add(added);
+            return added;
+        }
+        let whole = vehicles.floor() as usize;
+        if whole == 0 {
+            return 0.0;
+        }
+        let e_len = self.edges[edge].length_m;
+        let v_free = self.edges[edge].diagram.free_flow_speed;
+        let len = self.cfg.vehicle_length_m;
+        let s0_jam = self.cfg.idm.s0;
+        let s = (at.clamp(0.0, 1.0) * e_len).min((e_len - 0.1).max(0.0));
+        let mut placed = 0usize;
+        for _ in 0..whole {
+            let mut best: Option<(usize, f64, f64)> = None;
+            for (l, vs) in self.lanes[edge].iter().enumerate() {
+                let idx = vs.partition_point(|x| x.s < s);
+                if idx > 0 && s - len - vs[idx - 1].s < s0_jam {
+                    continue;
+                }
+                let (gap_ahead, v) = match vs.get(idx) {
+                    Some(ahead) => (ahead.s - len - s, ahead.v.min(v_free)),
+                    None => (e_len - s, v_free),
+                };
+                if gap_ahead >= s0_jam && best.is_none_or(|b| gap_ahead > b.1) {
+                    best = Some((l, gap_ahead, v));
+                }
+            }
+            let Some((lane, _, v)) = best else { break };
+            self.insert_vehicle(edge, lane, s, v);
+            placed += 1;
+        }
+        placed as f64
     }
 
     /// Gap and speed of whatever is ahead of a vehicle at `s` in `lane` of `edge` whose next
@@ -776,8 +857,7 @@ impl Hybrid {
         }
     }
 
-    /// Advances one CTM step (`dt_s`), with `substeps` near-field substeps after it.
-    pub fn step(&mut self) {
+    fn step_far(&mut self) {
         let dt = self.cfg.dt_s;
         // Boundary rates: outgoing links take from their buffers; incoming links close their
         // exit while a vehicle is still waiting for room in the near field.
@@ -805,9 +885,25 @@ impl Hybrid {
                 self.incoming[i].queue.push(first);
             }
         }
-        let sub = dt / f64::from(self.cfg.substeps);
-        for i in 0..self.cfg.substeps {
-            self.substep(sub, i == 0);
+    }
+
+    /// Advances one near-field substep (`dt_s / substeps`), stepping the far-field CTM at the
+    /// start of each `substeps`-substep cycle.
+    pub fn step_substep(&mut self) {
+        let first = self.substep_in_step == 0;
+        if first {
+            self.step_far();
+            self.ctm_steps += 1;
+        }
+        self.substep_in_step = (self.substep_in_step + 1) % self.cfg.substeps;
+        let sub = self.cfg.dt_s / f64::from(self.cfg.substeps);
+        self.substep(sub, first);
+    }
+
+    /// Advances one CTM step (`dt_s`), with `substeps` near-field substeps after it.
+    pub fn step(&mut self) {
+        for _ in 0..self.cfg.substeps {
+            self.step_substep();
         }
     }
 
@@ -997,5 +1093,24 @@ mod tests {
         );
         let bad = HybridConfig { substeps: 0, ..HybridConfig::default() };
         assert_eq!(Hybrid::new(6, &edges, &near, &|_, _| f64::NAN, bad).err(), Some(HybridError::BadConfig));
+    }
+
+    #[test]
+    fn inject_and_substeps_preserve_conservation() {
+        let (edges, near) = corridor(2);
+        let mut h = Hybrid::new(6, &edges, &near, &|_, _| f64::NAN, HybridConfig::default()).unwrap();
+        assert_eq!(h.near_edge_count(), 1);
+        assert_eq!(h.inject(0, 0.5, 1.5), 1.5); // far-field CTM edge
+        assert_eq!(h.inject(2, 0.0, 2.0), 2.0); // near-field 2-lane edge: one per lane at s = 0
+        assert_eq!(h.inject(2, 0.0, 1.0), 0.0); // both lanes now occupied at s = 0
+        assert_eq!(h.edge_vehicles(0), Some(1.5));
+        assert_eq!(h.edge_vehicles(2), Some(2.0));
+        assert_eq!(h.edge_vehicles(99), None);
+        for _ in 0..25 {
+            h.step_substep();
+            assert!(h.totals().conservation_error().abs() < 1e-12);
+            assert!(h.min_gap() >= 0.0);
+        }
+        assert_eq!(h.ctm_steps(), 5);
     }
 }

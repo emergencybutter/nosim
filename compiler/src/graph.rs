@@ -730,10 +730,17 @@ pub struct SimSummary {
     pub per_class: Vec<ClassStats>,
 }
 
-/// A far-field CTM built from a graph and run a step at a time: what [`simulate`] runs, and
-/// what a client drives through the C ABI.
+enum TrafficModel {
+    Far(ctm::GraphNetwork),
+    Hybrid(Box<nosim::traffic::hybrid::Hybrid>),
+}
+
+/// A traffic simulation built from a graph and run a step at a time: either the far-field CTM
+/// alone ([`Traffic::new`], what [`simulate`] runs) or individual near-field IDM / MOBIL
+/// vehicles coupled to the CTM beyond ([`Traffic::new_hybrid`], what [`simulate_hybrid`]
+/// runs), and what a client drives through the C ABI.
 pub struct Traffic {
-    built: ctm::GraphNetwork,
+    model: TrafficModel,
     stranded_sources: usize,
     entered: f64,
     exited: f64,
@@ -774,59 +781,157 @@ impl Traffic {
             }
             built
         };
-        Ok(Traffic { built, stranded_sources, entered: 0.0, exited: 0.0, steps: 0 })
+        Ok(Traffic { model: TrafficModel::Far(built), stranded_sources, entered: 0.0, exited: 0.0, steps: 0 })
     }
 
-    /// Advances one step; returns the vehicles that entered and left during it.
+    /// Builds a hybrid traffic simulation from `g`: individual IDM / MOBIL vehicles inside
+    /// `near`, coupled to the CTM beyond, with `substeps` near-field substeps per CTM step.
+    pub fn new_hybrid(g: &Graph, o: &SimOptions, near: NearField, substeps: u32) -> Result<Traffic, CompileError> {
+        let (h, stranded_sources, _) = build_hybrid(g, o, near, substeps)?;
+        Ok(Traffic { model: TrafficModel::Hybrid(Box::new(h)), stranded_sources, entered: 0.0, exited: 0.0, steps: 0 })
+    }
+
+    /// Advances one CTM step; returns the vehicles that entered and left during it.
     pub fn step(&mut self) -> (f64, f64) {
-        let flows = self.built.network.step();
-        let entered: f64 = self.built.sources.iter().map(|&(_, l)| flows[l].entered).sum();
-        let exited: f64 = self.built.sinks.iter().map(|&(_, l)| flows[l].exited).sum();
-        self.entered += entered;
-        self.exited += exited;
-        self.steps += 1;
-        (entered, exited)
+        match &mut self.model {
+            TrafficModel::Far(built) => {
+                let flows = built.network.step();
+                let entered: f64 = built.sources.iter().map(|&(_, l)| flows[l].entered).sum();
+                let exited: f64 = built.sinks.iter().map(|&(_, l)| flows[l].exited).sum();
+                self.entered += entered;
+                self.exited += exited;
+                self.steps += 1;
+                (entered, exited)
+            }
+            TrafficModel::Hybrid(h) => {
+                let prev = h.totals();
+                h.step();
+                let cur = h.totals();
+                self.entered = cur.entered;
+                self.exited = cur.exited;
+                self.steps = h.ctm_steps() as usize;
+                (cur.entered - prev.entered, cur.exited - prev.exited)
+            }
+        }
+    }
+
+    /// Advances one near-field substep (`dt_s / substeps` for hybrid runs, or one CTM step
+    /// for far-field runs), stepping the far-field CTM at the start of each cycle.
+    pub fn step_substep(&mut self) {
+        match &mut self.model {
+            TrafficModel::Far(_) => {
+                self.step();
+            }
+            TrafficModel::Hybrid(h) => {
+                h.step_substep();
+                let cur = h.totals();
+                self.entered = cur.entered;
+                self.exited = cur.exited;
+                self.steps = h.ctm_steps() as usize;
+            }
+        }
     }
 
     /// Puts up to `vehicles` on graph edge `k` at fraction `at` of its length (0 its start,
     /// 1 its end), as near-field handoff and spawning do, counting them as entered; returns
-    /// how many fitted in that cell.
+    /// how many fitted.
     pub fn inject(&mut self, k: usize, at: f64, vehicles: f64) -> f64 {
-        if k >= self.built.network.links().len() {
-            return 0.0;
+        match &mut self.model {
+            TrafficModel::Far(built) => {
+                if k >= built.network.links().len() {
+                    return 0.0;
+                }
+                let link = built.network.link_mut(k);
+                let cells = link.cell_count();
+                let cell = ((at.clamp(0.0, 1.0) * cells as f64) as usize).min(cells - 1);
+                let left = link.inject(cell, vehicles);
+                let added = vehicles.max(0.0) - left;
+                self.entered += added;
+                added
+            }
+            TrafficModel::Hybrid(h) => {
+                let added = h.inject(k, at, vehicles);
+                self.entered = h.totals().entered;
+                added
+            }
         }
-        let link = self.built.network.link_mut(k);
-        let cells = link.cell_count();
-        let cell = ((at.clamp(0.0, 1.0) * cells as f64) as usize).min(cells - 1);
-        let left = link.inject(cell, vehicles);
-        let added = vehicles.max(0.0) - left;
-        self.entered += added;
-        added
     }
 
     /// Totals so far.
     pub fn totals(&self) -> TrafficTotals {
-        TrafficTotals {
-            steps: self.steps,
-            entered: self.entered,
-            exited: self.exited,
-            on_network: self.built.network.total_vehicles(),
+        match &self.model {
+            TrafficModel::Far(built) => TrafficTotals {
+                steps: self.steps,
+                entered: self.entered,
+                exited: self.exited,
+                on_network: built.network.total_vehicles(),
+            },
+            TrafficModel::Hybrid(h) => {
+                let t = h.totals();
+                TrafficTotals {
+                    steps: h.ctm_steps() as usize,
+                    entered: t.entered,
+                    exited: t.exited,
+                    on_network: t.far + t.near + t.in_transfer,
+                }
+            }
         }
     }
 
-    /// The network, for inspection (link `k` is graph edge `k`).
+    /// The far-field network, for inspection (link `k` is graph edge `k` for a pure CTM run).
     pub fn network(&self) -> &ctm::Network {
-        &self.built.network
+        match &self.model {
+            TrafficModel::Far(built) => &built.network,
+            TrafficModel::Hybrid(h) => h.far(),
+        }
     }
 
     /// Vehicles on graph edge `k`.
     pub fn edge_vehicles(&self, k: usize) -> Option<f64> {
-        self.built.network.links().get(k).map(|l| l.vehicles().iter().sum())
+        match &self.model {
+            TrafficModel::Far(built) => built.network.links().get(k).map(|l| l.vehicles().iter().sum()),
+            TrafficModel::Hybrid(h) => h.edge_vehicles(k),
+        }
     }
 
-    /// Sources, sinks, junctions and links shorter than one step.
+    /// Whether graph edge `k` is simulated vehicle by vehicle in the near field.
+    pub fn is_near_edge(&self, k: usize) -> bool {
+        match &self.model {
+            TrafficModel::Far(_) => false,
+            TrafficModel::Hybrid(h) => h.is_near_edge(k),
+        }
+    }
+
+    /// Number of graph edges simulated vehicle by vehicle in the near field.
+    pub fn near_edge_count(&self) -> usize {
+        match &self.model {
+            TrafficModel::Far(_) => 0,
+            TrafficModel::Hybrid(h) => h.near_edge_count(),
+        }
+    }
+
+    /// Number of live near-field vehicles.
+    pub fn near_vehicle_count(&self) -> usize {
+        match &self.model {
+            TrafficModel::Far(_) => 0,
+            TrafficModel::Hybrid(h) => h.near_count(),
+        }
+    }
+
+    /// Live near-field vehicles as `(edge, lane, vehicle)`.
+    pub fn near_vehicles(&self) -> Vec<(usize, usize, nosim::traffic::hybrid::Vehicle)> {
+        match &self.model {
+            TrafficModel::Far(_) => Vec::new(),
+            TrafficModel::Hybrid(h) => h.vehicles().map(|(e, l, v)| (e, l, *v)).collect(),
+        }
+    }
+
+    /// Sources, sinks, junctions and links shorter than one step (pure CTM runs).
     pub fn shape(&self) -> (usize, usize, usize, usize) {
-        (self.built.sources.len(), self.built.sinks.len(), self.built.junctions, self.built.short_links)
+        match &self.model {
+            TrafficModel::Far(built) => (built.sources.len(), built.sinks.len(), built.junctions, built.short_links),
+            TrafficModel::Hybrid(_) => (0, 0, 0, 0),
+        }
     }
 }
 
@@ -937,14 +1042,12 @@ pub struct HybridSummary {
     pub mean_step_ms: f64,
 }
 
-/// Runs the hybrid simulation: individual vehicles inside `near`, the CTM outside, with the
-/// same routed turning in both (see [`assign`]) and the same demand at every source.
-pub fn simulate_hybrid(
+fn build_hybrid(
     g: &Graph,
     o: &SimOptions,
     near: NearField,
     substeps: u32,
-) -> Result<HybridSummary, CompileError> {
+) -> Result<(nosim::traffic::hybrid::Hybrid, usize, usize), CompileError> {
     use nosim::geodesy::{EnuFrame, Geodetic, geodetic_to_ecef};
     use nosim::traffic::hybrid::{Hybrid, HybridConfig};
     let frame = EnuFrame::at(Geodetic::new(near.lat, near.lon, 0.0));
@@ -956,32 +1059,54 @@ pub fn simulate_hybrid(
             p.x.hypot(p.y) <= near.radius_m
         })
         .collect();
-    let a = assign(g, o.demand_veh_per_s, o.assign_iterations);
-    let reach = reaches_sink(g);
-    let mut routed_inputs = vec![false; g.edges.len()];
-    for &(i, _) in a.movement.keys() {
-        routed_inputs[i as usize] = true;
-    }
-    let weight = |i: usize, out: usize| -> f64 {
-        if routed_inputs[i] {
-            return a.movement.get(&(i as u32, out as u32)).copied().unwrap_or(0.0);
-        }
-        if !reach[out] || g.edges[i].reverse == Some(out as u32) {
-            return 0.0;
-        }
-        capacity_veh_per_s(&g.edges[out])
-    };
+    let near_nodes = near_node.iter().filter(|&&n| n).count();
     let cfg = HybridConfig { dt_s: o.dt_s, substeps, ..HybridConfig::default() };
-    let mut h = Hybrid::new(g.nodes.len(), &ctm_edges(g), &near_node, &weight, cfg)
-        .map_err(|e| CompileError::Graph(format!("hybrid: {e:?}")))?;
-    for &(node, rate) in &a.source_rate {
-        h.set_source_rate(node, rate);
+    if o.routed {
+        let a = assign(g, o.demand_veh_per_s, o.assign_iterations);
+        let reach = reaches_sink(g);
+        let mut routed_inputs = vec![false; g.edges.len()];
+        for &(i, _) in a.movement.keys() {
+            routed_inputs[i as usize] = true;
+        }
+        let weight = |i: usize, out: usize| -> f64 {
+            if routed_inputs[i] {
+                return a.movement.get(&(i as u32, out as u32)).copied().unwrap_or(0.0);
+            }
+            if !reach[out] || g.edges[i].reverse == Some(out as u32) {
+                return 0.0;
+            }
+            capacity_veh_per_s(&g.edges[out])
+        };
+        let mut h = Hybrid::new(g.nodes.len(), &ctm_edges(g), &near_node, &weight, cfg)
+            .map_err(|e| CompileError::Graph(format!("hybrid: {e:?}")))?;
+        for &(node, rate) in &a.source_rate {
+            h.set_source_rate(node, rate);
+        }
+        Ok((h, a.stranded_sources, near_nodes))
+    } else {
+        let mut h = Hybrid::new(g.nodes.len(), &ctm_edges(g), &near_node, &|_, _| f64::NAN, cfg)
+            .map_err(|e| CompileError::Graph(format!("hybrid: {e:?}")))?;
+        for node in h.source_nodes() {
+            h.set_source_rate(node, o.demand_veh_per_s);
+        }
+        Ok((h, 0, near_nodes))
     }
+}
+
+/// Runs the hybrid simulation: individual vehicles inside `near`, the CTM outside, with the
+/// same routed turning in both (see [`assign`]) and the same demand at every source.
+pub fn simulate_hybrid(
+    g: &Graph,
+    o: &SimOptions,
+    near: NearField,
+    substeps: u32,
+) -> Result<HybridSummary, CompileError> {
+    let (mut h, _, near_nodes) = build_hybrid(g, o, near, substeps)?;
     let steps = (o.seconds / o.dt_s).round() as usize;
     let mut s = HybridSummary {
         steps,
-        near_nodes: near_node.iter().filter(|&&n| n).count(),
-        near_edges: (0..g.edges.len()).filter(|&k| h.is_near_edge(k)).count(),
+        near_nodes,
+        near_edges: h.near_edge_count(),
         min_gap_m: f64::INFINITY,
         ..Default::default()
     };
