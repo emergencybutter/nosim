@@ -12,6 +12,7 @@
 #include "Engine/DirectionalLight.h"
 #include "Engine/Engine.h"
 #include "Engine/ExponentialHeightFog.h"
+#include "Engine/PostProcessVolume.h"
 #include "Engine/SkyLight.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
@@ -2190,30 +2191,20 @@ void ANosimWorld::BuildScene()
 		}
 	}
 
-	// Buildings: footprints extruded from the lowest ground under them to their height.
+	// Buildings: real OSM 3D `building:part` footprints first (when present), then `buildings.geoparquet`
+	// for everything not already represented by stepped parts.
 	{
-		TArray<FString> Tables;
-		if (const FString Areas = WorldFile(TEXT("areas/buildings.geoparquet")); !Areas.IsEmpty())
-		{
-			Tables.Add(Areas);
-		}
-		else
-		{
-			for (size_t T = 0; T < nosim_package_polygon_table_count(Package); ++T)
-			{
-				nosim_package_polygon_table_path(Package, T, Buf, sizeof Buf);
-				Tables.Add(UTF8_TO_TCHAR(Buf));
-			}
-		}
-		TArray<double> Pts;
-		for (const FString& Table : Tables)
+		TSet<FIntPoint> PartCells;
+		auto CellKey = [](const FVector2D& P) { return FIntPoint(FMath::FloorToInt32(P.X / 1200.0), FMath::FloorToInt32(P.Y / 1200.0)); };
+		auto LoadBuildingTable = [&](const FString& Table, bool bIsParts)
 		{
 			NosimPolygonTable* Polygons = nosim_polygon_table_load(TCHAR_TO_UTF8(*Table));
 			if (!Polygons)
 			{
 				UE_LOG(LogNosim, Warning, TEXT("Polygon table %s: %s"), *Table, *FNosimModule::LastError());
-				continue;
+				return;
 			}
+			TArray<double> Pts;
 			for (size_t A = 0; A < nosim_polygon_table_count(Polygons); ++A)
 			{
 				NosimArea Info;
@@ -2221,13 +2212,14 @@ void ANosimWorld::BuildScene()
 				{
 					continue;
 				}
-				// Rings grouped by polygon, in local centimetres.
 				TArray<TArray<TArray<FVector2D>>> Parts;
 				Parts.SetNum(static_cast<int32>(Info.polygon_count));
 				double Base = TNumericLimits<double>::Max();
 				double SeedLon = Anchor.lon_deg, SeedLat = Anchor.lat_deg;
 				bool bHasSeed = false;
 				bool bInside = false;
+				FVector2D CentroidSum = FVector2D::ZeroVector;
+				int32 CentroidN = 0;
 				for (size_t K = 0; K < Info.ring_count; ++K)
 				{
 					NosimRing Ring;
@@ -2249,32 +2241,81 @@ void ANosimWorld::BuildScene()
 						}
 						bInside |= Lon >= Area.min_lon && Lon <= Area.max_lon && Lat >= Area.min_lat && Lat <= Area.max_lat;
 						const FVector L = LonLatToLocal(Lon, Lat);
-						Out.Add(FVector2D(L.X, L.Y));
+						const FVector2D Pt2(L.X, L.Y);
+						Out.Add(Pt2);
+						if (Parts[static_cast<int32>(Ring.polygon)].Num() == 1)
+						{
+							CentroidSum += Pt2;
+							++CentroidN;
+						}
 						Base = FMath::Min(Base, GroundM(Lon, Lat));
 					}
 				}
-				if (!bInside)
+				if (!bInside || CentroidN == 0)
 				{
 					continue;
+				}
+				const FVector2D Centroid = CentroidSum / CentroidN;
+				if (bIsParts)
+				{
+					PartCells.Add(CellKey(Centroid));
+					for (const TArray<TArray<FVector2D>>& Rings : Parts)
+					{
+						if (Rings.Num() > 0)
+						{
+							for (const FVector2D& V : Rings[0])
+							{
+								PartCells.Add(CellKey(V));
+							}
+						}
+					}
+				}
+				else if (PartCells.Num() > 0 && Info.height_m >= 20.0 && PartCells.Contains(CellKey(Centroid)))
+				{
+					continue; // stepped `building:part` footprints already draw this tower
 				}
 				char TagBuf[64] = {0};
 				nosim_polygon_table_tag(Polygons, A, TagBuf, sizeof TagBuf);
 				const double HeightM = Info.height_m > 0 ? Info.height_m : 8.0;
-				const uint64 Seed = nosim_spatial_seed(SeedLat, SeedLon, 0x6275696c64696e67ull /* "building" */);
+				// Quantise seed slightly for building:part so parts of the same skyscraper share a cohesive palette.
+				const double QLat = bIsParts ? FMath::RoundToDouble(SeedLat * 2500.0) / 2500.0 : SeedLat;
+				const double QLon = bIsParts ? FMath::RoundToDouble(SeedLon * 2500.0) / 2500.0 : SeedLon;
+				const uint64 Seed = nosim_spatial_seed(QLat, QLon, 0x6275696c64696e67ull /* "building" */);
 				FLinearColor WallColor, RoofColor;
 				const ESection Style = BuildingStyleAndPalette(UTF8_TO_TCHAR(TagBuf), HeightM, Seed, WallColor, RoofColor);
 				const double TopCm = (Base + HeightM) * 100.0;
 				const double BottomCm = (Base + Info.min_height_m) * 100.0 - (Info.min_height_m > 0 ? 0.0 : 100.0);
+				if (TopCm <= BottomCm + 10.0)
+				{
+					continue;
+				}
 				for (const TArray<TArray<FVector2D>>& Rings : Parts)
 				{
 					if (Rings.Num() > 0)
 					{
-						Mesh[Style].Extrude(Rings, BottomCm, TopCm, Mesh[S_Roof], WallColor, RoofColor);
+						Mesh[Style].Extrude(Rings, BottomCm, TopCm, Mesh[S_Roof], WallColor, RoofColor, !bIsParts);
 					}
 				}
 				++BuildingCount;
 			}
 			nosim_polygon_table_free(Polygons);
+		};
+
+		if (const FString PartsTable = WorldFile(TEXT("areas/building_parts.geoparquet")); !PartsTable.IsEmpty())
+		{
+			LoadBuildingTable(PartsTable, true);
+		}
+		if (const FString Areas = WorldFile(TEXT("areas/buildings.geoparquet")); !Areas.IsEmpty())
+		{
+			LoadBuildingTable(Areas, false);
+		}
+		else
+		{
+			for (size_t T = 0; T < nosim_package_polygon_table_count(Package); ++T)
+			{
+				nosim_package_polygon_table_path(Package, T, Buf, sizeof Buf);
+				LoadBuildingTable(UTF8_TO_TCHAR(Buf), false);
+			}
 		}
 	}
 
@@ -2622,12 +2663,15 @@ void ANosimWorld::SpawnEnvironment()
 	if (!TActorIterator<ASkyLight>(World))
 	{
 		ASkyLight* Sky = World->SpawnActorDeferred<ASkyLight>(ASkyLight::StaticClass(), Origin);
-		Sky->GetLightComponent()->SetMobility(EComponentMobility::Movable);
-		Sky->GetLightComponent()->bRealTimeCapture = true;
-		Sky->GetLightComponent()->Intensity = 2.0f;
-		Sky->GetLightComponent()->bLowerHemisphereIsBlack = false;
-		Sky->GetLightComponent()->LowerHemisphereColor = FLinearColor(0.14f, 0.13f, 0.12f);
+		USkyLightComponent* Comp = Sky->GetLightComponent();
+		Comp->SetMobility(EComponentMobility::Movable);
+		Comp->SetCastShadows(false);
+		Comp->bLowerHemisphereIsBlack = false;
+		Comp->LowerHemisphereColor = FLinearColor(0.18f, 0.17f, 0.16f);
 		Sky->FinishSpawning(Origin);
+		Comp->SetRealTimeCapture(true);
+		Comp->SetIntensity(1.5f);
+		Comp->RecaptureSky();
 	}
 	if (!TActorIterator<AExponentialHeightFog>(World))
 	{
@@ -2637,6 +2681,23 @@ void ANosimWorld::SpawnEnvironment()
 		Fog->GetComponent()->SetFogHeightFalloff(0.035f);
 		Fog->GetComponent()->SetStartDistance(25000.f);
 		Fog->GetComponent()->SetFogInscatteringColor(FLinearColor(0.36f, 0.48f, 0.66f));
+	}
+	if (!TActorIterator<APostProcessVolume>(World))
+	{
+		// Unbound filmic post-processing: grounded contact AO, subtle sun-glint bloom, and natural sky-bounce exposure.
+		APostProcessVolume* Pp = World->SpawnActor<APostProcessVolume>(APostProcessVolume::StaticClass(), Origin);
+		Pp->bUnbound = true;
+		FPostProcessSettings& S = Pp->Settings;
+		S.bOverride_AmbientOcclusionIntensity = true;
+		S.AmbientOcclusionIntensity = 0.55f;
+		S.bOverride_AmbientOcclusionRadius = true;
+		S.AmbientOcclusionRadius = 260.f;
+		S.bOverride_BloomIntensity = true;
+		S.BloomIntensity = 0.30f;
+		S.bOverride_BloomThreshold = true;
+		S.BloomThreshold = 1.2f;
+		S.bOverride_AutoExposureBias = true;
+		S.AutoExposureBias = 0.2f;
 	}
 }
 

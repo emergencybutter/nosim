@@ -666,6 +666,10 @@ fn parse_areas<I: Iterator<Item = String>>(mut it: I) -> Result<AreasArgs, Compi
     let mut options = osm::areas::AreaOptions::default();
     let bad = |flag: &str, value: &str| CompileError::Usage(format!("{flag}: invalid value {value:?}\n{USAGE}"));
     while let Some(flag) = it.next() {
+        if flag == "--building-parts" {
+            options.building_parts = true;
+            continue;
+        }
         let value = it.next().ok_or_else(|| CompileError::Usage(format!("{flag} needs a value\n{USAGE}")))?;
         match flag.as_str() {
             "--input" => input = Some(PathBuf::from(value)),

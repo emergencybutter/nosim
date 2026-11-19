@@ -275,6 +275,8 @@ pub struct CoastlineRow {
 pub struct AreaSet {
     /// Building footprints.
     pub buildings: Vec<AreaRow>,
+    /// `building:part=*` footprints (when [`AreaOptions::building_parts`] is set).
+    pub building_parts: Vec<AreaRow>,
     /// Water bodies.
     pub water: Vec<AreaRow>,
     /// Land use and land cover.
@@ -302,6 +304,9 @@ pub struct AreaOptions {
     /// Keep only areas (and coastline pieces, and located problems) whose bounding box meets
     /// `(west, south, east, north)`.
     pub bbox: Option<(f64, f64, f64, f64)>,
+    /// Also extract `building:part=*` footprints into `building_parts.geoparquet` for 3D
+    /// stepped skyscraper silhouettes.
+    pub building_parts: bool,
     /// Worker threads; 0 uses every core.
     pub threads: usize,
 }
@@ -542,7 +547,7 @@ fn failed(
         area_id: area_id(kind, id),
         osm_type: kind,
         osm_id: id,
-        layer: select(tags)[0].0,
+        layer: select(tags).first().map_or(Layer::Building, |&(l, _, _)| l),
         problem,
         detail,
         location: at.map(multipolygon::degrees),
@@ -573,7 +578,8 @@ fn assemble_way(w: &pbf::Way, coords: &[(i64, Pt)]) -> Outcome {
         }
     };
     // Piers and breakwaters are often drawn as lines; only closed ones are areas.
-    let line_ok = select(t).iter().all(|(_, k, _)| *k == "man_made");
+    let sel = select(t);
+    let line_ok = !sel.is_empty() && sel.iter().all(|(_, k, _)| *k == "man_made");
     if line_ok && (pts.len() <= 3 || pts.first() != pts.last()) {
         return Outcome::AreaNo;
     }
@@ -652,6 +658,10 @@ pub fn extract(
         coast: Vec<pbf::Way>,
         rels: Vec<pbf::Relation>,
     }
+    let keep_parts = opts.building_parts;
+    let want_tags = |tags: &[(String, String)]| {
+        !select(tags).is_empty() || (keep_parts && tag(tags, "building:part").is_some_and(|v| v != "no"))
+    };
     let pass1 = parallel_map(&blocks, threads, |b| {
         let block = pbf::block(b).map_err(bad)?;
         let (nodes, ways, relations) = (block.nodes.len(), block.ways.len(), block.relations.len());
@@ -659,7 +669,7 @@ pub fn extract(
         for w in block.ways {
             // A closed coastline way can be an area too (an island tagged as a park).
             let coastline = w.tag("natural") == Some("coastline");
-            if !select(&w.tags).is_empty() {
+            if want_tags(&w.tags) {
                 if coastline {
                     coast.push(w.clone());
                 }
@@ -674,7 +684,7 @@ pub fn extract(
             .filter(|r| {
                 matches!(r.tag("type"), Some("multipolygon" | "boundary"))
                     && r.members.iter().any(|m| m.kind == pbf::MemberType::Way)
-                    && !select(&r.tags).is_empty()
+                    && want_tags(&r.tags)
             })
             .collect();
         Ok(Pass1 { nodes, ways, relations, candidates, coast, rels })
@@ -750,6 +760,7 @@ pub fn extract(
     let inside = |b: (f64, f64, f64, f64)| opts.bbox.is_none_or(|w| meets(b, w));
     let mut set = AreaSet::default();
     let mut building_tags: Vec<Vec<(String, String)>> = Vec::new();
+    let mut part_tags: Vec<Vec<(String, String)>> = Vec::new();
     for o in outcomes.into_iter().flatten() {
         match o {
             Outcome::AreaNo => summary.area_no += 1,
@@ -796,6 +807,22 @@ pub fn extract(
                         Layer::Landuse => set.landuse.push(row),
                     }
                 }
+                if keep_parts && let Some(v) = tag(&tags, "building:part").filter(|v| *v != "no") {
+                    set.building_parts.push(AreaRow {
+                        area_id: area_id(kind, id),
+                        osm_type: kind,
+                        osm_id: id,
+                        layer: Layer::Building,
+                        key: "building:part".to_owned(),
+                        value: v.to_owned(),
+                        subtype: None,
+                        name: tag(&tags, "name").map(str::to_owned),
+                        polygons,
+                        area_m2,
+                        building: None,
+                    });
+                    part_tags.push(tags);
+                }
             }
         }
     }
@@ -834,6 +861,18 @@ pub fn extract(
         kept.push(row);
     }
     set.buildings = kept;
+    if !set.building_parts.is_empty() {
+        let mut kept_parts = Vec::with_capacity(set.building_parts.len());
+        for (mut row, tags) in std::mem::take(&mut set.building_parts).into_iter().zip(part_tags) {
+            let c = centroid(&row.polygons);
+            let value = row.value.clone();
+            let info = building_info(&tags, c, || zone_for_building(&value).unwrap_or(("commercial", COMMERCIAL)));
+            row.building = Some(info);
+            kept_parts.push(row);
+        }
+        kept_parts.sort_by_key(|r| r.area_id);
+        set.building_parts = kept_parts;
+    }
     for layer in Layer::ALL {
         let rows = match layer {
             Layer::Building => &mut set.buildings,
@@ -981,6 +1020,9 @@ pub fn write_all(dir: &Path, set: &AreaSet) -> Result<(), CompileError> {
     std::fs::create_dir_all(dir).map_err(|e| CompileError::Io(dir.to_path_buf(), e))?;
     for layer in Layer::ALL {
         write_polygons(&dir.join(layer.file_name()), set.layer(layer), layer == Layer::Building)?;
+    }
+    if !set.building_parts.is_empty() {
+        write_polygons(&dir.join("building_parts.geoparquet"), &set.building_parts, true)?;
     }
     write_coastline(&dir.join("coastline.geoparquet"), &set.coastline)?;
     let path = dir.join("problems.csv");
