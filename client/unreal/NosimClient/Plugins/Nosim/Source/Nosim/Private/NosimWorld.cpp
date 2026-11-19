@@ -632,12 +632,14 @@ UTexture2D* CurtainWallFacadeTexture()
 					const int32 Sub = Lx < 64 ? 0 : 1;
 					const uint32 Wh = Hash2D(Col * 2 + Sub, Row, 131u);
 					const float T = static_cast<float>(Ly - 22) / 96.f;
-					const float Var = ((Wh & 0xFF) / 255.f - 0.5f) * 34.f;
-					const bool bOfficeCeiling = T < 0.24f && ((Wh >> 8) & 3u) == 0u;
-					const bool bWarmOffice = ((Wh >> 10) & 7u) == 0u && T > 0.15f && T < 0.80f;
-					float R = 128.f + Var + (1.f - T) * 38.f + (bOfficeCeiling ? 30.f : 0.f) + (bWarmOffice ? 48.f : 0.f);
-					float G = 148.f + Var + (1.f - T) * 42.f + (bOfficeCeiling ? 28.f : 0.f) + (bWarmOffice ? 36.f : 0.f);
-					float B = 172.f + Var + (1.f - T) * 48.f + (bOfficeCeiling ? 20.f : 0.f) + (bWarmOffice ? 10.f : 0.f);
+					const float Var = ((Wh & 0xFF) / 255.f - 0.5f) * 32.f;
+					const bool bBlinds = T < 0.30f && ((Wh >> 8) & 3u) == 0u;
+					const bool bWarmOffice = ((Wh >> 10) & 7u) == 0u && T > 0.18f && T < 0.78f;
+					const bool bDarkRoom = ((Wh >> 13) & 3u) == 0u && !bWarmOffice;
+					const float Depth = bDarkRoom ? 0.62f : 1.0f;
+					float R = (92.f + Var + (1.f - T) * 34.f) * Depth + (bBlinds ? 26.f : 0.f) + (bWarmOffice ? 46.f : 0.f);
+					float G = (112.f + Var + (1.f - T) * 38.f) * Depth + (bBlinds ? 26.f : 0.f) + (bWarmOffice ? 34.f : 0.f);
+					float B = (138.f + Var + (1.f - T) * 44.f) * Depth + (bBlinds ? 22.f : 0.f) + (bWarmOffice ? 8.f : 0.f);
 					Pixels[Y * Size + X] = FColor(
 						static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(R), 0, 255)),
 						static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(G), 0, 255)),
@@ -901,7 +903,7 @@ UMaterialInterface* BuildingBrickMaterial()
 	return MakeFacadeMaterial(Material, TEXT("NosimBuildingBrick"), BrickFacadeTexture(), false, 0.90f, 0.16f, 0.30f, 0.80f, 0.0f, 0.08f);
 }
 
-/** Procedural glossy estuarine water material for `areas/water.geoparquet`. */
+/** Procedural glossy estuarine water material with world-space wave normals for outer sea/water planes. */
 UMaterialInterface* WaterMaterial()
 {
 #if WITH_EDITORONLY_DATA
@@ -909,24 +911,49 @@ UMaterialInterface* WaterMaterial()
 	if (!Material)
 	{
 		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimWater"), RF_Transient);
-		UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
-		Tex->ParameterName = TEXT("Water");
-		Tex->Texture = WaterTexture();
-		Tex->SamplerType = SAMPLERTYPE_Color;
+		UMaterialExpressionConstant3Vector* WaterColor = NewObject<UMaterialExpressionConstant3Vector>(M);
+		WaterColor->Constant = FLinearColor(0.015f, 0.042f, 0.062f);
 		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
-		Roughness->R = 0.09f;
+		Roughness->R = 0.11f;
 		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
-		Specular->R = 0.90f;
+		Specular->R = 0.92f;
 		UMaterialExpressionConstant* Metallic = NewObject<UMaterialExpressionConstant>(M);
-		Metallic->R = 0.06f;
-		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Tex, Roughness, Specular, Metallic})
+		Metallic->R = 0.08f;
+		UMaterialExpressionWorldPosition* Wp = NewObject<UMaterialExpressionWorldPosition>(M);
+		UMaterialExpressionComponentMask* WpXY = NewObject<UMaterialExpressionComponentMask>(M);
+		WpXY->R = 1;
+		WpXY->G = 1;
+		WpXY->B = 0;
+		WpXY->A = 0;
+		WpXY->Input.Connect(0, Wp);
+		UMaterialExpressionConstant* WaterScale = NewObject<UMaterialExpressionConstant>(M);
+		WaterScale->R = 1.f / 1800.f;
+		UMaterialExpressionMultiply* WaterUV = NewObject<UMaterialExpressionMultiply>(M);
+		WaterUV->A.Connect(0, WpXY);
+		WaterUV->B.Connect(0, WaterScale);
+		UMaterialExpressionTextureSampleParameter2D* WaterNormTex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		WaterNormTex->ParameterName = TEXT("WaterNormal");
+		WaterNormTex->Texture = WaterNormalTexture();
+		WaterNormTex->SamplerType = SAMPLERTYPE_LinearColor;
+		WaterNormTex->Coordinates.Connect(0, WaterUV);
+		UMaterialExpressionConstant3Vector* NegOne = NewObject<UMaterialExpressionConstant3Vector>(M);
+		NegOne->Constant = FLinearColor(-1.f, -1.f, -1.f);
+		UMaterialExpressionConstant3Vector* PosOne = NewObject<UMaterialExpressionConstant3Vector>(M);
+		PosOne->Constant = FLinearColor(1.f, 1.f, 1.f);
+		UMaterialExpressionLinearInterpolate* WaterNorm = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		WaterNorm->A.Connect(0, NegOne);
+		WaterNorm->B.Connect(0, PosOne);
+		WaterNorm->Alpha.Connect(0, WaterNormTex);
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{
+			WaterColor, Roughness, Specular, Metallic, Wp, WpXY, WaterScale, WaterUV, WaterNormTex, NegOne, PosOne, WaterNorm})
 		{
 			M->GetExpressionCollection().AddExpression(E);
 		}
-		M->GetEditorOnlyData()->BaseColor.Connect(0, Tex);
+		M->GetEditorOnlyData()->BaseColor.Connect(0, WaterColor);
 		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
 		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
 		M->GetEditorOnlyData()->Metallic.Connect(0, Metallic);
+		M->GetEditorOnlyData()->Normal.Connect(0, WaterNorm);
 		M->PostEditChange();
 		Material.Reset(M);
 	}
@@ -1144,26 +1171,26 @@ UTexture2D* GrassTexture()
 	{
 		constexpr int32 Size = 256;
 		TArray<FColor> Pixels;
-		Pixels.Init(FColor(34, 62, 22, 0), Size * Size);
+		Pixels.Init(FColor(28, 46, 18, 0), Size * Size);
 		FRandomStream Rng(0x47524153);
-		for (int32 B = 0; B < 42; ++B)
+		for (int32 B = 0; B < 64; ++B)
 		{
-			const float BaseX = Rng.FRandRange(18.f, Size - 18.f);
-			const float Height = Rng.FRandRange(110.f, 235.f);
-			const float Lean = Rng.FRandRange(-36.f, 36.f);
-			const float HalfW = Rng.FRandRange(3.0f, 5.5f);
+			const float BaseX = Rng.FRandRange(10.f, Size - 10.f);
+			const float Height = Rng.FRandRange(120.f, 238.f);
+			const float Lean = Rng.FRandRange(-40.f, 40.f);
+			const float HalfW = Rng.FRandRange(3.2f, 5.8f);
 			const float Hue = Rng.FRandRange(0.f, 1.f);
 			for (int32 S = 0; S < 240; ++S)
 			{
 				const float T = S / 240.f; // 0 bottom .. 1 tip
 				const float Px = BaseX + Lean * T * T;
 				const float Py = (Size - 2.f) - Height * T;
-				const float W = HalfW * (1.f - T * 0.92f);
-				// Darker roots at bottom, sunlit warm-green tips at top.
-				const float Shade = FMath::Lerp(0.28f, 1.0f, T);
-				const uint8 R = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(22.f, 88.f, Shade * (0.7f + 0.3f * Hue))), 0, 255));
-				const uint8 G = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(44.f, 126.f, Shade)), 0, 255));
-				const uint8 Bl = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(14.f, 40.f, Shade)), 0, 255));
+				const float W = HalfW * (1.f - T * 0.90f);
+				// Deep shaded roots at bottom, natural olive-emerald tips at top.
+				const float Shade = FMath::Lerp(0.24f, 0.95f, T);
+				const uint8 R = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(18.f, 68.f, Shade * (0.72f + 0.28f * Hue))), 0, 255));
+				const uint8 G = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(34.f, 94.f, Shade)), 0, 255));
+				const uint8 Bl = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(12.f, 30.f, Shade)), 0, 255));
 				const int32 Iy = FMath::RoundToInt(Py);
 				if (Iy < 2 || Iy >= Size) continue;
 				const int32 X0 = FMath::Max(2, FMath::FloorToInt(Px - W));
@@ -1199,7 +1226,7 @@ UMaterialInterface* GrassMaterial()
 		Tex->Texture = GrassTexture();
 		Tex->SamplerType = SAMPLERTYPE_Color;
 		UMaterialExpressionConstant* SssScale = NewObject<UMaterialExpressionConstant>(M);
-		SssScale->R = 0.50f;
+		SssScale->R = 0.34f;
 		UMaterialExpressionMultiply* Subsurface = NewObject<UMaterialExpressionMultiply>(M);
 		Subsurface->A.Connect(0, Tex);
 		Subsurface->B.Connect(0, SssScale);
@@ -1295,9 +1322,9 @@ UTexture2D* FoliageTexture()
 				}
 			}
 		}
-		// Scatter 950 fine overlapping elliptical leaves inside an organic irregular silhouette.
+		// Scatter 1,400 fine overlapping elliptical leaves inside an organic irregular silhouette.
 		FRandomStream Rng(0x4C454146);
-		for (int32 L = 0; L < 950; ++L)
+		for (int32 L = 0; L < 1400; ++L)
 		{
 			const float Ang = Rng.FRandRange(0.f, 2.f * PI);
 			// Irregular lobed envelope staying clear of card edges (max radius ~228 px).
@@ -1305,17 +1332,17 @@ UTexture2D* FoliageTexture()
 			const float R = FMath::Sqrt(Rng.FRand()) * 195.f * Lobe;
 			const float Cx = 256.f + FMath::Cos(Ang) * R;
 			const float Cy = 248.f + FMath::Sin(Ang) * R * 0.92f;
-			const float LeafA = Rng.FRandRange(7.f, 14.f);
+			const float LeafA = Rng.FRandRange(5.5f, 11.0f);
 			const float LeafB = LeafA * Rng.FRandRange(0.45f, 0.68f);
 			const float Rot = Rng.FRandRange(0.f, PI);
 			const float CosR = FMath::Cos(Rot), SinR = FMath::Sin(Rot);
-			// Inner/lower leaves are shaded deeper; outer/upper leaves catch warm sunlight.
+			// Inner/lower leaves are shaded deeper; outer/upper leaves catch natural olive-forest sunlight.
 			const float HeightShade = FMath::Clamp(1.f - (Cy - 60.f) / 380.f, 0.f, 1.f);
 			const float RimShade = FMath::Clamp(R / 210.f, 0.f, 1.f);
-			const float Tone = FMath::Clamp(0.25f + 0.45f * HeightShade + 0.20f * RimShade + Rng.FRandRange(-0.14f, 0.14f), 0.f, 1.f);
-			const uint8 Cr = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(16.f, 66.f, Tone * Tone)), 0, 255));
-			const uint8 Cg = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(30.f, 102.f, Tone)), 0, 255));
-			const uint8 Cb = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(10.f, 34.f, Tone * Tone)), 0, 255));
+			const float Tone = FMath::Clamp(0.18f + 0.44f * HeightShade + 0.24f * RimShade + Rng.FRandRange(-0.14f, 0.14f), 0.f, 1.f);
+			const uint8 Cr = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(13.f, 54.f, Tone * Tone)), 0, 255));
+			const uint8 Cg = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(24.f, 78.f, Tone)), 0, 255));
+			const uint8 Cb = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(9.f, 28.f, Tone * Tone)), 0, 255));
 			const int32 Pad = FMath::CeilToInt(LeafA) + 1;
 			const int32 X0 = FMath::Max(2, FMath::FloorToInt(Cx) - Pad);
 			const int32 X1 = FMath::Min(Size - 3, FMath::CeilToInt(Cx) + Pad);
@@ -1361,7 +1388,7 @@ UMaterialInterface* FoliageMaterial()
 		Tex->Texture = FoliageTexture();
 		Tex->SamplerType = SAMPLERTYPE_Color;
 		UMaterialExpressionConstant* SssScale = NewObject<UMaterialExpressionConstant>(M);
-		SssScale->R = 0.55f;
+		SssScale->R = 0.26f;
 		UMaterialExpressionMultiply* Subsurface = NewObject<UMaterialExpressionMultiply>(M);
 		Subsurface->A.Connect(0, Tex);
 		Subsurface->B.Connect(0, SssScale);
@@ -1612,16 +1639,16 @@ struct FMeshBuffer
 	 * and (above 130 m) a stepped crown/spire so skyline silhouettes aren't flat boxes.
 	 */
 	void Extrude(const TArray<TArray<FVector2D>>& Rings, double BottomCm, double TopCm, FMeshBuffer& Roof,
-		const FLinearColor& WallColor, const FLinearColor& RoofColor, bool bAddCrown = true)
+		const FLinearColor& WallColor, const FLinearColor& RoofColor, bool bAddCrown = true, bool bHasGroundLobby = true)
 	{
 		using namespace UE::Geometry;
 		constexpr double TileWidthCm = 1280.0; // 4 bays × 3.2 m
 		constexpr double TileHeightCm = 1360.0; // 4 storeys × 3.4 m
 		constexpr double RoofTileCm = 2000.0; // 20 m × 20 m
 		const double HeightCm = FMath::Max(TopCm - BottomCm, 0.0);
-		const bool bHasLobby = bAddCrown && HeightCm >= 1000.0;
-		const double LobbyTopCm = bHasLobby ? BottomCm + 450.0 : BottomCm;
-		const FLinearColor LobbyColor = WallColor * 0.55f;
+		const bool bHasLobby = bHasGroundLobby && HeightCm >= 1000.0;
+		const double LobbyTopCm = bHasLobby ? BottomCm + 480.0 : BottomCm;
+		const FLinearColor LobbyColor = WallColor * 0.46f;
 		const double VTop = 0.0;
 		const double VBot = HeightCm / TileHeightCm;
 		const double VLobby = FMath::Max(TopCm - LobbyTopCm, 0.0) / TileHeightCm;
@@ -1707,7 +1734,7 @@ struct FMeshBuffer
 						Center + FVector2D(HalfX, HalfY),
 						Center + FVector2D(-HalfX, HalfY),
 					});
-					Extrude(BoxRings, Z0, Z1, Roof, C, RoofColor * 0.9f, false);
+					Extrude(BoxRings, Z0, Z1, Roof, C, RoofColor * 0.9f, false, false);
 				};
 				const double PentH = FMath::Clamp(HeightCm * 0.08, 450.0, 1200.0);
 				AddBox(Extent.X * 0.42, Extent.Y * 0.42, TopCm, TopCm + PentH, WallColor * 0.85f);
@@ -2258,6 +2285,10 @@ void ANosimWorld::BuildScene()
 	{
 		const double H = 1.2e6; // 12 km each way
 		Mesh[S_Ground].Quad(FVector(-H, -H, GroundCm), FVector(H, -H, GroundCm), FVector(H, H, GroundCm), FVector(-H, H, GroundCm));
+		// Outer estuarine sea-level plane (25 km each way, just below 0 m) so waterways continue cleanly into the horizon haze.
+		const double SeaH = 2.5e6;
+		const double SeaZ = -180.0;
+		Mesh[S_Water].Quad(FVector(-SeaH, -SeaH, SeaZ), FVector(SeaH, -SeaH, SeaZ), FVector(SeaH, SeaH, SeaZ), FVector(-SeaH, SeaH, SeaZ));
 	}
 
 	for (const FRunwayVis& R : Runways)
@@ -2562,7 +2593,7 @@ void ANosimWorld::BuildScene()
 				{
 					if (Rings.Num() > 0)
 					{
-						Mesh[Style].Extrude(Rings, BottomCm, TopCm, Mesh[S_Roof], WallColor, RoofColor, !bIsParts);
+						Mesh[Style].Extrude(Rings, BottomCm, TopCm, Mesh[S_Roof], WallColor, RoofColor, !bIsParts, Info.min_height_m <= 0.1);
 					}
 				}
 				++BuildingCount;
@@ -2809,28 +2840,37 @@ void ANosimWorld::BuildScene()
 		TreeTrunks->AddInstances(TrunkInstances, false, false);
 		TreeCount = static_cast<int32>(Count);
 
-		// 3D grass tufts across nearby park/grassland/tree-cover ground (within 450 m of anchor, culled at 160 m).
+		// Dense 3D grass carpet across nearby park/grassland/tree-cover ground (1.15 m jittered grid within 420 m, culled at 140 m).
 		TArray<FTransform> GrassInstances;
-		constexpr double GrassRadM = 450.0;
-		const double GrassLatSpan = GrassRadM / 111320.0;
-		const double GrassLonSpan = GrassLatSpan / CosLat;
+		constexpr double GrassRadM = 420.0;
+		constexpr double GrassStepM = 1.15;
+		const int32 GridSteps = FMath::CeilToInt32(2.0 * GrassRadM / GrassStepM);
+		const double LatPerM = 1.0 / 111320.0;
+		const double LonPerM = LatPerM / CosLat;
 		FRandomStream GrassRng(static_cast<int32>(Seed ^ 0x47524153));
-		for (int32 GIdx = 0; GIdx < 60000; ++GIdx)
+		for (int32 Gy = 0; Gy < GridSteps; ++Gy)
 		{
-			const double Lon = Anchor.lon_deg + GrassRng.FRandRange(-GrassLonSpan, GrassLonSpan);
-			const double Lat = Anchor.lat_deg + GrassRng.FRandRange(-GrassLatSpan, GrassLatSpan);
-			const uint8 Cls = Classes.Byte(Lon, Lat);
-			if (Cls != 10 && Cls != 30)
+			const double BaseNorthM = -GrassRadM + (Gy + 0.5) * GrassStepM;
+			for (int32 Gx = 0; Gx < GridSteps; ++Gx)
 			{
-				continue;
+				const double BaseEastM = -GrassRadM + (Gx + 0.5) * GrassStepM;
+				const double EastM = BaseEastM + GrassRng.FRandRange(-0.48f, 0.48f) * GrassStepM;
+				const double NorthM = BaseNorthM + GrassRng.FRandRange(-0.48f, 0.48f) * GrassStepM;
+				const double Lon = Anchor.lon_deg + EastM * LonPerM;
+				const double Lat = Anchor.lat_deg + NorthM * LatPerM;
+				const uint8 Cls = Classes.Byte(Lon, Lat);
+				if (Cls != 10 && Cls != 30)
+				{
+					continue;
+				}
+				const FVector BaseP = GeoToLocal(Lon, Lat, GroundM(Lon, Lat));
+				const double H = GrassRng.FRandRange(0.15f, 0.28f);
+				const double W = GrassRng.FRandRange(0.62f, 1.05f);
+				const double Yaw = GrassRng.FRandRange(0.f, 180.f);
+				// Roll +90 deg stands the plane upright with texture V pointing up (blades grow vertically).
+				GrassInstances.Add(FTransform(FRotator(0.0, Yaw, 90.0), BaseP + FVector(0, 0, H * 44.0), FVector(W, H, 1.0)));
+				GrassInstances.Add(FTransform(FRotator(0.0, Yaw + 65.0, 90.0), BaseP + FVector(0, 0, H * 44.0), FVector(W, H, 1.0)));
 			}
-			const FVector BaseP = GeoToLocal(Lon, Lat, GroundM(Lon, Lat));
-			const double H = GrassRng.FRandRange(0.16f, 0.28f);
-			const double W = GrassRng.FRandRange(0.55f, 0.90f);
-			const double Yaw = GrassRng.FRandRange(0.f, 180.f);
-			// Roll +90 deg stands the plane upright with texture V pointing up (blades grow vertically).
-			GrassInstances.Add(FTransform(FRotator(0.0, Yaw, 90.0), BaseP + FVector(0, 0, H * 46.0), FVector(W, H, 1.0)));
-			GrassInstances.Add(FTransform(FRotator(0.0, Yaw + 70.0, 90.0), BaseP + FVector(0, 0, H * 46.0), FVector(W, H, 1.0)));
 		}
 		if (GrassInstances.Num() > 0)
 		{
@@ -2941,6 +2981,44 @@ void ANosimWorld::BuildScene()
 		V.HalfWidthCm = HalfWidthCm;
 		// Two-way roads carry each direction on its own half.
 		V.LateralCm = V.bTwoWay ? HalfWidthCm * 0.5 : 0.0;
+
+		// White zebra crosswalk bars at near-field drive-graph intersections.
+		if (V.bNear && V.Points.Num() >= 2 && V.Stations.Last() >= 18.0 && HalfWidthCm >= 260.0)
+		{
+			auto AddCrosswalk = [&](double StationM)
+			{
+				FVector Pos, Dir;
+				SampleAlong(V.Points, V.Stations, StationM, Pos, Dir);
+				Pos.Z -= 72.0; // road surface + 3 cm (V.Points is lifted +75 cm for vehicle centres)
+				const FVector Fwd = Dir.GetSafeNormal2D();
+				const FVector Rgt(-Fwd.Y, Fwd.X, 0.0);
+				constexpr double BarLenCm = 280.0;
+				constexpr double BarW = 45.0;
+				constexpr double Pitch = 105.0;
+				const double Span = HalfWidthCm * 0.84;
+				for (double C = -Span + BarW * 0.5; C + BarW * 0.5 <= Span; C += Pitch)
+				{
+					const FVector P0 = Pos - Fwd * (BarLenCm * 0.5) + Rgt * (C - BarW * 0.5);
+					const FVector P1 = Pos - Fwd * (BarLenCm * 0.5) + Rgt * (C + BarW * 0.5);
+					const FVector P2 = Pos + Fwd * (BarLenCm * 0.5) + Rgt * (C + BarW * 0.5);
+					const FVector P3 = Pos + Fwd * (BarLenCm * 0.5) + Rgt * (C - BarW * 0.5);
+					Mesh[S_Marking].Quad(P0, P1, P2, P3, FVector::UpVector);
+				}
+			};
+			if (From.in_degree + From.out_degree >= 3)
+			{
+				AddCrosswalk(6.0);
+			}
+			if (To.in_degree + To.out_degree >= 3)
+			{
+				AddCrosswalk(V.Stations.Last() - 6.0);
+			}
+		}
+	}
+	if (Mesh[S_Marking].Triangles.Num() > 0)
+	{
+		Scenery->CreateMeshSection_LinearColor(S_Marking, Mesh[S_Marking].Vertices, Mesh[S_Marking].Triangles,
+			Mesh[S_Marking].Normals, Mesh[S_Marking].UVs, Mesh[S_Marking].Colors, TArray<FProcMeshTangent>(), false);
 	}
 	if (EntryEdges.Num() == 0)
 	{
