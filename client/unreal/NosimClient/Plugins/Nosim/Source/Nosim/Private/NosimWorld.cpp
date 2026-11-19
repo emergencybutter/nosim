@@ -55,6 +55,7 @@ enum ESection : int32
 	S_Taxiway,
 	S_TaxiLine,
 	S_Road,
+	S_Sidewalk,
 	S_BuildingGlass,
 	S_BuildingStone,
 	S_BuildingBrick,
@@ -70,6 +71,7 @@ const FLinearColor SectionColors[S_SectionCount] = {
 	FLinearColor(0.09f, 0.09f, 0.10f), // taxiway
 	FLinearColor(0.80f, 0.55f, 0.02f), // taxiway centreline
 	FLinearColor(0.038f, 0.040f, 0.044f), // road asphalt
+	FLinearColor(0.24f, 0.24f, 0.23f), // concrete sidewalks
 	FLinearColor(0.18f, 0.24f, 0.30f), // glass curtain-wall towers
 	FLinearColor(0.24f, 0.23f, 0.21f), // stone / concrete facades
 	FLinearColor(0.22f, 0.14f, 0.11f), // brick / residential facades
@@ -1004,6 +1006,135 @@ UTexture2D* RoadAsphaltTexture()
 	return Cached.Get();
 }
 
+/** Matte brushed concrete sidewalk texture (256 × 256) with slab expansion joints. */
+UTexture2D* SidewalkTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 256;
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const float Grain = ((Hash2D(X, Y, 601u) & 0xFF) / 255.f - 0.5f) * 18.f;
+				const float Slab = ((Hash2D(X / 128, Y / 64, 607u) & 0xFF) / 255.f - 0.5f) * 14.f;
+				float V = 138.f + Grain + Slab;
+				if ((Y % 64) < 2 || (X % 128) < 2)
+				{
+					V -= 36.f; // concrete expansion joint
+				}
+				const uint8 C = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(V), 0, 255));
+				Pixels[Y * Size + X] = FColor(C, C, static_cast<uint8>(FMath::Max(C - 3, 0)), 255);
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
+}
+
+UMaterialInterface* SidewalkMaterial()
+{
+#if WITH_EDITORONLY_DATA
+	static TStrongObjectPtr<UMaterial> Material;
+	if (!Material)
+	{
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimSidewalk"), RF_Transient);
+		UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		Tex->ParameterName = TEXT("Sidewalk");
+		Tex->Texture = SidewalkTexture();
+		Tex->SamplerType = SAMPLERTYPE_Color;
+		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
+		Roughness->R = 0.88f;
+		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
+		Specular->R = 0.24f;
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Tex, Roughness, Specular})
+		{
+			M->GetExpressionCollection().AddExpression(E);
+		}
+		M->GetEditorOnlyData()->BaseColor.Connect(0, Tex);
+		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
+		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
+		M->PostEditChange();
+		Material.Reset(M);
+	}
+	return Material.Get();
+#else
+	return VertexColorMaterial();
+#endif
+}
+
+/** Dark cast-iron material for NYC streetlight poles. */
+UMaterialInterface* IronPoleMaterial()
+{
+#if WITH_EDITORONLY_DATA
+	static TStrongObjectPtr<UMaterial> Material;
+	if (!Material)
+	{
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimIronPole"), RF_Transient);
+		PRAGMA_DISABLE_DEPRECATION_WARNINGS
+		M->bUsedWithInstancedStaticMeshes = true;
+		PRAGMA_ENABLE_DEPRECATION_WARNINGS
+		UMaterialExpressionConstant3Vector* Color = NewObject<UMaterialExpressionConstant3Vector>(M);
+		Color->Constant = FLinearColor(0.032f, 0.036f, 0.038f);
+		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
+		Roughness->R = 0.48f;
+		UMaterialExpressionConstant* Metallic = NewObject<UMaterialExpressionConstant>(M);
+		Metallic->R = 0.75f;
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Color, Roughness, Metallic})
+		{
+			M->GetExpressionCollection().AddExpression(E);
+		}
+		M->GetEditorOnlyData()->BaseColor.Connect(0, Color);
+		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
+		M->GetEditorOnlyData()->Metallic.Connect(0, Metallic);
+		M->PostEditChange();
+		Material.Reset(M);
+	}
+	return Material.Get();
+#else
+	return VertexColorMaterial();
+#endif
+}
+
+/** Glossy tinted automotive glass material for sedan cabins. */
+UMaterialInterface* VehicleCabinMaterial()
+{
+#if WITH_EDITORONLY_DATA
+	static TStrongObjectPtr<UMaterial> Material;
+	if (!Material)
+	{
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimVehicleCabin"), RF_Transient);
+		PRAGMA_DISABLE_DEPRECATION_WARNINGS
+		M->bUsedWithInstancedStaticMeshes = true;
+		PRAGMA_ENABLE_DEPRECATION_WARNINGS
+		UMaterialExpressionConstant3Vector* Color = NewObject<UMaterialExpressionConstant3Vector>(M);
+		Color->Constant = FLinearColor(0.025f, 0.032f, 0.042f);
+		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
+		Roughness->R = 0.08f;
+		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
+		Specular->R = 0.95f;
+		UMaterialExpressionConstant* Metallic = NewObject<UMaterialExpressionConstant>(M);
+		Metallic->R = 0.25f;
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Color, Roughness, Specular, Metallic})
+		{
+			M->GetExpressionCollection().AddExpression(E);
+		}
+		M->GetEditorOnlyData()->BaseColor.Connect(0, Color);
+		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
+		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
+		M->GetEditorOnlyData()->Metallic.Connect(0, Metallic);
+		M->PostEditChange();
+		Material.Reset(M);
+	}
+	return Material.Get();
+#else
+	return VertexColorMaterial();
+#endif
+}
+
 /** Matte asphalt road material (no midday plastic glare). */
 UMaterialInterface* RoadAsphaltMaterial()
 {
@@ -1598,9 +1729,18 @@ ANosimWorld::ANosimWorld()
 	TreeTrunks->SetMobility(EComponentMobility::Static);
 	TreeTrunks->SetCullDistances(0, 150000); // trunks visible up to 1.5 km
 	TreeTrunks->SetCastShadow(false);
+	StreetLights = MakeVehicles(TEXT("StreetLights"));
+	StreetLights->SetMobility(EComponentMobility::Static);
+	StreetLights->SetCullDistances(0, 75000); // 750 m
+	StreetLights->SetCastShadow(false);
+	StreetLampHeads = MakeVehicles(TEXT("StreetLampHeads"));
+	StreetLampHeads->SetMobility(EComponentMobility::Static);
+	StreetLampHeads->SetCullDistances(0, 75000);
+	StreetLampHeads->SetCastShadow(false);
 	VehiclesFree = MakeVehicles(TEXT("VehiclesFree"));
 	VehiclesSlow = MakeVehicles(TEXT("VehiclesSlow"));
 	VehiclesJammed = MakeVehicles(TEXT("VehiclesJammed"));
+	VehicleCabins = MakeVehicles(TEXT("VehicleCabins"));
 
 	// 15:00 UTC is 11:00 in New York for most of the year.
 	const FDateTime Now = FDateTime::UtcNow();
@@ -1709,7 +1849,8 @@ void ANosimWorld::BuildScene()
 	Scenery->ClearAllMeshSections();
 	Terrain->ClearAllMeshSections();
 	Models->ClearAllMeshSections();
-	for (UInstancedStaticMeshComponent* Ism : {Trees.Get(), TreeTrunks.Get(), VehiclesFree.Get(), VehiclesSlow.Get(), VehiclesJammed.Get()})
+	for (UInstancedStaticMeshComponent* Ism : {Trees.Get(), TreeTrunks.Get(), StreetLights.Get(), StreetLampHeads.Get(),
+		VehiclesFree.Get(), VehiclesSlow.Get(), VehiclesJammed.Get(), VehicleCabins.Get()})
 	{
 		Ism->ClearInstances();
 	}
@@ -2104,6 +2245,8 @@ void ANosimWorld::BuildScene()
 	};
 	TArray<FSplineGeo> Geo;
 	TMultiMap<int64, int32> ByOsmId;
+	TArray<FTransform> LampPoles;
+	TArray<FTransform> LampHeads;
 	FString SplinePath = WorldSplines;
 	if (SplinePath.IsEmpty() && nosim_vfs_resolve(Vfs, NOSIM_CONTENT_KIND_SPLINE_NETWORKS, Anchor.lat_deg, Anchor.lon_deg, Buf, sizeof Buf) > 0)
 	{
@@ -2188,6 +2331,38 @@ void ANosimWorld::BuildScene()
 			G.ZOffsetCm = (S.bridge ? 60.0 : 12.0) + FMath::Clamp(S.layer, -2, 5) * 2.0;
 			// Always draw roads and bridges as crisp dark asphalt so street-level views don't rely on blurry aerial pixels.
 			Mesh[S_Road].Ribbon(G.Local, G.HalfWidthCm, 0, G.ZOffsetCm);
+			const bool bUrbanStreet = !S.bridge && (Class == TEXT("primary") || Class == TEXT("secondary")
+				|| Class == TEXT("tertiary") || Class == TEXT("residential") || Class == TEXT("trunk"));
+			if (bUrbanStreet && G.HalfWidthCm >= 250.0)
+			{
+				constexpr double SidewalkHalfCm = 110.0; // 2.2 m sidewalk on each side
+				Mesh[S_Sidewalk].Ribbon(G.Local, SidewalkHalfCm, G.HalfWidthCm + SidewalkHalfCm, G.ZOffsetCm + 10.0);
+				Mesh[S_Sidewalk].Ribbon(G.Local, SidewalkHalfCm, -(G.HalfWidthCm + SidewalkHalfCm), G.ZOffsetCm + 10.0);
+				// Place cast-iron NYC streetlight poles every 45 m along the near-field curb.
+				const double NearRadCm = FMath::Max(NearFieldRadiusM * 100.0, 100000.0);
+				double AccumCm = 2000.0;
+				for (int32 P = 0; P + 1 < G.Local.Num(); ++P)
+				{
+					const FVector A = G.Local[P], B = G.Local[P + 1];
+					const double SegCm = FVector::Dist2D(A, B);
+					if (SegCm < 10.0) continue;
+					const FVector Dir = (B - A).GetSafeNormal2D();
+					const FVector Right(-Dir.Y, Dir.X, 0.0);
+					while (AccumCm < SegCm)
+					{
+						const FVector Pos = FMath::Lerp(A, B, AccumCm / SegCm) + Right * (G.HalfWidthCm + 55.0);
+						if (Pos.SizeSquared2D() <= NearRadCm * NearRadCm)
+						{
+							const double PoleH = 7.5; // 7.5 m tall
+							const FRotator Rot = Dir.Rotation();
+							LampPoles.Add(FTransform(Rot, Pos + FVector(0, 0, G.ZOffsetCm + PoleH * 50.0), FVector(0.16, 0.16, PoleH)));
+							LampHeads.Add(FTransform(Rot, Pos - Right * 65.0 + FVector(0, 0, G.ZOffsetCm + PoleH * 100.0), FVector(0.32, 1.4, 0.16)));
+						}
+						AccumCm += 4500.0; // 45 m spacing
+					}
+					AccumCm -= SegCm;
+				}
+			}
 		}
 	}
 
@@ -2373,6 +2548,10 @@ void ANosimWorld::BuildScene()
 		{
 			Scenery->SetMaterial(I, RoadAsphaltMaterial());
 		}
+		else if (I == S_Sidewalk)
+		{
+			Scenery->SetMaterial(I, SidewalkMaterial());
+		}
 		else if (I == S_BuildingGlass)
 		{
 			Scenery->SetMaterial(I, BuildingGlassMaterial());
@@ -2445,6 +2624,17 @@ void ANosimWorld::BuildScene()
 		Mid->SetVectorParameterValue(TEXT("Color"), VehicleColors[I]);
 		Isms[I]->SetMaterial(0, Mid);
 		Materials.Add(Mid);
+	}
+	VehicleCabins->SetStaticMesh(Cube);
+	VehicleCabins->SetMaterial(0, VehicleCabinMaterial());
+	if (LampPoles.Num() > 0)
+	{
+		StreetLights->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cylinder.Cylinder")));
+		StreetLights->SetMaterial(0, IronPoleMaterial());
+		StreetLights->AddInstances(LampPoles, false, false);
+		StreetLampHeads->SetStaticMesh(Cube);
+		StreetLampHeads->SetMaterial(0, IronPoleMaterial());
+		StreetLampHeads->AddInstances(LampHeads, false, false);
 	}
 
 	// Trees: nosim's Poisson-disk scatter over the area, thinned by the tree mask.
@@ -2795,7 +2985,15 @@ void ANosimWorld::UpdateTraffic(float DeltaSeconds)
 	// near-field edges draw each microscopic IDM/MOBIL vehicle at its exact lane and bumper position.
 	const NosimFundamentalDiagram Urban = nosim_ctm_diagram_urban();
 	TArray<FTransform> Buckets[3];
-	const FVector Scale(4.5, 1.9, 1.5);
+	TArray<FTransform> Cabins;
+	const FVector BodyScale(4.5, 1.85, 0.85);
+	const FVector CabinScale(2.3, 1.52, 0.62);
+	auto EmitCar = [&](int32 Bucket, const FVector& Pos, const FVector& Dir)
+	{
+		const FRotator Rot = Dir.Rotation();
+		Buckets[Bucket].Add(FTransform(Rot, Pos - FVector(0, 0, 28.0), BodyScale));
+		Cabins.Add(FTransform(Rot, Pos - Dir * 22.0 + FVector(0, 0, 44.0), CabinScale));
+	};
 	for (int32 E = 0; E < Edges.Num(); ++E)
 	{
 		FNosimEdgeVis& V = Edges[E];
@@ -2819,7 +3017,7 @@ void ANosimWorld::UpdateTraffic(float DeltaSeconds)
 			FVector Pos, Dir;
 			SampleAlong(V.Points, V.Stations, (K + V.Phase) / Count * DrawnLength, Pos, Dir);
 			Pos += FVector(-Dir.Y, Dir.X, 0).GetSafeNormal() * V.LateralCm;
-			Buckets[Bucket].Add(FTransform(Dir.Rotation(), Pos, Scale));
+			EmitCar(Bucket, Pos, Dir);
 		}
 	}
 	if (NearEdgeCount > 0)
@@ -2860,7 +3058,7 @@ void ANosimWorld::UpdateTraffic(float DeltaSeconds)
 			Pos += FVector(-Dir.Y, Dir.X, 0).GetSafeNormal() * LatCm;
 			const double Ratio = V.SpeedMps > 0 ? Veh.speed_mps / V.SpeedMps : 1.0;
 			const int32 Bucket = Ratio > 0.7 ? 0 : Ratio > 0.3 ? 1 : 2;
-			Buckets[Bucket].Add(FTransform(Dir.Rotation(), Pos, Scale));
+			EmitCar(Bucket, Pos, Dir);
 		}
 		NearVehicleLateralCm = MoveTemp(NextLateral);
 	}
@@ -2876,6 +3074,11 @@ void ANosimWorld::UpdateTraffic(float DeltaSeconds)
 		{
 			Isms[I]->AddInstances(Buckets[I], false, false);
 		}
+	}
+	VehicleCabins->ClearInstances();
+	if (Cabins.Num() > 0)
+	{
+		VehicleCabins->AddInstances(Cabins, false, false);
 	}
 }
 

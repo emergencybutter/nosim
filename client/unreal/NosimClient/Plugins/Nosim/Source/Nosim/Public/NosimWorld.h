@@ -186,6 +186,12 @@ private:
 	TObjectPtr<UInstancedStaticMeshComponent> TreeTrunks;
 
 	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UInstancedStaticMeshComponent> StreetLights;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UInstancedStaticMeshComponent> StreetLampHeads;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
 	TObjectPtr<UInstancedStaticMeshComponent> VehiclesFree;
 
 	UPROPERTY(VisibleAnywhere, Category = "Nosim")
@@ -193,6 +199,9 @@ private:
 
 	UPROPERTY(VisibleAnywhere, Category = "Nosim")
 	TObjectPtr<UInstancedStaticMeshComponent> VehiclesJammed;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UInstancedStaticMeshComponent> VehicleCabins;
 
 	UPROPERTY(Transient)
 	TObjectPtr<ADirectionalLight> Sun;
