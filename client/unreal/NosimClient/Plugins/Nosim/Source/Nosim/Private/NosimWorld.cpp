@@ -407,7 +407,7 @@ UTexture2D* GroundDetailTexture()
 	return Cached.Get();
 }
 
-/** Seamless tangent-space water wave normal map (256 × 256, linear RGB). */
+/** Seamless multi-directional tangent-space water wave normal map (256 × 256, linear RGB). */
 UTexture2D* WaterNormalTexture()
 {
 	static TStrongObjectPtr<UTexture2D> Cached;
@@ -419,10 +419,11 @@ UTexture2D* WaterNormalTexture()
 		auto Wave = [](float U, float V)
 		{
 			const float T = 2.f * PI;
-			return 0.42f * FMath::Sin(T * (3.f * U + 2.f * V))
-				+ 0.28f * FMath::Sin(T * (-5.f * U + 4.f * V) + 1.1f)
-				+ 0.18f * FMath::Sin(T * (9.f * U - 7.f * V) + 2.3f)
-				+ 0.12f * FMath::Cos(T * (14.f * U + 13.f * V) + 0.7f);
+			return 0.26f * FMath::Sin(T * (2.f * U + 3.f * V))
+				+ 0.24f * FMath::Sin(T * (-4.f * U + 2.f * V) + 1.1f)
+				+ 0.20f * FMath::Sin(T * (5.f * U - 6.f * V) + 2.3f)
+				+ 0.16f * FMath::Cos(T * (11.f * U + 9.f * V) + 0.7f)
+				+ 0.14f * FMath::Sin(T * (-13.f * U - 10.f * V) + 1.9f);
 		};
 		const float Eps = 1.f / Size;
 		for (int32 Y = 0; Y < Size; ++Y)
@@ -431,8 +432,51 @@ UTexture2D* WaterNormalTexture()
 			for (int32 X = 0; X < Size; ++X)
 			{
 				const float U = static_cast<float>(X) / Size;
-				const float Dx = (Wave(U + Eps, V) - Wave(U - Eps, V)) * 1.4f;
-				const float Dy = (Wave(U, V + Eps) - Wave(U, V - Eps)) * 1.4f;
+				const float Dx = (Wave(U + Eps, V) - Wave(U - Eps, V)) * 0.95f;
+				const float Dy = (Wave(U, V + Eps) - Wave(U, V - Eps)) * 0.95f;
+				const FVector N = FVector(-Dx, -Dy, 1.0).GetSafeNormal();
+				Pixels[Y * Size + X] = FColor(
+					static_cast<uint8>(FMath::Clamp(FMath::RoundToInt((N.X * 0.5 + 0.5) * 255.0), 0, 255)),
+					static_cast<uint8>(FMath::Clamp(FMath::RoundToInt((N.Y * 0.5 + 0.5) * 255.0), 0, 255)),
+					static_cast<uint8>(FMath::Clamp(FMath::RoundToInt((N.Z * 0.5 + 0.5) * 255.0), 0, 255)),
+					255);
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels, false));
+	}
+	return Cached.Get();
+}
+
+/** Tangent-space relief normal map (512 × 512) matching our 4-bay × 4-storey window/mullion grid. */
+UTexture2D* FacadeNormalTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 512;
+		constexpr int32 Cell = 128;
+		auto Height = [](int32 X, int32 Y)
+		{
+			const int32 Lx = ((X % Cell) + Cell) % Cell;
+			const int32 Ly = ((Y % Cell) + Cell) % Cell;
+			// Window pane recessed (-1.0), frame/mullion mid (-0.3), wall flush (0.0), sill/cornice proud (+0.5).
+			const bool bInWin = Lx >= 20 && Lx < 108 && Ly >= 26 && Ly < 98;
+			const bool bSill = Lx >= 16 && Lx < 112 && Ly >= 98 && Ly < 104;
+			const bool bMullion = bInWin && (Lx < 24 || Lx >= 104 || Ly < 30 || Ly >= 94 || (Lx >= 62 && Lx < 66) || (Ly >= 46 && Ly < 49));
+			if (bSill) return 0.55f;
+			if (bMullion) return -0.30f;
+			if (bInWin) return -1.0f;
+			if (Ly < 18 || Ly >= 112) return 0.25f;
+			return 0.0f;
+		};
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const float Dx = (Height(X + 1, Y) - Height(X - 1, Y)) * 0.85f;
+				const float Dy = (Height(X, Y + 1) - Height(X, Y - 1)) * 0.85f;
 				const FVector N = FVector(-Dx, -Dy, 1.0).GetSafeNormal();
 				Pixels[Y * Size + X] = FColor(
 					static_cast<uint8>(FMath::Clamp(FMath::RoundToInt((N.X * 0.5 + 0.5) * 255.0), 0, 255)),
@@ -803,7 +847,20 @@ UMaterialInterface* MakeFacadeMaterial(TStrongObjectPtr<UMaterial>& Cache, const
 		Metallic->A.Connect(0, WM);
 		Metallic->B.Connect(0, GM);
 		Metallic->Alpha.Connect(4, Tex);
-		Exprs.Append({WR, GR, Roughness, WS, GS, Specular, WM, GM, Metallic});
+		// Architectural relief normal map for recessed windows, mullions, and sills.
+		UMaterialExpressionTextureSampleParameter2D* NormTex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		NormTex->ParameterName = TEXT("FacadeNormal");
+		NormTex->Texture = FacadeNormalTexture();
+		NormTex->SamplerType = SAMPLERTYPE_LinearColor;
+		UMaterialExpressionConstant3Vector* NegOne = NewObject<UMaterialExpressionConstant3Vector>(M);
+		NegOne->Constant = FLinearColor(-1.f, -1.f, -1.f);
+		UMaterialExpressionConstant3Vector* PosOne = NewObject<UMaterialExpressionConstant3Vector>(M);
+		PosOne->Constant = FLinearColor(1.f, 1.f, 1.f);
+		UMaterialExpressionLinearInterpolate* NormalOut = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		NormalOut->A.Connect(0, NegOne);
+		NormalOut->B.Connect(0, PosOne);
+		NormalOut->Alpha.Connect(0, NormTex);
+		Exprs.Append({WR, GR, Roughness, WS, GS, Specular, WM, GM, Metallic, NormTex, NegOne, PosOne, NormalOut});
 		for (UMaterialExpression* E : Exprs)
 		{
 			M->GetExpressionCollection().AddExpression(E);
@@ -812,6 +869,7 @@ UMaterialInterface* MakeFacadeMaterial(TStrongObjectPtr<UMaterial>& Cache, const
 		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
 		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
 		M->GetEditorOnlyData()->Metallic.Connect(0, Metallic);
+		M->GetEditorOnlyData()->Normal.Connect(0, NormalOut);
 		M->PostEditChange();
 		Cache.Reset(M);
 	}
@@ -1015,9 +1073,9 @@ UTexture2D* FoliageTexture()
 				}
 			}
 		}
-		// Scatter 520 overlapping individual elliptical leaves inside an organic irregular silhouette.
+		// Scatter 950 fine overlapping elliptical leaves inside an organic irregular silhouette.
 		FRandomStream Rng(0x4C454146);
-		for (int32 L = 0; L < 520; ++L)
+		for (int32 L = 0; L < 950; ++L)
 		{
 			const float Ang = Rng.FRandRange(0.f, 2.f * PI);
 			// Irregular lobed envelope staying clear of card edges (max radius ~228 px).
@@ -1025,7 +1083,7 @@ UTexture2D* FoliageTexture()
 			const float R = FMath::Sqrt(Rng.FRand()) * 195.f * Lobe;
 			const float Cx = 256.f + FMath::Cos(Ang) * R;
 			const float Cy = 248.f + FMath::Sin(Ang) * R * 0.92f;
-			const float LeafA = Rng.FRandRange(11.f, 22.f);
+			const float LeafA = Rng.FRandRange(7.f, 14.f);
 			const float LeafB = LeafA * Rng.FRandRange(0.45f, 0.68f);
 			const float Rot = Rng.FRandRange(0.f, PI);
 			const float CosR = FMath::Cos(Rot), SinR = FMath::Sin(Rot);
@@ -1061,7 +1119,7 @@ UTexture2D* FoliageTexture()
 	return Cached.Get();
 }
 
-/** Two-sided alpha-masked leafy bough material so tree crowns have real serrated leaf silhouettes. */
+/** Two-sided subsurface-lit alpha-masked leafy bough material so backlit canopies glow naturally. */
 UMaterialInterface* FoliageMaterial()
 {
 #if WITH_EDITORONLY_DATA
@@ -1073,21 +1131,28 @@ UMaterialInterface* FoliageMaterial()
 		M->bUsedWithInstancedStaticMeshes = true;
 		PRAGMA_ENABLE_DEPRECATION_WARNINGS
 		M->BlendMode = BLEND_Masked;
+		M->SetShadingModel(MSM_TwoSidedFoliage);
 		M->TwoSided = true;
 		M->OpacityMaskClipValue = 0.45f;
 		UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
 		Tex->ParameterName = TEXT("Foliage");
 		Tex->Texture = FoliageTexture();
 		Tex->SamplerType = SAMPLERTYPE_Color;
+		UMaterialExpressionConstant* SssScale = NewObject<UMaterialExpressionConstant>(M);
+		SssScale->R = 0.55f;
+		UMaterialExpressionMultiply* Subsurface = NewObject<UMaterialExpressionMultiply>(M);
+		Subsurface->A.Connect(0, Tex);
+		Subsurface->B.Connect(0, SssScale);
 		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
-		Roughness->R = 0.88f;
+		Roughness->R = 0.85f;
 		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
-		Specular->R = 0.14f;
-		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Tex, Roughness, Specular})
+		Specular->R = 0.16f;
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Tex, SssScale, Subsurface, Roughness, Specular})
 		{
 			M->GetExpressionCollection().AddExpression(E);
 		}
 		M->GetEditorOnlyData()->BaseColor.Connect(0, Tex);
+		M->GetEditorOnlyData()->SubsurfaceColor.Connect(0, Subsurface);
 		M->GetEditorOnlyData()->OpacityMask.Connect(4, Tex);
 		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
 		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
@@ -1206,10 +1271,10 @@ ESection BuildingStyleAndPalette(const FString& Tag, double HeightM, uint64 Seed
 	}
 	// Stone / Art Deco limestone / precast concrete / industrial.
 	const FLinearColor StoneSwatches[4] = {
-		FLinearColor(0.26f, 0.24f, 0.21f), // Indiana limestone
-		FLinearColor(0.22f, 0.23f, 0.25f), // cool precast concrete
-		FLinearColor(0.29f, 0.26f, 0.22f), // warm travertine
-		FLinearColor(0.18f, 0.18f, 0.19f), // dark granite
+		FLinearColor(0.21f, 0.20f, 0.18f), // Indiana limestone
+		FLinearColor(0.19f, 0.20f, 0.22f), // cool precast concrete
+		FLinearColor(0.23f, 0.21f, 0.18f), // warm travertine
+		FLinearColor(0.15f, 0.15f, 0.16f), // dark granite
 	};
 	OutWall = StoneSwatches[Pick % 4] * FMath::Lerp(0.85f, 1.15f, U);
 	const float R = FMath::Lerp(0.10f, 0.18f, V);
@@ -2566,10 +2631,12 @@ void ANosimWorld::SpawnEnvironment()
 	}
 	if (!TActorIterator<AExponentialHeightFog>(World))
 	{
-		// The default fog is set for a small level; thin it for ten kilometres of ground.
+		// Soft aerial-perspective haze starting 250 m out so eye-level stays crisp while distant skyline fades into blue.
 		AExponentialHeightFog* Fog = World->SpawnActor<AExponentialHeightFog>(AExponentialHeightFog::StaticClass(), Origin);
-		Fog->GetComponent()->SetFogDensity(0.0025f);
-		Fog->GetComponent()->SetFogHeightFalloff(0.05f);
+		Fog->GetComponent()->SetFogDensity(0.0018f);
+		Fog->GetComponent()->SetFogHeightFalloff(0.035f);
+		Fog->GetComponent()->SetStartDistance(25000.f);
+		Fog->GetComponent()->SetFogInscatteringColor(FLinearColor(0.36f, 0.48f, 0.66f));
 	}
 }
 
