@@ -8,6 +8,7 @@
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/SkyAtmosphereComponent.h"
 #include "Components/SkyLightComponent.h"
+#include "Components/VolumetricCloudComponent.h"
 #include "Engine/DirectionalLight.h"
 #include "Engine/Engine.h"
 #include "Engine/ExponentialHeightFog.h"
@@ -18,6 +19,7 @@
 #include "GameFramework/PlayerController.h"
 #include "Materials/Material.h"
 #include "Async/ParallelFor.h"
+#include "Materials/MaterialExpressionComponentMask.h"
 #include "Materials/MaterialExpressionConstant.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
@@ -25,6 +27,7 @@
 #include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialExpressionVertexColor.h"
+#include "Materials/MaterialExpressionWorldPosition.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "Misc/CommandLine.h"
@@ -117,6 +120,8 @@ UMaterialInterface* VertexColorMaterial()
 #endif
 }
 
+UTexture2D* GroundDetailTexture();
+
 /**
  * The terrain's material where it has imagery: the `Imagery` texture's colour, scaled by
  * `Brightness`, over the land-cover vertex colour, mixed by the texture's alpha (its coverage).
@@ -145,10 +150,31 @@ UMaterialInterface* ImageryMaterial()
 		LandMix->A.Connect(0, Color);
 		LandMix->B.Connect(0, Scaled);
 		LandMix->Alpha.Connect(4, Photo); // A
+		// World-space micro-detail grain (6 m tile) so close-up grass/ground isn't a flat NAIP blur.
+		UMaterialExpressionWorldPosition* Wp = NewObject<UMaterialExpressionWorldPosition>(M);
+		UMaterialExpressionComponentMask* WpXY = NewObject<UMaterialExpressionComponentMask>(M);
+		WpXY->R = 1;
+		WpXY->G = 1;
+		WpXY->B = 0;
+		WpXY->A = 0;
+		WpXY->Input.Connect(0, Wp);
+		UMaterialExpressionConstant* DetailScale = NewObject<UMaterialExpressionConstant>(M);
+		DetailScale->R = 1.f / 600.f; // 6 m tile in cm
+		UMaterialExpressionMultiply* DetailUV = NewObject<UMaterialExpressionMultiply>(M);
+		DetailUV->A.Connect(0, WpXY);
+		DetailUV->B.Connect(0, DetailScale);
+		UMaterialExpressionTextureSampleParameter2D* DetailTex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		DetailTex->ParameterName = TEXT("Detail");
+		DetailTex->Texture = GroundDetailTexture();
+		DetailTex->SamplerType = SAMPLERTYPE_Color;
+		DetailTex->Coordinates.Connect(0, DetailUV);
+		UMaterialExpressionMultiply* LandDetailed = NewObject<UMaterialExpressionMultiply>(M);
+		LandDetailed->A.Connect(0, LandMix);
+		LandDetailed->B.Connect(0, DetailTex);
 		UMaterialExpressionConstant3Vector* WaterColor = NewObject<UMaterialExpressionConstant3Vector>(M);
 		WaterColor->Constant = FLinearColor(0.015f, 0.042f, 0.062f);
 		UMaterialExpressionLinearInterpolate* BaseColor = NewObject<UMaterialExpressionLinearInterpolate>(M);
-		BaseColor->A.Connect(0, LandMix);
+		BaseColor->A.Connect(0, LandDetailed);
 		BaseColor->B.Connect(0, WaterColor);
 		BaseColor->Alpha.Connect(4, Color); // vertex alpha = WorldCover water mask
 		UMaterialExpressionConstant* LandRough = NewObject<UMaterialExpressionConstant>(M);
@@ -176,7 +202,7 @@ UMaterialInterface* ImageryMaterial()
 		Metallic->B.Connect(0, WaterMetal);
 		Metallic->Alpha.Connect(4, Color);
 		for (UMaterialExpression* E : TArray<UMaterialExpression*>{
-			Color, Photo, Brightness, Scaled, LandMix, WaterColor, BaseColor, LandRough, WaterRough, Roughness, LandSpec, WaterSpec, Specular, LandMetal, WaterMetal, Metallic})
+			Color, Photo, Brightness, Scaled, LandMix, Wp, WpXY, DetailScale, DetailUV, DetailTex, LandDetailed, WaterColor, BaseColor, LandRough, WaterRough, Roughness, LandSpec, WaterSpec, Specular, LandMetal, WaterMetal, Metallic})
 		{
 			M->GetExpressionCollection().AddExpression(E);
 		}
@@ -306,6 +332,50 @@ uint32 Hash2D(int32 X, int32 Y, uint32 Salt)
 	uint32 H = static_cast<uint32>(X) * 374761393u + static_cast<uint32>(Y) * 668265263u + Salt * 2246822519u;
 	H = (H ^ (H >> 13)) * 1274126177u;
 	return H ^ (H >> 16);
+}
+
+/** Seamless tileable bilinear value noise in [0, 1] with period `Period`. */
+float TileNoise(float X, float Y, int32 Period, uint32 Salt)
+{
+	const int32 Ix = FMath::FloorToInt(X);
+	const int32 Iy = FMath::FloorToInt(Y);
+	const float Fx = X - Ix, Fy = Y - Iy;
+	const float Sx = Fx * Fx * (3.f - 2.f * Fx);
+	const float Sy = Fy * Fy * (3.f - 2.f * Fy);
+	auto At = [Period, Salt](int32 Px, int32 Py)
+	{
+		const int32 Wx = ((Px % Period) + Period) % Period;
+		const int32 Wy = ((Py % Period) + Period) % Period;
+		return (Hash2D(Wx, Wy, Salt) & 0xFFFFu) / 65535.f;
+	};
+	const float A = FMath::Lerp(At(Ix, Iy), At(Ix + 1, Iy), Sx);
+	const float B = FMath::Lerp(At(Ix, Iy + 1), At(Ix + 1, Iy + 1), Sx);
+	return FMath::Lerp(A, B, Sy);
+}
+
+/** Fine neutral ground detail texture (256 × 256, ~0.82..1.18 modulation) so close-up terrain has micro-grain. */
+UTexture2D* GroundDetailTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 256;
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const float N = 0.45f * TileNoise(X / 8.f, Y / 8.f, 32, 401u)
+					+ 0.35f * TileNoise(X / 3.f, Y / 3.f, 85, 409u)
+					+ 0.20f * ((Hash2D(X, Y, 419u) & 0xFF) / 255.f);
+				const uint8 V = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(192.f, 255.f, N)), 0, 255));
+				Pixels[Y * Size + X] = FColor(V, V, V, 255);
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
 }
 
 /**
@@ -839,26 +909,28 @@ UMaterialInterface* RoadAsphaltMaterial()
 #endif
 }
 
-/** Organic dappled leaf-cluster foliage texture (256 × 256) so canopy meshes never look like smooth balloons. */
+/** Smooth multi-octave dappled leaf-cluster foliage texture (512 × 512) with zero blocky texels. */
 UTexture2D* FoliageTexture()
 {
 	static TStrongObjectPtr<UTexture2D> Cached;
 	if (!Cached)
 	{
-		constexpr int32 Size = 256;
+		constexpr int32 Size = 512;
 		TArray<FColor> Pixels;
 		Pixels.SetNumUninitialized(Size * Size);
 		for (int32 Y = 0; Y < Size; ++Y)
 		{
 			for (int32 X = 0; X < Size; ++X)
 			{
-				const float Fine = (Hash2D(X, Y, 307u) & 0xFF) / 255.f;
-				const float Leaf = (Hash2D(X / 4, Y / 4, 311u) & 0xFF) / 255.f;
-				const float Clump = (Hash2D(X / 16, Y / 16, 313u) & 0xFF) / 255.f;
-				const float Shade = 0.25f * Fine + 0.45f * Leaf + 0.30f * Clump;
-				const float R = FMath::Lerp(14.f, 64.f, Shade);
-				const float G = FMath::Lerp(28.f, 102.f, Shade);
-				const float B = FMath::Lerp(10.f, 36.f, Shade);
+				const float N0 = TileNoise(X / 64.f, Y / 64.f, 8, 307u);
+				const float N1 = TileNoise(X / 16.f, Y / 16.f, 32, 311u);
+				const float N2 = TileNoise(X / 4.f, Y / 4.f, 128, 313u);
+				const float Fine = (Hash2D(X, Y, 317u) & 0xFF) / 255.f;
+				const float Shade = FMath::Clamp(0.28f * N0 + 0.36f * N1 + 0.24f * N2 + 0.12f * Fine, 0.f, 1.f);
+				// Deep olive shadow pockets to warm sunlit deciduous leaf highlights.
+				const float R = FMath::Lerp(12.f, 58.f, Shade * Shade);
+				const float G = FMath::Lerp(24.f, 92.f, Shade);
+				const float B = FMath::Lerp(8.f, 30.f, Shade * Shade);
 				Pixels[Y * Size + X] = FColor(
 					static_cast<uint8>(FMath::RoundToInt(R)),
 					static_cast<uint8>(FMath::RoundToInt(G)),
@@ -879,7 +951,9 @@ UMaterialInterface* FoliageMaterial()
 	if (!Material)
 	{
 		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimFoliage"), RF_Transient);
+		PRAGMA_DISABLE_DEPRECATION_WARNINGS
 		M->bUsedWithInstancedStaticMeshes = true;
+		PRAGMA_ENABLE_DEPRECATION_WARNINGS
 		UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
 		Tex->ParameterName = TEXT("Foliage");
 		Tex->Texture = FoliageTexture();
@@ -887,7 +961,7 @@ UMaterialInterface* FoliageMaterial()
 		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
 		Roughness->R = 0.90f;
 		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
-		Specular->R = 0.14f;
+		Specular->R = 0.12f;
 		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Tex, Roughness, Specular})
 		{
 			M->GetExpressionCollection().AddExpression(E);
@@ -904,7 +978,35 @@ UMaterialInterface* FoliageMaterial()
 #endif
 }
 
-/** Matte tree bark material for trunks. */
+/** Vertical furrowed bark texture (128 × 128) for tree trunks. */
+UTexture2D* BarkTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 128;
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const float Ridge = TileNoise(X / 4.f, Y / 32.f, 32, 331u);
+				const float Grain = (Hash2D(X, Y, 337u) & 0xFF) / 255.f;
+				const float S = 0.72f * Ridge + 0.28f * Grain;
+				Pixels[Y * Size + X] = FColor(
+					static_cast<uint8>(FMath::RoundToInt(FMath::Lerp(28.f, 68.f, S))),
+					static_cast<uint8>(FMath::RoundToInt(FMath::Lerp(20.f, 52.f, S))),
+					static_cast<uint8>(FMath::RoundToInt(FMath::Lerp(14.f, 38.f, S))),
+					255);
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
+}
+
+/** Matte furrowed bark material for trunks. */
 UMaterialInterface* BarkMaterial()
 {
 #if WITH_EDITORONLY_DATA
@@ -912,18 +1014,22 @@ UMaterialInterface* BarkMaterial()
 	if (!Material)
 	{
 		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), TEXT("NosimBark"), RF_Transient);
+		PRAGMA_DISABLE_DEPRECATION_WARNINGS
 		M->bUsedWithInstancedStaticMeshes = true;
-		UMaterialExpressionConstant3Vector* Color = NewObject<UMaterialExpressionConstant3Vector>(M);
-		Color->Constant = FLinearColor(0.048f, 0.033f, 0.022f);
+		PRAGMA_ENABLE_DEPRECATION_WARNINGS
+		UMaterialExpressionTextureSampleParameter2D* Tex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		Tex->ParameterName = TEXT("Bark");
+		Tex->Texture = BarkTexture();
+		Tex->SamplerType = SAMPLERTYPE_Color;
 		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
 		Roughness->R = 0.95f;
 		UMaterialExpressionConstant* Specular = NewObject<UMaterialExpressionConstant>(M);
-		Specular->R = 0.12f;
-		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Color, Roughness, Specular})
+		Specular->R = 0.10f;
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Tex, Roughness, Specular})
 		{
 			M->GetExpressionCollection().AddExpression(E);
 		}
-		M->GetEditorOnlyData()->BaseColor.Connect(0, Color);
+		M->GetEditorOnlyData()->BaseColor.Connect(0, Tex);
 		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
 		M->GetEditorOnlyData()->Specular.Connect(0, Specular);
 		M->PostEditChange();
@@ -1093,16 +1199,23 @@ struct FMeshBuffer
 	 * A solid from a footprint: `Rings` holds the outer ring then its holes, open, in local
 	 * centimetres. Walls go here with metric facade UVs (12.8 m × 13.6 m per tile), from
 	 * `BottomCm` to `TopCm`; the flat roof goes to `Roof` with 20 m world-space UVs.
+	 * Tall buildings also get a darker ground-floor lobby band, a rooftop mechanical penthouse,
+	 * and (above 130 m) a stepped crown/spire so skyline silhouettes aren't flat boxes.
 	 */
 	void Extrude(const TArray<TArray<FVector2D>>& Rings, double BottomCm, double TopCm, FMeshBuffer& Roof,
-		const FLinearColor& WallColor, const FLinearColor& RoofColor)
+		const FLinearColor& WallColor, const FLinearColor& RoofColor, bool bAddCrown = true)
 	{
 		using namespace UE::Geometry;
 		constexpr double TileWidthCm = 1280.0; // 4 bays × 3.2 m
 		constexpr double TileHeightCm = 1360.0; // 4 storeys × 3.4 m
 		constexpr double RoofTileCm = 2000.0; // 20 m × 20 m
+		const double HeightCm = FMath::Max(TopCm - BottomCm, 0.0);
+		const bool bHasLobby = bAddCrown && HeightCm >= 1000.0;
+		const double LobbyTopCm = bHasLobby ? BottomCm + 450.0 : BottomCm;
+		const FLinearColor LobbyColor = WallColor * 0.55f;
 		const double VTop = 0.0;
-		const double VBot = FMath::Max(TopCm - BottomCm, 0.0) / TileHeightCm;
+		const double VBot = HeightCm / TileHeightCm;
+		const double VLobby = FMath::Max(TopCm - LobbyTopCm, 0.0) / TileHeightCm;
 		for (int32 R = 0; R < Rings.Num(); ++R)
 		{
 			const TArray<FVector2D>& Ring = Rings[R];
@@ -1125,8 +1238,18 @@ struct FMeshBuffer
 				const double U1 = (DistCm + EdgeLenCm) / TileWidthCm;
 				DistCm += EdgeLenCm;
 				const FVector Normal = FVector((B.Y - A.Y) * Out, -(B.X - A.X) * Out, 0).GetSafeNormal();
-				QuadUV(FVector(A, BottomCm), FVector(B, BottomCm), FVector(B, TopCm), FVector(A, TopCm), Normal,
-					FVector2D(U0, VBot), FVector2D(U1, VBot), FVector2D(U1, VTop), FVector2D(U0, VTop), WallColor);
+				if (bHasLobby)
+				{
+					QuadUV(FVector(A, BottomCm), FVector(B, BottomCm), FVector(B, LobbyTopCm), FVector(A, LobbyTopCm), Normal,
+						FVector2D(U0, VBot), FVector2D(U1, VBot), FVector2D(U1, VLobby), FVector2D(U0, VLobby), LobbyColor);
+					QuadUV(FVector(A, LobbyTopCm), FVector(B, LobbyTopCm), FVector(B, TopCm), FVector(A, TopCm), Normal,
+						FVector2D(U0, VLobby), FVector2D(U1, VLobby), FVector2D(U1, VTop), FVector2D(U0, VTop), WallColor);
+				}
+				else
+				{
+					QuadUV(FVector(A, BottomCm), FVector(B, BottomCm), FVector(B, TopCm), FVector(A, TopCm), Normal,
+						FVector2D(U0, VBot), FVector2D(U1, VBot), FVector2D(U1, VTop), FVector2D(U0, VTop), WallColor);
+				}
 			}
 		}
 		FGeneralPolygon2d Footprint{FPolygon2d(Rings[0])};
@@ -1149,6 +1272,43 @@ struct FMeshBuffer
 					FVector2D(PA.X / RoofTileCm, PA.Y / RoofTileCm),
 					FVector2D(PB.X / RoofTileCm, PB.Y / RoofTileCm),
 					FVector2D(PC.X / RoofTileCm, PC.Y / RoofTileCm), RoofColor);
+			}
+		}
+
+		// Rooftop mechanical penthouse (>= 32 m) and stepped crown / mast (>= 130 m).
+		if (bAddCrown && HeightCm >= 3200.0 && Rings[0].Num() >= 3)
+		{
+			FVector2D Center = FVector2D::ZeroVector;
+			FBox2D Bounds(ForceInit);
+			for (const FVector2D& P : Rings[0])
+			{
+				Center += P;
+				Bounds += P;
+			}
+			Center /= Rings[0].Num();
+			const FVector2D Extent = Bounds.GetExtent();
+			if (Extent.X >= 500.0 && Extent.Y >= 500.0)
+			{
+				auto AddBox = [&](double HalfX, double HalfY, double Z0, double Z1, const FLinearColor& C)
+				{
+					TArray<TArray<FVector2D>> BoxRings;
+					BoxRings.Add({
+						Center + FVector2D(-HalfX, -HalfY),
+						Center + FVector2D(HalfX, -HalfY),
+						Center + FVector2D(HalfX, HalfY),
+						Center + FVector2D(-HalfX, HalfY),
+					});
+					Extrude(BoxRings, Z0, Z1, Roof, C, RoofColor * 0.9f, false);
+				};
+				const double PentH = FMath::Clamp(HeightCm * 0.08, 450.0, 1200.0);
+				AddBox(Extent.X * 0.42, Extent.Y * 0.42, TopCm, TopCm + PentH, WallColor * 0.85f);
+				if (HeightCm >= 13000.0)
+				{
+					const double CrownH = FMath::Clamp(HeightCm * 0.07, 900.0, 2200.0);
+					AddBox(Extent.X * 0.22, Extent.Y * 0.22, TopCm + PentH, TopCm + PentH + CrownH, WallColor * 0.92f);
+					// Slender broadcast / architectural spire mast.
+					AddBox(75.0, 75.0, TopCm + PentH + CrownH, TopCm + PentH + CrownH + 2400.0, FLinearColor(0.30f, 0.31f, 0.33f));
+				}
 			}
 		}
 	}
@@ -2262,6 +2422,10 @@ void ANosimWorld::SpawnEnvironment()
 	if (!TActorIterator<ASkyAtmosphere>(World))
 	{
 		World->SpawnActor<ASkyAtmosphere>(ASkyAtmosphere::StaticClass(), Origin);
+	}
+	if (!TActorIterator<AVolumetricCloud>(World))
+	{
+		World->SpawnActor<AVolumetricCloud>(AVolumetricCloud::StaticClass(), Origin);
 	}
 	if (!TActorIterator<ASkyLight>(World))
 	{
