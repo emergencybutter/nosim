@@ -6,6 +6,6 @@ public class Nosim : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 		PublicDependencyModuleNames.AddRange(new[] { "Core", "CoreUObject", "Engine", "ProceduralMeshComponent", "NosimLibrary" });
-		PrivateDependencyModuleNames.AddRange(new[] { "Projects", "GeometryCore", "Json" });
+		PrivateDependencyModuleNames.AddRange(new[] { "Projects", "GeometryCore", "Json", "ImageWrapper", "MeshDescription", "StaticMeshDescription" });
 	}
 }

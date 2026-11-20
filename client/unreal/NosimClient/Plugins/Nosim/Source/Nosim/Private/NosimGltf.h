@@ -2,6 +2,10 @@
 
 #include "CoreMinimal.h"
 
+class UMaterialInterface;
+class UStaticMesh;
+class UTexture2D;
+
 /** Triangles read from a glTF 2.0 binary (.glb), in glTF space: metres, Y up, +Z forward. */
 struct FNosimGltfMesh
 {
@@ -18,3 +22,12 @@ struct FNosimGltfMesh
  * the file is not a usable glTF binary.
  */
 bool LoadGlb(const FString& Path, FNosimGltfMesh& Out, FString& OutError);
+
+/**
+ * Loads a glTF 2.0 (.gltf or .glb) file with embedded or external buffers & PNG/JPEG PBR
+ * textures into a multi-material UE5 UStaticMesh (Z-up, XY centred, minZ = 0, scaled so
+ * height = TargetHeightCm when TargetHeightCm > 0). Keeps generated textures/materials alive
+ * in `KeepTextures` and `KeepMaterials`.
+ */
+UStaticMesh* LoadGltfStaticMesh(const FString& Path, UObject* Outer, double TargetHeightCm, bool bFirstRootOnly,
+	TArray<TObjectPtr<UTexture2D>>& KeepTextures, TArray<TObjectPtr<UMaterialInterface>>& KeepMaterials, FString& OutError);

@@ -146,6 +146,10 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Nosim|Display")
 	bool bShowHud = true;
 
+	/** Optional directory of glTF/GLB assets (`tree`, `grass`, `streetlight`, `bench`, `car`, `pedestrian`); also `-NosimAssetDir=...`. */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Assets")
+	FString AssetDir;
+
 	/** Optional Nanite/authored mesh overrides (leave empty to use built-in procedural meshes). */
 	UPROPERTY(EditAnywhere, Category = "Nosim|Assets")
 	TObjectPtr<class UStaticMesh> TreeMeshOverride;
@@ -246,6 +250,15 @@ private:
 
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UTexture2D>> ImageryTextures;
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UTexture2D>> LoadedAssetTextures;
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UMaterialInterface>> LoadedAssetMaterials;
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<class UStaticMesh>> LoadedAssetMeshes;
 
 	NosimPackage* Package = nullptr;
 	NosimVfs* Vfs = nullptr;

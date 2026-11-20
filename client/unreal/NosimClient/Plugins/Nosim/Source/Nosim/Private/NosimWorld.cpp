@@ -2467,6 +2467,9 @@ void ANosimWorld::BuildScene()
 	LandcoverTiles = 0;
 	ImageryTiles = 0;
 	ImageryZoom = -1;
+	LoadedAssetTextures.Reset();
+	LoadedAssetMaterials.Reset();
+	LoadedAssetMeshes.Reset();
 	ImageryTextures.Reset();
 	WorldName.Reset();
 	bCameraPlaced = false;
@@ -2524,6 +2527,57 @@ void ANosimWorld::BuildScene()
 	};
 	WorldName = World.IsEmpty() ? TEXT("no world") : FPaths::GetCleanFilename(World);
 	const FString WorldSplines = WorldFile(TEXT("splines.geoparquet"));
+
+	// Optional external glTF/GLB art assets (`-NosimAssetDir=...` or `<World>/assets`).
+	FString AssetArg;
+	FParse::Value(FCommandLine::Get(), TEXT("NosimAssetDir="), AssetArg);
+	FString AssetsRoot = AssetDir.IsEmpty() ? AssetArg : AssetDir;
+	if (AssetsRoot.IsEmpty() && !World.IsEmpty())
+	{
+		const FString Candidate = FPaths::Combine(World, TEXT("assets"));
+		if (FPaths::DirectoryExists(Candidate))
+		{
+			AssetsRoot = Candidate;
+		}
+	}
+	auto TryLoadAsset = [&](const TCHAR* Name, double TargetHeightCm, bool bFirstRootOnly, UStaticMesh* Override) -> UStaticMesh*
+	{
+		if (Override)
+		{
+			return Override;
+		}
+		if (AssetsRoot.IsEmpty() || !FPaths::DirectoryExists(AssetsRoot))
+		{
+			return nullptr;
+		}
+		const FString Candidates[4] = {
+			FPaths::Combine(AssetsRoot, Name, FString::Printf(TEXT("%s.gltf"), Name)),
+			FPaths::Combine(AssetsRoot, Name, FString::Printf(TEXT("%s.glb"), Name)),
+			FPaths::Combine(AssetsRoot, FString::Printf(TEXT("%s.gltf"), Name)),
+			FPaths::Combine(AssetsRoot, FString::Printf(TEXT("%s.glb"), Name)),
+		};
+		for (const FString& Path : Candidates)
+		{
+			if (FPaths::FileExists(Path))
+			{
+				FString Err;
+				if (UStaticMesh* Loaded = LoadGltfStaticMesh(Path, this, TargetHeightCm, bFirstRootOnly, LoadedAssetTextures, LoadedAssetMaterials, Err))
+				{
+					LoadedAssetMeshes.Add(Loaded);
+					UE_LOG(LogNosim, Log, TEXT("Loaded glTF asset %s from %s"), Name, *Path);
+					return Loaded;
+				}
+				UE_LOG(LogNosim, Warning, TEXT("Failed to load glTF asset %s (%s): %s"), Name, *Path, *Err);
+			}
+		}
+		return nullptr;
+	};
+	UStaticMesh* TreeAsset = TryLoadAsset(TEXT("tree"), 1000.0, false, TreeMeshOverride);
+	UStaticMesh* GrassAsset = TryLoadAsset(TEXT("grass"), 26.0, true, GrassMeshOverride);
+	UStaticMesh* LampAsset = TryLoadAsset(TEXT("streetlight"), 680.0, false, StreetLightMeshOverride);
+	UStaticMesh* BenchAsset = TryLoadAsset(TEXT("bench"), 82.0, false, ParkBenchMeshOverride);
+	UStaticMesh* CarAsset = TryLoadAsset(TEXT("car"), 150.0, false, VehicleMeshOverride);
+	UStaticMesh* PedAsset = TryLoadAsset(TEXT("pedestrian"), 172.0, false, PedestrianMeshOverride);
 
 	// Terrain reaches past the package bounds by the margin.
 	const double CosLat = FMath::Cos(FMath::DegreesToRadians(Anchor.lat_deg));
@@ -2966,9 +3020,16 @@ void ANosimWorld::BuildScene()
 						const FVector Pos = FMath::Lerp(A, B, AccumCm / SegCm) + Right * (G.HalfWidthCm + 55.0);
 						if (Pos.SizeSquared2D() <= NearRadCm * NearRadCm)
 						{
-							const double PoleH = 7.5; // 7.5 m tall
-							LampPoles.Add(FTransform(Rot, Pos + FVector(0, 0, G.ZOffsetCm + PoleH * 50.0), FVector(0.16, 0.16, PoleH)));
-							LampHeads.Add(FTransform(Rot, Pos - Right * 65.0 + FVector(0, 0, G.ZOffsetCm + PoleH * 100.0), FVector(0.32, 1.4, 0.16)));
+							if (LampAsset)
+							{
+								LampPoles.Add(FTransform(Rot, Pos + FVector(0, 0, G.ZOffsetCm), FVector::OneVector));
+							}
+							else
+							{
+								const double PoleH = 7.5; // 7.5 m tall
+								LampPoles.Add(FTransform(Rot, Pos + FVector(0, 0, G.ZOffsetCm + PoleH * 50.0), FVector(0.16, 0.16, PoleH)));
+								LampHeads.Add(FTransform(Rot, Pos - Right * 65.0 + FVector(0, 0, G.ZOffsetCm + PoleH * 100.0), FVector(0.32, 1.4, 0.16)));
+							}
 						}
 						AccumCm += 4500.0; // 45 m spacing
 					}
@@ -2982,8 +3043,8 @@ void ANosimWorld::BuildScene()
 							const uint32 Ph = Hash2D(static_cast<int32>(I), P * 17 + static_cast<int32>(PedAccumCm / 100.0), 719u);
 							const double Side = (Ph & 1u) ? 1.0 : -1.0;
 							const double Lat = G.HalfWidthCm + 85.0 + ((Ph >> 1) & 63);
-							const FVector PedPos = Mid + Right * (Side * Lat) + FVector(0, 0, G.ZOffsetCm + 92.0);
-							PedInstances.Add(FTransform(Rot, PedPos, FVector(0.34, 0.42, 1.72)));
+							const FVector PedPos = Mid + Right * (Side * Lat) + FVector(0, 0, G.ZOffsetCm + (PedAsset ? 0.0 : 92.0));
+							PedInstances.Add(FTransform(Rot, PedPos, PedAsset ? FVector::OneVector : FVector(0.34, 0.42, 1.72)));
 							// Park-edge benches where sidewalk borders WorldCover tree/grass cover.
 							if ((Ph & 7u) == 0u && P < G.LonLat.Num() && P + 1 < G.LonLat.Num())
 							{
@@ -2991,8 +3052,8 @@ void ANosimWorld::BuildScene()
 								const uint8 Cls = Classes.Byte(Ll.X, Ll.Y);
 								if (Cls == 10 || Cls == 30)
 								{
-									const FVector BenchPos = Mid + Right * (Side * (G.HalfWidthCm + 210.0)) + FVector(0, 0, G.ZOffsetCm + 42.0);
-									BenchInstances.Add(FTransform(Rot, BenchPos, FVector(1.80, 0.62, 0.78)));
+									const FVector BenchPos = Mid + Right * (Side * (G.HalfWidthCm + 210.0)) + FVector(0, 0, G.ZOffsetCm + (BenchAsset ? 0.0 : 42.0));
+									BenchInstances.Add(FTransform(Rot, BenchPos, BenchAsset ? FVector::OneVector : FVector(1.80, 0.62, 0.78)));
 								}
 							}
 						}
@@ -3262,12 +3323,12 @@ void ANosimWorld::BuildScene()
 		Models->SetMaterial(0, VertexColored);
 	}
 	UStaticMesh* Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
-	UStaticMesh* VehicleMesh = VehicleMeshOverride ? VehicleMeshOverride.Get() : Cube;
+	UStaticMesh* VehicleMesh = CarAsset ? CarAsset : Cube;
 	UInstancedStaticMeshComponent* Isms[3] = {VehiclesFree, VehiclesSlow, VehiclesJammed};
 	for (int32 I = 0; I < 3; ++I)
 	{
 		Isms[I]->SetStaticMesh(VehicleMesh);
-		if (!VehicleMeshOverride)
+		if (!CarAsset)
 		{
 			UMaterialInstanceDynamic* Mid = UMaterialInstanceDynamic::Create(Base, this);
 			Mid->SetVectorParameterValue(TEXT("Color"), VehicleColors[I]);
@@ -3277,25 +3338,25 @@ void ANosimWorld::BuildScene()
 	}
 	VehicleCabins->SetStaticMesh(Cube);
 	VehicleCabins->SetMaterial(0, VehicleCabinMaterial());
-	VehicleCabins->SetVisibility(!VehicleMeshOverride);
+	VehicleCabins->SetVisibility(!CarAsset);
 	UStaticMesh* CylinderMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cylinder.Cylinder"));
 	if (LampPoles.Num() > 0)
 	{
-		StreetLights->SetStaticMesh(StreetLightMeshOverride ? StreetLightMeshOverride.Get() : CylinderMesh);
-		if (!StreetLightMeshOverride)
+		StreetLights->SetStaticMesh(LampAsset ? LampAsset : CylinderMesh);
+		if (!LampAsset)
 		{
 			StreetLights->SetMaterial(0, IronPoleMaterial());
 		}
 		StreetLights->AddInstances(LampPoles, false, false);
 		StreetLampHeads->SetStaticMesh(Cube);
 		StreetLampHeads->SetMaterial(0, IronPoleMaterial());
-		StreetLampHeads->SetVisibility(!StreetLightMeshOverride);
+		StreetLampHeads->SetVisibility(!LampAsset);
 		StreetLampHeads->AddInstances(LampHeads, false, false);
 	}
 	if (BenchInstances.Num() > 0)
 	{
-		ParkBenches->SetStaticMesh(ParkBenchMeshOverride ? ParkBenchMeshOverride.Get() : Cube);
-		if (!ParkBenchMeshOverride)
+		ParkBenches->SetStaticMesh(BenchAsset ? BenchAsset : Cube);
+		if (!BenchAsset)
 		{
 			ParkBenches->SetMaterial(0, ParkBenchMaterial());
 		}
@@ -3303,8 +3364,8 @@ void ANosimWorld::BuildScene()
 	}
 	if (PedInstances.Num() > 0)
 	{
-		Pedestrians->SetStaticMesh(PedestrianMeshOverride ? PedestrianMeshOverride.Get() : CylinderMesh);
-		if (!PedestrianMeshOverride)
+		Pedestrians->SetStaticMesh(PedAsset ? PedAsset : CylinderMesh);
+		if (!PedAsset)
 		{
 			Pedestrians->SetMaterial(0, PedestrianMaterial());
 		}
@@ -3350,7 +3411,7 @@ void ANosimWorld::BuildScene()
 			const double TrunkW = Random.FRandRange(0.28f, 0.44f);
 			const FVector BasePos = GeoToLocal(Lon, Lat, G);
 			const double BaseYaw = Random.FRandRange(0.f, 360.f);
-			if (TreeMeshOverride)
+			if (TreeAsset)
 			{
 				const double S = TallM / 10.0;
 				CanopyInstances.Add(FTransform(FRotator(0.0, BaseYaw, 0.0), BasePos, FVector(S, S, S)));
@@ -3387,15 +3448,15 @@ void ANosimWorld::BuildScene()
 				CrownTop + FVector(0, 0, TallM * 8.0), FVector(WideM * 0.78, WideM * 0.74, 1.0)));
 		}
 		UStaticMesh* PlaneMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane"));
-		Trees->SetStaticMesh(TreeMeshOverride ? TreeMeshOverride.Get() : PlaneMesh);
-		if (!TreeMeshOverride)
+		Trees->SetStaticMesh(TreeAsset ? TreeAsset : PlaneMesh);
+		if (!TreeAsset)
 		{
 			Trees->SetMaterial(0, FoliageMaterial());
 		}
 		Trees->AddInstances(CanopyInstances, false, false);
 		TreeTrunks->SetStaticMesh(CylinderMesh);
 		TreeTrunks->SetMaterial(0, BarkMaterial());
-		TreeTrunks->SetVisibility(!TreeMeshOverride);
+		TreeTrunks->SetVisibility(!TreeAsset);
 		TreeTrunks->AddInstances(TrunkInstances, false, false);
 		TreeCount = static_cast<int32>(Count);
 
@@ -3423,18 +3484,26 @@ void ANosimWorld::BuildScene()
 					continue;
 				}
 				const FVector BaseP = GeoToLocal(Lon, Lat, GroundM(Lon, Lat));
-				const double H = GrassRng.FRandRange(0.15f, 0.28f);
-				const double W = GrassRng.FRandRange(0.62f, 1.05f);
-				const double Yaw = GrassRng.FRandRange(0.f, 180.f);
-				// Roll +90 deg stands the plane upright with texture V pointing up (blades grow vertically).
-				GrassInstances.Add(FTransform(FRotator(0.0, Yaw, 90.0), BaseP + FVector(0, 0, H * 44.0), FVector(W, H, 1.0)));
-				GrassInstances.Add(FTransform(FRotator(0.0, Yaw + 65.0, 90.0), BaseP + FVector(0, 0, H * 44.0), FVector(W, H, 1.0)));
+				const double Yaw = GrassRng.FRandRange(0.f, 360.f);
+				if (GrassAsset)
+				{
+					const double S = GrassRng.FRandRange(0.85f, 1.45f);
+					GrassInstances.Add(FTransform(FRotator(0.0, Yaw, 0.0), BaseP, FVector(S, S, S)));
+				}
+				else
+				{
+					const double H = GrassRng.FRandRange(0.15f, 0.28f);
+					const double W = GrassRng.FRandRange(0.62f, 1.05f);
+					// Roll +90 deg stands the plane upright with texture V pointing up (blades grow vertically).
+					GrassInstances.Add(FTransform(FRotator(0.0, Yaw, 90.0), BaseP + FVector(0, 0, H * 44.0), FVector(W, H, 1.0)));
+					GrassInstances.Add(FTransform(FRotator(0.0, Yaw + 65.0, 90.0), BaseP + FVector(0, 0, H * 44.0), FVector(W, H, 1.0)));
+				}
 			}
 		}
 		if (GrassInstances.Num() > 0)
 		{
-			Grass->SetStaticMesh(GrassMeshOverride ? GrassMeshOverride.Get() : PlaneMesh);
-			if (!GrassMeshOverride)
+			Grass->SetStaticMesh(GrassAsset ? GrassAsset : PlaneMesh);
+			if (!GrassAsset)
 			{
 				Grass->SetMaterial(0, GrassMaterial());
 			}
