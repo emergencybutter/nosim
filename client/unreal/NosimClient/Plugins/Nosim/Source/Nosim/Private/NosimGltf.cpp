@@ -457,23 +457,27 @@ FGltfTexTransform ParseTexInfo(const TSharedPtr<FJsonObject>& TexInfo, int32& Ou
 
 UMaterialInterface* MakeGltfMaterial(UTexture2D* BaseTex, UTexture2D* NormalTex, const FLinearColor& Factor,
 	float MetallicVal, float RoughnessVal, bool bMasked, float AlphaCutoff, bool bDoubleSided,
-	const FGltfTexTransform& BaseXf, const FGltfTexTransform& NormXf)
+	const FGltfTexTransform& BaseXf, const FGltfTexTransform& NormXf, bool bFoliageSss = false)
 {
 #if WITH_EDITORONLY_DATA
 	UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), NAME_None, RF_Transient);
 	PRAGMA_DISABLE_DEPRECATION_WARNINGS
 	M->bUsedWithInstancedStaticMeshes = true;
 	PRAGMA_ENABLE_DEPRECATION_WARNINGS
-	M->TwoSided = bDoubleSided || bMasked;
+	M->TwoSided = bDoubleSided || bMasked || bFoliageSss;
 	if (bMasked)
 	{
 		M->BlendMode = BLEND_Masked;
 		M->SetShadingModel(MSM_TwoSidedFoliage);
 		M->OpacityMaskClipValue = FMath::Clamp(AlphaCutoff, 0.25f, 0.75f);
 	}
+	else if (bFoliageSss)
+	{
+		M->SetShadingModel(MSM_TwoSidedFoliage);
+	}
 	TArray<UMaterialExpression*> Exprs;
 	UMaterialExpressionConstant3Vector* FacExpr = NewObject<UMaterialExpressionConstant3Vector>(M);
-	FacExpr->Constant = Factor;
+	FacExpr->Constant = bFoliageSss ? (Factor * 1.45f) : Factor;
 	Exprs.Add(FacExpr);
 	UMaterialExpression* BaseOut = FacExpr;
 	if (BaseTex)
@@ -495,8 +499,11 @@ UMaterialInterface* MakeGltfMaterial(UTexture2D* BaseTex, UTexture2D* NormalTex,
 		if (bMasked)
 		{
 			M->GetEditorOnlyData()->OpacityMask.Connect(4, Tex);
+		}
+		if (bMasked || bFoliageSss)
+		{
 			UMaterialExpressionConstant* SssScale = NewObject<UMaterialExpressionConstant>(M);
-			SssScale->R = 0.25f;
+			SssScale->R = bFoliageSss ? 0.42f : 0.25f;
 			UMaterialExpressionMultiply* Sss = NewObject<UMaterialExpressionMultiply>(M);
 			Sss->A.Connect(0, Mul);
 			Sss->B.Connect(0, SssScale);
@@ -547,7 +554,8 @@ UMaterialInterface* MakeGltfMaterial(UTexture2D* BaseTex, UTexture2D* NormalTex,
 } // namespace
 
 UStaticMesh* LoadGltfStaticMesh(const FString& Path, UObject* Outer, double TargetHeightCm, bool bFirstRootOnly,
-	TArray<TObjectPtr<UTexture2D>>& KeepTextures, TArray<TObjectPtr<UMaterialInterface>>& KeepMaterials, FString& OutError)
+	TArray<TObjectPtr<UTexture2D>>& KeepTextures, TArray<TObjectPtr<UMaterialInterface>>& KeepMaterials, FString& OutError,
+	bool bFoliageSss)
 {
 	TArray<uint8> FileBytes;
 	if (!FFileHelper::LoadFileToArray(FileBytes, *Path))
@@ -712,7 +720,7 @@ UStaticMesh* LoadGltfStaticMesh(const FString& Path, UObject* Outer, double Targ
 		}
 		UTexture2D* BaseTex = LoadTexByIndex(BaseTexIdx, true);
 		UTexture2D* NormTex = LoadTexByIndex(NormTexIdx, false);
-		UMaterialInterface* Mat = MakeGltfMaterial(BaseTex, NormTex, Factor, Metal, Rough, bMasked, Cutoff, bDouble, BaseXf, NormXf);
+		UMaterialInterface* Mat = MakeGltfMaterial(BaseTex, NormTex, Factor, Metal, Rough, bMasked, Cutoff, bDouble, BaseXf, NormXf, bFoliageSss);
 		KeepMaterials.Add(Mat);
 		BuiltMaterials.Add(Mat);
 	}

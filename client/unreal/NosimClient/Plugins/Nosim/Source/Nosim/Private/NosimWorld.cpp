@@ -468,10 +468,10 @@ UTexture2D* ParkTurfTexture()
 				const float Clump = TileNoise(X / 6.f, Y / 6.f, 43, 811u);
 				const float Blade = (Hash2D(X, Y, 821u) & 0xFF) / 255.f;
 				const float S = 0.35f * Patch + 0.35f * Clump + 0.30f * Blade;
-				const bool bSoil = (Clump < 0.24f) && (Blade < 0.38f);
-				const float R = bSoil ? FMath::Lerp(48.f, 68.f, Blade) : FMath::Lerp(34.f, 74.f, S);
-				const float G = bSoil ? FMath::Lerp(44.f, 60.f, Blade) : FMath::Lerp(54.f, 108.f, S);
-				const float B = bSoil ? FMath::Lerp(30.f, 42.f, Blade) : FMath::Lerp(22.f, 42.f, S);
+				const bool bSoil = (Clump < 0.28f) && (Blade < 0.42f);
+				const float R = bSoil ? FMath::Lerp(32.f, 48.f, Blade) : FMath::Lerp(24.f, 54.f, S);
+				const float G = bSoil ? FMath::Lerp(32.f, 44.f, Blade) : FMath::Lerp(40.f, 78.f, S);
+				const float B = bSoil ? FMath::Lerp(20.f, 30.f, Blade) : FMath::Lerp(16.f, 30.f, S);
 				Pixels[Y * Size + X] = FColor(
 					static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(R), 0, 255)),
 					static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(G), 0, 255)),
@@ -2540,7 +2540,7 @@ void ANosimWorld::BuildScene()
 			AssetsRoot = Candidate;
 		}
 	}
-	auto TryLoadAsset = [&](const TCHAR* Name, double TargetHeightCm, bool bFirstRootOnly, UStaticMesh* Override) -> UStaticMesh*
+	auto TryLoadAsset = [&](const TCHAR* Name, double TargetHeightCm, bool bFirstRootOnly, UStaticMesh* Override, bool bFoliageSss = false) -> UStaticMesh*
 	{
 		if (Override)
 		{
@@ -2561,7 +2561,7 @@ void ANosimWorld::BuildScene()
 			if (FPaths::FileExists(Path))
 			{
 				FString Err;
-				if (UStaticMesh* Loaded = LoadGltfStaticMesh(Path, this, TargetHeightCm, bFirstRootOnly, LoadedAssetTextures, LoadedAssetMaterials, Err))
+				if (UStaticMesh* Loaded = LoadGltfStaticMesh(Path, this, TargetHeightCm, bFirstRootOnly, LoadedAssetTextures, LoadedAssetMaterials, Err, bFoliageSss))
 				{
 					LoadedAssetMeshes.Add(Loaded);
 					UE_LOG(LogNosim, Log, TEXT("Loaded glTF asset %s from %s"), Name, *Path);
@@ -2573,7 +2573,7 @@ void ANosimWorld::BuildScene()
 		return nullptr;
 	};
 	UStaticMesh* TreeAsset = TryLoadAsset(TEXT("tree"), 1000.0, false, TreeMeshOverride);
-	UStaticMesh* GrassAsset = TryLoadAsset(TEXT("grass"), 26.0, true, GrassMeshOverride);
+	UStaticMesh* GrassAsset = TryLoadAsset(TEXT("grass"), 20.0, true, GrassMeshOverride, true);
 	UStaticMesh* LampAsset = TryLoadAsset(TEXT("streetlight"), 680.0, false, StreetLightMeshOverride);
 	UStaticMesh* BenchAsset = TryLoadAsset(TEXT("bench"), 82.0, false, ParkBenchMeshOverride);
 	UStaticMesh* CarAsset = TryLoadAsset(TEXT("car"), 150.0, false, VehicleMeshOverride);
@@ -3460,10 +3460,10 @@ void ANosimWorld::BuildScene()
 		TreeTrunks->AddInstances(TrunkInstances, false, false);
 		TreeCount = static_cast<int32>(Count);
 
-		// Dense 3D grass carpet across nearby park/grassland/tree-cover ground (1.15 m jittered grid within 420 m, culled at 140 m).
+		// Continuous interlocking 3D grass carpet across nearby park/grassland/tree-cover ground (within 420 m, culled at 140 m).
 		TArray<FTransform> GrassInstances;
 		constexpr double GrassRadM = 420.0;
-		constexpr double GrassStepM = 1.15;
+		const double GrassStepM = GrassAsset ? 0.65 : 1.15;
 		const int32 GridSteps = FMath::CeilToInt32(2.0 * GrassRadM / GrassStepM);
 		const double LatPerM = 1.0 / 111320.0;
 		const double LonPerM = LatPerM / CosLat;
@@ -3487,8 +3487,9 @@ void ANosimWorld::BuildScene()
 				const double Yaw = GrassRng.FRandRange(0.f, 360.f);
 				if (GrassAsset)
 				{
-					const double S = GrassRng.FRandRange(0.85f, 1.45f);
-					GrassInstances.Add(FTransform(FRotator(0.0, Yaw, 0.0), BaseP, FVector(S, S, S)));
+					const double W = GrassRng.FRandRange(2.10f, 2.85f);
+					const double H = GrassRng.FRandRange(0.65f, 1.05f);
+					GrassInstances.Add(FTransform(FRotator(0.0, Yaw, 0.0), BaseP - FVector(0, 0, 2.0), FVector(W, W, H)));
 				}
 				else
 				{

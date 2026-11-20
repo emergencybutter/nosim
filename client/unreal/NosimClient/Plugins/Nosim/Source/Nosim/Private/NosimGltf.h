@@ -30,4 +30,5 @@ bool LoadGlb(const FString& Path, FNosimGltfMesh& Out, FString& OutError);
  * in `KeepTextures` and `KeepMaterials`.
  */
 UStaticMesh* LoadGltfStaticMesh(const FString& Path, UObject* Outer, double TargetHeightCm, bool bFirstRootOnly,
-	TArray<TObjectPtr<UTexture2D>>& KeepTextures, TArray<TObjectPtr<UMaterialInterface>>& KeepMaterials, FString& OutError);
+	TArray<TObjectPtr<UTexture2D>>& KeepTextures, TArray<TObjectPtr<UMaterialInterface>>& KeepMaterials, FString& OutError,
+	bool bFoliageSss = false);
