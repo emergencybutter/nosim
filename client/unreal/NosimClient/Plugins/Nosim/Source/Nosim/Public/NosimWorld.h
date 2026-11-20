@@ -142,6 +142,29 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Nosim|Sun")
 	bool bSpawnEnvironment = true;
 
+	/** Draw the on-screen status HUD (also suppressed by `-NosimHideHud`). */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Display")
+	bool bShowHud = true;
+
+	/** Optional Nanite/authored mesh overrides (leave empty to use built-in procedural meshes). */
+	UPROPERTY(EditAnywhere, Category = "Nosim|Assets")
+	TObjectPtr<class UStaticMesh> TreeMeshOverride;
+
+	UPROPERTY(EditAnywhere, Category = "Nosim|Assets")
+	TObjectPtr<class UStaticMesh> GrassMeshOverride;
+
+	UPROPERTY(EditAnywhere, Category = "Nosim|Assets")
+	TObjectPtr<class UStaticMesh> VehicleMeshOverride;
+
+	UPROPERTY(EditAnywhere, Category = "Nosim|Assets")
+	TObjectPtr<class UStaticMesh> StreetLightMeshOverride;
+
+	UPROPERTY(EditAnywhere, Category = "Nosim|Assets")
+	TObjectPtr<class UStaticMesh> ParkBenchMeshOverride;
+
+	UPROPERTY(EditAnywhere, Category = "Nosim|Assets")
+	TObjectPtr<class UStaticMesh> PedestrianMeshOverride;
+
 	/** Reloads the package and rebuilds everything. */
 	UFUNCTION(CallInEditor, Category = "Nosim")
 	void Rebuild();

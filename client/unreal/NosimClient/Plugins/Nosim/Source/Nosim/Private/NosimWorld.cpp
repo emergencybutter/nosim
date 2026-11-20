@@ -20,12 +20,15 @@
 #include "GameFramework/PlayerController.h"
 #include "Materials/Material.h"
 #include "Async/ParallelFor.h"
+#include "Materials/MaterialExpressionClamp.h"
 #include "Materials/MaterialExpressionComponentMask.h"
 #include "Materials/MaterialExpressionConstant.h"
 #include "Materials/MaterialExpressionConstant3Vector.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionMultiply.h"
+#include "Materials/MaterialExpressionOneMinus.h"
 #include "Materials/MaterialExpressionScalarParameter.h"
+#include "Materials/MaterialExpressionSubtract.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialExpressionVertexColor.h"
 #include "Materials/MaterialExpressionWorldPosition.h"
@@ -59,6 +62,7 @@ enum ESection : int32
 	S_BuildingGlass,
 	S_BuildingStone,
 	S_BuildingBrick,
+	S_Storefront,
 	S_Roof,
 	S_Water,
 	S_SectionCount
@@ -75,6 +79,7 @@ const FLinearColor SectionColors[S_SectionCount] = {
 	FLinearColor(0.18f, 0.24f, 0.30f), // glass curtain-wall towers
 	FLinearColor(0.24f, 0.23f, 0.21f), // stone / concrete facades
 	FLinearColor(0.22f, 0.14f, 0.11f), // brick / residential facades
+	FLinearColor(0.14f, 0.13f, 0.12f), // ground-floor storefronts & lobbies
 	FLinearColor(0.15f, 0.15f, 0.16f), // roofs
 	FLinearColor(0.022f, 0.055f, 0.072f), // water
 };
@@ -91,7 +96,7 @@ FLinearColor LandcoverColor(uint8 Class)
 	case 50: return FLinearColor(0.11f, 0.105f, 0.10f); // built-up
 	case 60: return FLinearColor(0.20f, 0.17f, 0.12f); // bare / sparse vegetation
 	case 70: return FLinearColor(0.80f, 0.82f, 0.85f); // snow and ice
-	case 80: return FLinearColor(0.012f, 0.03f, 0.05f); // permanent water
+	case 80: return FLinearColor(0.025f, 0.025f, 0.055f); // permanent water (G == R so park-turf mask stays 0 at shoreline)
 	case 90: return FLinearColor(0.05f, 0.08f, 0.04f); // herbaceous wetland
 	case 95: return FLinearColor(0.02f, 0.05f, 0.03f); // mangroves
 	case 100: return FLinearColor(0.12f, 0.12f, 0.08f); // moss and lichen
@@ -124,6 +129,7 @@ UMaterialInterface* VertexColorMaterial()
 }
 
 UTexture2D* GroundDetailTexture();
+UTexture2D* ParkTurfTexture();
 UTexture2D* WaterNormalTexture();
 
 /**
@@ -175,10 +181,43 @@ UMaterialInterface* ImageryMaterial()
 		UMaterialExpressionMultiply* LandDetailed = NewObject<UMaterialExpressionMultiply>(M);
 		LandDetailed->A.Connect(0, LandMix);
 		LandDetailed->B.Connect(0, DetailTex);
+		// High-frequency park turf blend (3.2 m tile) on WorldCover tree/grass vertices (G > R, non-water)
+		// so close-up park lawns look like real grass & soil instead of blurry aerial pixels.
+		UMaterialExpressionConstant* TurfScale = NewObject<UMaterialExpressionConstant>(M);
+		TurfScale->R = 1.f / 320.f;
+		UMaterialExpressionMultiply* TurfUV = NewObject<UMaterialExpressionMultiply>(M);
+		TurfUV->A.Connect(0, WpXY);
+		TurfUV->B.Connect(0, TurfScale);
+		UMaterialExpressionTextureSampleParameter2D* TurfTex = NewObject<UMaterialExpressionTextureSampleParameter2D>(M);
+		TurfTex->ParameterName = TEXT("ParkTurf");
+		TurfTex->Texture = ParkTurfTexture();
+		TurfTex->SamplerType = SAMPLERTYPE_Color;
+		TurfTex->Coordinates.Connect(0, TurfUV);
+		UMaterialExpressionSubtract* GreenMinusRed = NewObject<UMaterialExpressionSubtract>(M);
+		GreenMinusRed->A.Connect(2, Color); // G
+		GreenMinusRed->B.Connect(1, Color); // R
+		UMaterialExpressionConstant* TurfGain = NewObject<UMaterialExpressionConstant>(M);
+		TurfGain->R = 30.f;
+		UMaterialExpressionMultiply* RawParkMask = NewObject<UMaterialExpressionMultiply>(M);
+		RawParkMask->A.Connect(0, GreenMinusRed);
+		RawParkMask->B.Connect(0, TurfGain);
+		UMaterialExpressionClamp* ClampedPark = NewObject<UMaterialExpressionClamp>(M);
+		ClampedPark->Input.Connect(0, RawParkMask);
+		ClampedPark->MinDefault = 0.f;
+		ClampedPark->MaxDefault = 0.72f;
+		UMaterialExpressionOneMinus* NotWater = NewObject<UMaterialExpressionOneMinus>(M);
+		NotWater->Input.Connect(4, Color);
+		UMaterialExpressionMultiply* ParkMask = NewObject<UMaterialExpressionMultiply>(M);
+		ParkMask->A.Connect(0, ClampedPark);
+		ParkMask->B.Connect(0, NotWater);
+		UMaterialExpressionLinearInterpolate* LandWithTurf = NewObject<UMaterialExpressionLinearInterpolate>(M);
+		LandWithTurf->A.Connect(0, LandDetailed);
+		LandWithTurf->B.Connect(0, TurfTex);
+		LandWithTurf->Alpha.Connect(0, ParkMask);
 		UMaterialExpressionConstant3Vector* WaterColor = NewObject<UMaterialExpressionConstant3Vector>(M);
 		WaterColor->Constant = FLinearColor(0.015f, 0.042f, 0.062f);
 		UMaterialExpressionLinearInterpolate* BaseColor = NewObject<UMaterialExpressionLinearInterpolate>(M);
-		BaseColor->A.Connect(0, LandDetailed);
+		BaseColor->A.Connect(0, LandWithTurf);
 		BaseColor->B.Connect(0, WaterColor);
 		BaseColor->Alpha.Connect(4, Color); // vertex alpha = WorldCover water mask
 		UMaterialExpressionConstant* LandRough = NewObject<UMaterialExpressionConstant>(M);
@@ -231,7 +270,9 @@ UMaterialInterface* ImageryMaterial()
 		NormalOut->B.Connect(0, WaterNorm);
 		NormalOut->Alpha.Connect(4, Color);
 		for (UMaterialExpression* E : TArray<UMaterialExpression*>{
-			Color, Photo, Brightness, Scaled, LandMix, Wp, WpXY, DetailScale, DetailUV, DetailTex, LandDetailed, WaterColor, BaseColor,
+			Color, Photo, Brightness, Scaled, LandMix, Wp, WpXY, DetailScale, DetailUV, DetailTex, LandDetailed,
+			TurfScale, TurfUV, TurfTex, GreenMinusRed, TurfGain, RawParkMask, ClampedPark, NotWater, ParkMask, LandWithTurf,
+			WaterColor, BaseColor,
 			LandRough, WaterRough, Roughness, LandSpec, WaterSpec, Specular, LandMetal, WaterMetal, Metallic,
 			WaterScale, WaterUV, WaterNormTex, NegOne, PosOne, WaterNorm, FlatNorm, NormalOut})
 		{
@@ -403,6 +444,39 @@ UTexture2D* GroundDetailTexture()
 					+ 0.20f * ((Hash2D(X, Y, 419u) & 0xFF) / 255.f);
 				const uint8 V = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(FMath::Lerp(192.f, 255.f, N)), 0, 255));
 				Pixels[Y * Size + X] = FColor(V, V, V, 255);
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
+}
+
+/** High-frequency seamless park turf texture (256 × 256, 3.2 m tile) with fine grass blades and soil specks. */
+UTexture2D* ParkTurfTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 256;
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const float Patch = TileNoise(X / 24.f, Y / 24.f, 11, 809u);
+				const float Clump = TileNoise(X / 6.f, Y / 6.f, 43, 811u);
+				const float Blade = (Hash2D(X, Y, 821u) & 0xFF) / 255.f;
+				const float S = 0.35f * Patch + 0.35f * Clump + 0.30f * Blade;
+				const bool bSoil = (Clump < 0.24f) && (Blade < 0.38f);
+				const float R = bSoil ? FMath::Lerp(48.f, 68.f, Blade) : FMath::Lerp(34.f, 74.f, S);
+				const float G = bSoil ? FMath::Lerp(44.f, 60.f, Blade) : FMath::Lerp(54.f, 108.f, S);
+				const float B = bSoil ? FMath::Lerp(30.f, 42.f, Blade) : FMath::Lerp(22.f, 42.f, S);
+				Pixels[Y * Size + X] = FColor(
+					static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(R), 0, 255)),
+					static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(G), 0, 255)),
+					static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(B), 0, 255)),
+					255);
 			}
 		}
 		Cached.Reset(MakeTilingTexture(Size, Pixels));
@@ -901,6 +975,77 @@ UMaterialInterface* BuildingBrickMaterial()
 {
 	static TStrongObjectPtr<UMaterial> Material;
 	return MakeFacadeMaterial(Material, TEXT("NosimBuildingBrick"), BrickFacadeTexture(), false, 0.90f, 0.16f, 0.30f, 0.80f, 0.0f, 0.08f);
+}
+
+/**
+ * Tileable ground-floor NYC storefront / lobby facade (512 × 256, covering 12.8 m × 4.8 m).
+ * Dark bronze/granite piers, top transom/awning band, and tall warm-lit display glass bays.
+ */
+UTexture2D* StorefrontFacadeTexture()
+{
+	static TStrongObjectPtr<UTexture2D> Cached;
+	if (!Cached)
+	{
+		constexpr int32 Size = 512;
+		constexpr int32 Bay = 128;
+		TArray<FColor> Pixels;
+		Pixels.SetNumUninitialized(Size * Size);
+		for (int32 Y = 0; Y < Size; ++Y)
+		{
+			for (int32 X = 0; X < Size; ++X)
+			{
+				const int32 Col = X / Bay;
+				const int32 Lx = X % Bay;
+				const float Grain = ((Hash2D(X, Y, 907u) & 0xFF) / 255.f - 0.5f) * 10.f;
+				const bool bCornice = Y < 46;
+				const bool bSignBand = Y >= 46 && Y < 88;
+				const bool bPlinth = Y >= 468;
+				const bool bPier = Lx < 14 || Lx >= 114;
+				const bool bMullion = (Lx >= 62 && Lx < 66) || (Y >= 140 && Y < 146);
+				if (bCornice || bPlinth || bPier)
+				{
+					const float V = (bCornice ? 72.f : bPlinth ? 56.f : 86.f) + Grain;
+					const uint8 C = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(V), 0, 255));
+					Pixels[Y * Size + X] = FColor(C, static_cast<uint8>(FMath::Max(C - 2, 0)), static_cast<uint8>(FMath::Max(C - 4, 0)), 0);
+				}
+				else if (bSignBand)
+				{
+					const uint32 Sh = Hash2D(Col, 1, 911u);
+					const float Base = 36.f + ((Sh & 31) * 1.5f) + Grain * 0.4f;
+					const uint8 C = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(Base), 0, 255));
+					Pixels[Y * Size + X] = FColor(C, C, static_cast<uint8>(FMath::Min(C + 6, 255)), 40);
+				}
+				else if (bMullion)
+				{
+					const uint8 C = static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(42.f + Grain * 0.3f), 0, 255));
+					Pixels[Y * Size + X] = FColor(C, C, C, 0);
+				}
+				else
+				{
+					const uint32 Wh = Hash2D(Col, 2, 919u);
+					const float T = static_cast<float>(Y - 88) / 380.f;
+					const bool bWarmShop = (Wh & 3u) != 0u;
+					const float Glow = bWarmShop ? FMath::Lerp(0.45f, 1.0f, 1.f - FMath::Abs(T - 0.55f) * 1.4f) : 0.25f;
+					const float R = 32.f + (bWarmShop ? 92.f * Glow : 18.f);
+					const float G = 38.f + (bWarmShop ? 74.f * Glow : 24.f);
+					const float B = 48.f + (bWarmShop ? 42.f * Glow : 36.f);
+					Pixels[Y * Size + X] = FColor(
+						static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(R), 0, 255)),
+						static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(G), 0, 255)),
+						static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(B), 0, 255)),
+						255);
+				}
+			}
+		}
+		Cached.Reset(MakeTilingTexture(Size, Pixels));
+	}
+	return Cached.Get();
+}
+
+UMaterialInterface* StorefrontMaterial()
+{
+	static TStrongObjectPtr<UMaterial> Material;
+	return MakeFacadeMaterial(Material, TEXT("NosimStorefront"), StorefrontFacadeTexture(), false, 0.72f, 0.08f, 0.45f, 0.95f, 0.15f, 0.22f);
 }
 
 /** Procedural glossy estuarine water material with world-space wave normals for outer sea/water planes. */
@@ -1841,7 +1986,7 @@ struct FMeshBuffer
 	 */
 	void Extrude(const TArray<TArray<FVector2D>>& Rings, double BottomCm, double TopCm, FMeshBuffer& Roof,
 		const FLinearColor& WallColor, const FLinearColor& RoofColor, bool bAddCrown = true, bool bHasGroundLobby = true,
-		const FOsmRoof& OsmRoof = FOsmRoof())
+		const FOsmRoof& OsmRoof = FOsmRoof(), FMeshBuffer* Storefront = nullptr)
 	{
 		using namespace UE::Geometry;
 		constexpr double TileWidthCm = 1280.0; // 4 bays × 3.2 m
@@ -1931,8 +2076,16 @@ struct FMeshBuffer
 				if (bHasLobby && TopA > LobbyTopCm + 10.0 && TopB > LobbyTopCm + 10.0)
 				{
 					const double VLob = FMath::Max(TopCm - LobbyTopCm, 0.0) / TileHeightCm;
-					QuadUV(FVector(A, BottomCm), FVector(B, BottomCm), FVector(B, LobbyTopCm), FVector(A, LobbyTopCm), Normal,
-						FVector2D(U0, VBot), FVector2D(U1, VBot), FVector2D(U1, VLob), FVector2D(U0, VLob), LobbyColor);
+					if (Storefront)
+					{
+						Storefront->QuadUV(FVector(A, BottomCm), FVector(B, BottomCm), FVector(B, LobbyTopCm), FVector(A, LobbyTopCm), Normal,
+							FVector2D(U0, 1.0), FVector2D(U1, 1.0), FVector2D(U1, 0.0), FVector2D(U0, 0.0), WallColor * 0.72f);
+					}
+					else
+					{
+						QuadUV(FVector(A, BottomCm), FVector(B, BottomCm), FVector(B, LobbyTopCm), FVector(A, LobbyTopCm), Normal,
+							FVector2D(U0, VBot), FVector2D(U1, VBot), FVector2D(U1, VLob), FVector2D(U0, VLob), LobbyColor);
+					}
 					QuadUV(FVector(A, LobbyTopCm), FVector(B, LobbyTopCm), FVector(B, TopB), FVector(A, TopA), Normal,
 						FVector2D(U0, VLob), FVector2D(U1, VLob), FVector2D(U1, VTopB), FVector2D(U0, VTopA), WallColor);
 				}
@@ -1940,6 +2093,12 @@ struct FMeshBuffer
 				{
 					QuadUV(FVector(A, BottomCm), FVector(B, BottomCm), FVector(B, TopB), FVector(A, TopA), Normal,
 						FVector2D(U0, VBot), FVector2D(U1, VBot), FVector2D(U1, VTopB), FVector2D(U0, VTopA), WallColor);
+				}
+				// 0.9 m raised rooftop parapet lip around flat roofs on buildings >= 15 m.
+				if (R == 0 && OsmRoof.Shape == ERoofShape::Flat && HeightCm >= 1500.0)
+				{
+					Roof.QuadUV(FVector(A, TopCm), FVector(B, TopCm), FVector(B, TopCm + 90.0), FVector(A, TopCm + 90.0), Normal,
+						FVector2D(U0, 0.05), FVector2D(U1, 0.05), FVector2D(U1, 0.0), FVector2D(U0, 0.0), RoofColor * 0.85f);
 				}
 			}
 		}
@@ -2769,6 +2928,15 @@ void ANosimWorld::BuildScene()
 		}
 		else
 		{
+			const bool bWalkway = Class == TEXT("footway") || Class == TEXT("path") || Class == TEXT("pedestrian")
+				|| Class == TEXT("steps") || Class == TEXT("cycleway");
+			if (bWalkway)
+			{
+				G.ZOffsetCm = (S.bridge ? 50.0 : 9.0) + FMath::Clamp(S.layer, -2, 5) * 2.0;
+				const double PathHalfCm = FMath::Clamp(G.HalfWidthCm, 90.0, 180.0);
+				Mesh[S_Sidewalk].Ribbon(G.Local, PathHalfCm, 0, G.ZOffsetCm);
+				continue;
+			}
 			G.ZOffsetCm = (S.bridge ? 60.0 : 12.0) + FMath::Clamp(S.layer, -2, 5) * 2.0;
 			// Always draw roads and bridges as crisp dark asphalt so street-level views don't rely on blurry aerial pixels.
 			Mesh[S_Road].Ribbon(G.Local, G.HalfWidthCm, 0, G.ZOffsetCm);
@@ -2942,7 +3110,7 @@ void ANosimWorld::BuildScene()
 				{
 					if (Rings.Num() > 0)
 					{
-						Mesh[Style].Extrude(Rings, BottomCm, TopCm, Mesh[S_Roof], WallColor, RoofColor, !bIsParts, Info.min_height_m <= 0.1, OsmRoof);
+						Mesh[Style].Extrude(Rings, BottomCm, TopCm, Mesh[S_Roof], WallColor, RoofColor, !bIsParts, Info.min_height_m <= 0.1, OsmRoof, &Mesh[S_Storefront]);
 					}
 				}
 				++BuildingCount;
@@ -3038,6 +3206,10 @@ void ANosimWorld::BuildScene()
 		{
 			Scenery->SetMaterial(I, BuildingBrickMaterial());
 		}
+		else if (I == S_Storefront)
+		{
+			Scenery->SetMaterial(I, StorefrontMaterial());
+		}
 		else if (I == S_Roof)
 		{
 			Scenery->SetMaterial(I, BuildingRoofMaterial());
@@ -3090,37 +3262,52 @@ void ANosimWorld::BuildScene()
 		Models->SetMaterial(0, VertexColored);
 	}
 	UStaticMesh* Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+	UStaticMesh* VehicleMesh = VehicleMeshOverride ? VehicleMeshOverride.Get() : Cube;
 	UInstancedStaticMeshComponent* Isms[3] = {VehiclesFree, VehiclesSlow, VehiclesJammed};
 	for (int32 I = 0; I < 3; ++I)
 	{
-		Isms[I]->SetStaticMesh(Cube);
-		UMaterialInstanceDynamic* Mid = UMaterialInstanceDynamic::Create(Base, this);
-		Mid->SetVectorParameterValue(TEXT("Color"), VehicleColors[I]);
-		Isms[I]->SetMaterial(0, Mid);
-		Materials.Add(Mid);
+		Isms[I]->SetStaticMesh(VehicleMesh);
+		if (!VehicleMeshOverride)
+		{
+			UMaterialInstanceDynamic* Mid = UMaterialInstanceDynamic::Create(Base, this);
+			Mid->SetVectorParameterValue(TEXT("Color"), VehicleColors[I]);
+			Isms[I]->SetMaterial(0, Mid);
+			Materials.Add(Mid);
+		}
 	}
 	VehicleCabins->SetStaticMesh(Cube);
 	VehicleCabins->SetMaterial(0, VehicleCabinMaterial());
+	VehicleCabins->SetVisibility(!VehicleMeshOverride);
 	UStaticMesh* CylinderMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cylinder.Cylinder"));
 	if (LampPoles.Num() > 0)
 	{
-		StreetLights->SetStaticMesh(CylinderMesh);
-		StreetLights->SetMaterial(0, IronPoleMaterial());
+		StreetLights->SetStaticMesh(StreetLightMeshOverride ? StreetLightMeshOverride.Get() : CylinderMesh);
+		if (!StreetLightMeshOverride)
+		{
+			StreetLights->SetMaterial(0, IronPoleMaterial());
+		}
 		StreetLights->AddInstances(LampPoles, false, false);
 		StreetLampHeads->SetStaticMesh(Cube);
 		StreetLampHeads->SetMaterial(0, IronPoleMaterial());
+		StreetLampHeads->SetVisibility(!StreetLightMeshOverride);
 		StreetLampHeads->AddInstances(LampHeads, false, false);
 	}
 	if (BenchInstances.Num() > 0)
 	{
-		ParkBenches->SetStaticMesh(Cube);
-		ParkBenches->SetMaterial(0, ParkBenchMaterial());
+		ParkBenches->SetStaticMesh(ParkBenchMeshOverride ? ParkBenchMeshOverride.Get() : Cube);
+		if (!ParkBenchMeshOverride)
+		{
+			ParkBenches->SetMaterial(0, ParkBenchMaterial());
+		}
 		ParkBenches->AddInstances(BenchInstances, false, false);
 	}
 	if (PedInstances.Num() > 0)
 	{
-		Pedestrians->SetStaticMesh(CylinderMesh);
-		Pedestrians->SetMaterial(0, PedestrianMaterial());
+		Pedestrians->SetStaticMesh(PedestrianMeshOverride ? PedestrianMeshOverride.Get() : CylinderMesh);
+		if (!PedestrianMeshOverride)
+		{
+			Pedestrians->SetMaterial(0, PedestrianMaterial());
+		}
 		Pedestrians->AddInstances(PedInstances, false, false);
 	}
 
@@ -3163,6 +3350,12 @@ void ANosimWorld::BuildScene()
 			const double TrunkW = Random.FRandRange(0.28f, 0.44f);
 			const FVector BasePos = GeoToLocal(Lon, Lat, G);
 			const double BaseYaw = Random.FRandRange(0.f, 360.f);
+			if (TreeMeshOverride)
+			{
+				const double S = TallM / 10.0;
+				CanopyInstances.Add(FTransform(FRotator(0.0, BaseYaw, 0.0), BasePos, FVector(S, S, S)));
+				continue;
+			}
 			// Grounded furrowed-bark main trunk.
 			TrunkInstances.Add(FTransform(FRotator(Random.FRandRange(-2.f, 2.f), BaseYaw, Random.FRandRange(-2.f, 2.f)),
 				BasePos + FVector(0, 0, TrunkH * 50.0), FVector(TrunkW, TrunkW, TrunkH)));
@@ -3194,11 +3387,15 @@ void ANosimWorld::BuildScene()
 				CrownTop + FVector(0, 0, TallM * 8.0), FVector(WideM * 0.78, WideM * 0.74, 1.0)));
 		}
 		UStaticMesh* PlaneMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane"));
-		Trees->SetStaticMesh(PlaneMesh);
-		Trees->SetMaterial(0, FoliageMaterial());
+		Trees->SetStaticMesh(TreeMeshOverride ? TreeMeshOverride.Get() : PlaneMesh);
+		if (!TreeMeshOverride)
+		{
+			Trees->SetMaterial(0, FoliageMaterial());
+		}
 		Trees->AddInstances(CanopyInstances, false, false);
-		TreeTrunks->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cylinder.Cylinder")));
+		TreeTrunks->SetStaticMesh(CylinderMesh);
 		TreeTrunks->SetMaterial(0, BarkMaterial());
+		TreeTrunks->SetVisibility(!TreeMeshOverride);
 		TreeTrunks->AddInstances(TrunkInstances, false, false);
 		TreeCount = static_cast<int32>(Count);
 
@@ -3236,8 +3433,11 @@ void ANosimWorld::BuildScene()
 		}
 		if (GrassInstances.Num() > 0)
 		{
-			Grass->SetStaticMesh(PlaneMesh);
-			Grass->SetMaterial(0, GrassMaterial());
+			Grass->SetStaticMesh(GrassMeshOverride ? GrassMeshOverride.Get() : PlaneMesh);
+			if (!GrassMeshOverride)
+			{
+				Grass->SetMaterial(0, GrassMaterial());
+			}
 			Grass->AddInstances(GrassInstances, false, false);
 		}
 	}
@@ -3711,7 +3911,8 @@ void ANosimWorld::UpdateSun()
 
 void ANosimWorld::ShowStatus() const
 {
-	if (!GEngine || !GetWorld() || !GetWorld()->IsGameWorld())
+	static const bool bHideHudArg = FParse::Param(FCommandLine::Get(), TEXT("NosimHideHud"));
+	if (!bShowHud || bHideHudArg || !GEngine || !GetWorld() || !GetWorld()->IsGameWorld())
 	{
 		return;
 	}
