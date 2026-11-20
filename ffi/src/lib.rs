@@ -2662,6 +2662,26 @@ pub unsafe extern "C" fn nosim_polygon_table_name(
     }
 }
 
+/// `subtype` of area `i` (e.g. `water=*` for water, or packed `mat=...;col=...;roof=...` for
+/// buildings); returns the size needed including the NUL, 0 when it has none.
+///
+/// # Safety
+/// `t` must be NULL or live; `buf` must be NULL or point to `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nosim_polygon_table_subtype(
+    t: *const NosimPolygonTable,
+    i: usize,
+    buf: *mut c_char,
+    cap: usize,
+) -> usize {
+    // SAFETY: documented contract.
+    match unsafe { opt_ref(t) }.and_then(|t| t.rows.get(i)).and_then(|r| r.subtype.as_deref()) {
+        // SAFETY: documented contract.
+        Some(subtype) => unsafe { write_cstr(buf, cap, subtype) },
+        None => 0,
+    }
+}
+
 /// Ring `k` of area `i`, counting each polygon's outer ring and then its holes in turn.
 ///
 /// # Safety

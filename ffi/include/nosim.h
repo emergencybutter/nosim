@@ -2152,6 +2152,18 @@ size_t nosim_polygon_table_tag(const struct NosimPolygonTable *t, size_t i, char
 size_t nosim_polygon_table_name(const struct NosimPolygonTable *t, size_t i, char *buf, size_t cap);
 
 /**
+ * `subtype` of area `i` (e.g. `water=*` for water, or packed `mat=...;col=...;roof=...` for
+ * buildings); returns the size needed including the NUL, 0 when it has none.
+ *
+ * # Safety
+ * `t` must be NULL or live; `buf` must be NULL or point to `cap` bytes.
+ */
+size_t nosim_polygon_table_subtype(const struct NosimPolygonTable *t,
+                                   size_t i,
+                                   char *buf,
+                                   size_t cap);
+
+/**
  * Ring `k` of area `i`, counting each polygon's outer ring and then its holes in turn.
  *
  * # Safety

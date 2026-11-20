@@ -195,6 +195,15 @@ private:
 	TObjectPtr<UInstancedStaticMeshComponent> StreetLampHeads;
 
 	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UInstancedStaticMeshComponent> TrafficSignals;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UInstancedStaticMeshComponent> ParkBenches;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
+	TObjectPtr<UInstancedStaticMeshComponent> Pedestrians;
+
+	UPROPERTY(VisibleAnywhere, Category = "Nosim")
 	TObjectPtr<UInstancedStaticMeshComponent> VehiclesFree;
 
 	UPROPERTY(VisibleAnywhere, Category = "Nosim")

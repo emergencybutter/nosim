@@ -455,6 +455,59 @@ pub fn zone_for_landuse(value: &str) -> Option<(&'static str, ZoneLevels)> {
     })
 }
 
+fn parse_roof_direction_deg(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    if let Ok(deg) = s.parse::<f64>()
+        && deg.is_finite()
+    {
+        return Some(deg.rem_euclid(360.0));
+    }
+    Some(match s.to_ascii_uppercase().as_str() {
+        "N" => 0.0,
+        "NNE" => 22.5,
+        "NE" => 45.0,
+        "ENE" => 67.5,
+        "E" => 90.0,
+        "ESE" => 112.5,
+        "SE" => 135.0,
+        "SSE" => 157.5,
+        "S" => 180.0,
+        "SSW" => 202.5,
+        "SW" => 225.0,
+        "WSW" => 247.5,
+        "W" => 270.0,
+        "WNW" => 292.5,
+        "NW" => 315.0,
+        "NNW" => 337.5,
+        _ => return None,
+    })
+}
+
+/// Packs optional OSM facade/roof tags into the area `subtype` column (`k=v;...`) when present.
+fn building_subtype(tags: &[(String, String)]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let clean = |v: &str| v.trim().replace(';', ",");
+    if let Some(m) = tag(tags, "building:material").map(clean).filter(|s| !s.is_empty()) {
+        parts.push(format!("mat={m}"));
+    }
+    if let Some(c) = tag(tags, "building:colour").map(clean).filter(|s| !s.is_empty()) {
+        parts.push(format!("col={c}"));
+    }
+    if let Some(r) = tag(tags, "roof:shape").map(clean).filter(|s| !s.is_empty()) {
+        parts.push(format!("roof={r}"));
+    }
+    if let Some(rh) = tag(tags, "roof:height").and_then(parse_length_m).filter(|&v| v > 0.0) {
+        parts.push(format!("rh={rh:.2}"));
+    }
+    if let Some(rd) = tag(tags, "roof:direction").and_then(parse_roof_direction_deg) {
+        parts.push(format!("rd={rd:.1}"));
+    }
+    if let Some(rc) = tag(tags, "roof:colour").map(clean).filter(|s| !s.is_empty()) {
+        parts.push(format!("rcol={rc}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(";"))
+}
+
 /// Normalises a building's height tags. `zone` supplies the §5 zone for estimates; the
 /// estimate's seed is the spatial seed of `at` (`(lon, lat)`).
 pub fn building_info(
@@ -792,7 +845,11 @@ pub fn extract(
                         layer,
                         key: key.to_owned(),
                         value: value.to_owned(),
-                        subtype: (layer == Layer::Water).then(|| tag(&tags, "water").map(str::to_owned)).flatten(),
+                        subtype: match layer {
+                            Layer::Water => tag(&tags, "water").map(str::to_owned),
+                            Layer::Building => building_subtype(&tags),
+                            Layer::Landuse => None,
+                        },
                         name: tag(&tags, "name").map(str::to_owned),
                         polygons: polygons.clone(),
                         area_m2,
@@ -815,7 +872,7 @@ pub fn extract(
                         layer: Layer::Building,
                         key: "building:part".to_owned(),
                         value: v.to_owned(),
-                        subtype: None,
+                        subtype: building_subtype(&tags),
                         name: tag(&tags, "name").map(str::to_owned),
                         polygons,
                         area_m2,

@@ -1127,6 +1127,57 @@ UMaterialInterface* IronPoleMaterial()
 #endif
 }
 
+/** Helper to create a simple instanced-mesh solid PBR material. */
+UMaterialInterface* MakeIsmSolidMaterial(TStrongObjectPtr<UMaterial>& Cache, const TCHAR* Name,
+	const FLinearColor& BaseColor, float Rough, float Metal)
+{
+#if WITH_EDITORONLY_DATA
+	if (!Cache)
+	{
+		UMaterial* M = NewObject<UMaterial>(GetTransientPackage(), Name, RF_Transient);
+		PRAGMA_DISABLE_DEPRECATION_WARNINGS
+		M->bUsedWithInstancedStaticMeshes = true;
+		PRAGMA_ENABLE_DEPRECATION_WARNINGS
+		UMaterialExpressionConstant3Vector* Color = NewObject<UMaterialExpressionConstant3Vector>(M);
+		Color->Constant = BaseColor;
+		UMaterialExpressionConstant* Roughness = NewObject<UMaterialExpressionConstant>(M);
+		Roughness->R = Rough;
+		UMaterialExpressionConstant* Metallic = NewObject<UMaterialExpressionConstant>(M);
+		Metallic->R = Metal;
+		for (UMaterialExpression* E : TArray<UMaterialExpression*>{Color, Roughness, Metallic})
+		{
+			M->GetExpressionCollection().AddExpression(E);
+		}
+		M->GetEditorOnlyData()->BaseColor.Connect(0, Color);
+		M->GetEditorOnlyData()->Roughness.Connect(0, Roughness);
+		M->GetEditorOnlyData()->Metallic.Connect(0, Metallic);
+		M->PostEditChange();
+		Cache.Reset(M);
+	}
+	return Cache.Get();
+#else
+	return VertexColorMaterial();
+#endif
+}
+
+UMaterialInterface* TrafficSignalMaterial()
+{
+	static TStrongObjectPtr<UMaterial> Material;
+	return MakeIsmSolidMaterial(Material, TEXT("NosimTrafficSignal"), FLinearColor(0.66f, 0.44f, 0.03f), 0.36f, 0.35f);
+}
+
+UMaterialInterface* ParkBenchMaterial()
+{
+	static TStrongObjectPtr<UMaterial> Material;
+	return MakeIsmSolidMaterial(Material, TEXT("NosimParkBench"), FLinearColor(0.06f, 0.12f, 0.06f), 0.65f, 0.25f);
+}
+
+UMaterialInterface* PedestrianMaterial()
+{
+	static TStrongObjectPtr<UMaterial> Material;
+	return MakeIsmSolidMaterial(Material, TEXT("NosimPedestrian"), FLinearColor(0.05f, 0.055f, 0.065f), 0.82f, 0.0f);
+}
+
 /** Glossy tinted automotive glass material for sedan cabins. */
 UMaterialInterface* VehicleCabinMaterial()
 {
@@ -1531,6 +1582,156 @@ ESection BuildingStyleAndPalette(const FString& Tag, double HeightM, uint64 Seed
 	return S_BuildingStone;
 }
 
+enum class ERoofShape : uint8
+{
+	Flat,
+	Pyramidal,
+	Skillion,
+	Dome,
+	Gabled,
+};
+
+struct FOsmRoof
+{
+	ERoofShape Shape = ERoofShape::Flat;
+	double HeightM = 0.0;
+	double DirectionDeg = 0.0;
+	bool bHasDirection = false;
+};
+
+/** Parses an OSM/CSS `#rrggbb`, `#rgb`, or named colour into calibrated linear PBR albedo. */
+bool ParseOsmColor(const FString& Raw, FLinearColor& Out)
+{
+	FString S = Raw.TrimStartAndEnd().ToLower();
+	if (S.IsEmpty())
+	{
+		return false;
+	}
+	if (S.StartsWith(TEXT("#")))
+	{
+		const FString Hex = S.Mid(1);
+		if (Hex.Len() == 6 || Hex.Len() == 3)
+		{
+			const FColor C = FColor::FromHex(S);
+			// Scale sRGB->linear albedo so white/light facades don't blow out under direct sun.
+			Out = FLinearColor::FromSRGBColor(C) * 0.42f;
+			Out.A = 1.f;
+			return true;
+		}
+		return false;
+	}
+	auto SetSrgb = [&](uint8 R, uint8 G, uint8 B)
+	{
+		Out = FLinearColor::FromSRGBColor(FColor(R, G, B, 255)) * 0.42f;
+		Out.A = 1.f;
+		return true;
+	};
+	if (S == TEXT("white") || S == TEXT("ivory") || S == TEXT("snow")) return SetSrgb(225, 222, 216);
+	if (S == TEXT("cream") || S == TEXT("beige") || S == TEXT("sand") || S == TEXT("wheat")) return SetSrgb(212, 198, 174);
+	if (S == TEXT("tan") || S == TEXT("khaki") || S == TEXT("buff")) return SetSrgb(192, 168, 134);
+	if (S == TEXT("brown") || S == TEXT("saddlebrown") || S == TEXT("sienna") || S == TEXT("chocolate")) return SetSrgb(122, 78, 54);
+	if (S == TEXT("red") || S == TEXT("firebrick") || S == TEXT("crimson") || S == TEXT("brick")) return SetSrgb(148, 66, 52);
+	if (S == TEXT("maroon") || S == TEXT("darkred")) return SetSrgb(104, 42, 38);
+	if (S == TEXT("orange") || S == TEXT("terracotta") || S == TEXT("coral")) return SetSrgb(178, 102, 64);
+	if (S == TEXT("yellow") || S == TEXT("gold") || S == TEXT("ochre")) return SetSrgb(198, 174, 104);
+	if (S == TEXT("silver") || S == TEXT("lightgrey") || S == TEXT("lightgray")) return SetSrgb(184, 188, 194);
+	if (S == TEXT("grey") || S == TEXT("gray")) return SetSrgb(138, 142, 148);
+	if (S == TEXT("darkgrey") || S == TEXT("darkgray") || S == TEXT("dimgray") || S == TEXT("slate")) return SetSrgb(88, 92, 98);
+	if (S == TEXT("black") || S == TEXT("charcoal")) return SetSrgb(46, 48, 52);
+	if (S == TEXT("blue") || S == TEXT("steelblue") || S == TEXT("cadetblue")) return SetSrgb(98, 132, 166);
+	if (S == TEXT("lightblue") || S == TEXT("skyblue")) return SetSrgb(142, 172, 198);
+	if (S == TEXT("darkblue") || S == TEXT("navy")) return SetSrgb(58, 78, 112);
+	if (S == TEXT("green") || S == TEXT("seagreen") || S == TEXT("olive")) return SetSrgb(92, 128, 112);
+	if (S == TEXT("bronze") || S == TEXT("copper")) return SetSrgb(136, 102, 72);
+	return false;
+}
+
+/** Overrides procedural building style/tint/roof with real OSM tags packed into `subtype`. */
+void ApplyOsmAppearance(const FString& Subtype, double HeightM, ESection& InOutStyle,
+	FLinearColor& InOutWall, FLinearColor& InOutRoof, FOsmRoof& OutRoof)
+{
+	if (Subtype.IsEmpty())
+	{
+		return;
+	}
+	TArray<FString> Pairs;
+	Subtype.ParseIntoArray(Pairs, TEXT(";"), true);
+	for (const FString& Pair : Pairs)
+	{
+		FString K, V;
+		if (!Pair.Split(TEXT("="), &K, &V))
+		{
+			continue;
+		}
+		V = V.TrimStartAndEnd().ToLower();
+		if (K == TEXT("mat"))
+		{
+			if (V.Contains(TEXT("glass")) || V.Contains(TEXT("mirror")))
+			{
+				InOutStyle = S_BuildingGlass;
+			}
+			else if (V.Contains(TEXT("brick")) || V.Contains(TEXT("terracotta")))
+			{
+				InOutStyle = S_BuildingBrick;
+			}
+			else if (V.Contains(TEXT("stone")) || V.Contains(TEXT("concrete")) || V.Contains(TEXT("limestone"))
+				|| V.Contains(TEXT("granite")) || V.Contains(TEXT("marble")) || V.Contains(TEXT("sandstone"))
+				|| V.Contains(TEXT("plaster")) || V.Contains(TEXT("stucco")) || V.Contains(TEXT("metal")) || V.Contains(TEXT("steel")))
+			{
+				InOutStyle = S_BuildingStone;
+			}
+		}
+		else if (K == TEXT("col"))
+		{
+			FLinearColor Parsed;
+			if (ParseOsmColor(V, Parsed))
+			{
+				InOutWall = Parsed;
+			}
+		}
+		else if (K == TEXT("rcol"))
+		{
+			FLinearColor Parsed;
+			if (ParseOsmColor(V, Parsed))
+			{
+				InOutRoof = Parsed;
+			}
+		}
+		else if (K == TEXT("roof"))
+		{
+			if (V == TEXT("pyramidal") || V == TEXT("cone") || V == TEXT("spire"))
+			{
+				OutRoof.Shape = ERoofShape::Pyramidal;
+			}
+			else if (V == TEXT("skillion"))
+			{
+				OutRoof.Shape = ERoofShape::Skillion;
+			}
+			else if (V == TEXT("dome") || V == TEXT("onion") || V == TEXT("half-dome"))
+			{
+				OutRoof.Shape = ERoofShape::Dome;
+			}
+			else if (V == TEXT("gabled") || V == TEXT("hipped") || V == TEXT("gambrel") || V == TEXT("mansard"))
+			{
+				OutRoof.Shape = ERoofShape::Gabled;
+			}
+		}
+		else if (K == TEXT("rh"))
+		{
+			OutRoof.HeightM = FCString::Atod(*V);
+		}
+		else if (K == TEXT("rd"))
+		{
+			OutRoof.DirectionDeg = FCString::Atod(*V);
+			OutRoof.bHasDirection = true;
+		}
+	}
+	if (OutRoof.Shape != ERoofShape::Flat && OutRoof.HeightM <= 0.1)
+	{
+		OutRoof.HeightM = FMath::Clamp(HeightM * 0.18, 3.0, 28.0);
+	}
+}
+
 const FLinearColor VehicleColors[3] = {
 	FLinearColor(0.05f, 0.55f, 0.10f), // near free flow
 	FLinearColor(0.80f, 0.45f, 0.02f), // slowed
@@ -1639,19 +1840,67 @@ struct FMeshBuffer
 	 * and (above 130 m) a stepped crown/spire so skyline silhouettes aren't flat boxes.
 	 */
 	void Extrude(const TArray<TArray<FVector2D>>& Rings, double BottomCm, double TopCm, FMeshBuffer& Roof,
-		const FLinearColor& WallColor, const FLinearColor& RoofColor, bool bAddCrown = true, bool bHasGroundLobby = true)
+		const FLinearColor& WallColor, const FLinearColor& RoofColor, bool bAddCrown = true, bool bHasGroundLobby = true,
+		const FOsmRoof& OsmRoof = FOsmRoof())
 	{
 		using namespace UE::Geometry;
 		constexpr double TileWidthCm = 1280.0; // 4 bays × 3.2 m
 		constexpr double TileHeightCm = 1360.0; // 4 storeys × 3.4 m
 		constexpr double RoofTileCm = 2000.0; // 20 m × 20 m
 		const double HeightCm = FMath::Max(TopCm - BottomCm, 0.0);
-		const bool bHasLobby = bHasGroundLobby && HeightCm >= 1000.0;
+		const double MaxRoofFrac = bHasGroundLobby ? 0.30 : 0.95; // raised roof-only building:parts can be mostly roof
+		const double RoofHCm = OsmRoof.Shape != ERoofShape::Flat
+			? FMath::Clamp(OsmRoof.HeightM * 100.0, 150.0, HeightCm * MaxRoofFrac)
+			: 0.0;
+		const double EaveTopCm = TopCm - RoofHCm;
+		const bool bHasLobby = bHasGroundLobby && (EaveTopCm - BottomCm) >= 1000.0;
 		const double LobbyTopCm = bHasLobby ? BottomCm + 480.0 : BottomCm;
 		const FLinearColor LobbyColor = WallColor * 0.46f;
-		const double VTop = 0.0;
-		const double VBot = HeightCm / TileHeightCm;
-		const double VLobby = FMath::Max(TopCm - LobbyTopCm, 0.0) / TileHeightCm;
+		// For skillion (slanted) roofs, compute per-point height along roof:direction so walls meet the sloped roof cleanly.
+		FVector2D SlopeDir(1.0, 0.0);
+		double SlopeMin = 0.0, SlopeMax = 1.0;
+		const bool bSkillion = OsmRoof.Shape == ERoofShape::Skillion && RoofHCm > 10.0 && Rings[0].Num() >= 3;
+		if (bSkillion)
+		{
+			if (OsmRoof.bHasDirection)
+			{
+				const double Rad = FMath::DegreesToRadians(OsmRoof.DirectionDeg);
+				// roof:direction points downhill (bearing clockwise from north); local X=east, Y=south.
+				SlopeDir = FVector2D(FMath::Sin(Rad), -FMath::Cos(Rad));
+			}
+			else
+			{
+				// Default downhill along the first longest edge's perpendicular.
+				double BestLen = 0.0;
+				for (int32 I = 0; I < Rings[0].Num(); ++I)
+				{
+					const FVector2D E = Rings[0][(I + 1) % Rings[0].Num()] - Rings[0][I];
+					if (E.Size() > BestLen)
+					{
+						BestLen = E.Size();
+						SlopeDir = FVector2D(-E.Y, E.X).GetSafeNormal();
+					}
+				}
+			}
+			SlopeMin = TNumericLimits<double>::Max();
+			SlopeMax = -TNumericLimits<double>::Max();
+			for (const FVector2D& P : Rings[0])
+			{
+				const double D = FVector2D::DotProduct(P, SlopeDir);
+				SlopeMin = FMath::Min(SlopeMin, D);
+				SlopeMax = FMath::Max(SlopeMax, D);
+			}
+			if (SlopeMax - SlopeMin < 1.0) SlopeMax = SlopeMin + 1.0;
+		}
+		auto RoofZAt = [&](const FVector2D& P) -> double
+		{
+			if (!bSkillion)
+			{
+				return EaveTopCm;
+			}
+			const double T = FMath::Clamp((FVector2D::DotProduct(P, SlopeDir) - SlopeMin) / (SlopeMax - SlopeMin), 0.0, 1.0);
+			return FMath::Lerp(TopCm, EaveTopCm, T);
+		};
 		for (int32 R = 0; R < Rings.Num(); ++R)
 		{
 			const TArray<FVector2D>& Ring = Rings[R];
@@ -1674,45 +1923,97 @@ struct FMeshBuffer
 				const double U1 = (DistCm + EdgeLenCm) / TileWidthCm;
 				DistCm += EdgeLenCm;
 				const FVector Normal = FVector((B.Y - A.Y) * Out, -(B.X - A.X) * Out, 0).GetSafeNormal();
-				if (bHasLobby)
+				const double TopA = RoofZAt(A);
+				const double TopB = RoofZAt(B);
+				const double VTopA = (TopCm - TopA) / TileHeightCm;
+				const double VTopB = (TopCm - TopB) / TileHeightCm;
+				const double VBot = FMath::Max(TopCm - BottomCm, 0.0) / TileHeightCm;
+				if (bHasLobby && TopA > LobbyTopCm + 10.0 && TopB > LobbyTopCm + 10.0)
 				{
+					const double VLob = FMath::Max(TopCm - LobbyTopCm, 0.0) / TileHeightCm;
 					QuadUV(FVector(A, BottomCm), FVector(B, BottomCm), FVector(B, LobbyTopCm), FVector(A, LobbyTopCm), Normal,
-						FVector2D(U0, VBot), FVector2D(U1, VBot), FVector2D(U1, VLobby), FVector2D(U0, VLobby), LobbyColor);
-					QuadUV(FVector(A, LobbyTopCm), FVector(B, LobbyTopCm), FVector(B, TopCm), FVector(A, TopCm), Normal,
-						FVector2D(U0, VLobby), FVector2D(U1, VLobby), FVector2D(U1, VTop), FVector2D(U0, VTop), WallColor);
+						FVector2D(U0, VBot), FVector2D(U1, VBot), FVector2D(U1, VLob), FVector2D(U0, VLob), LobbyColor);
+					QuadUV(FVector(A, LobbyTopCm), FVector(B, LobbyTopCm), FVector(B, TopB), FVector(A, TopA), Normal,
+						FVector2D(U0, VLob), FVector2D(U1, VLob), FVector2D(U1, VTopB), FVector2D(U0, VTopA), WallColor);
 				}
-				else
+				else if (TopA > BottomCm + 1.0 || TopB > BottomCm + 1.0)
 				{
-					QuadUV(FVector(A, BottomCm), FVector(B, BottomCm), FVector(B, TopCm), FVector(A, TopCm), Normal,
-						FVector2D(U0, VBot), FVector2D(U1, VBot), FVector2D(U1, VTop), FVector2D(U0, VTop), WallColor);
+					QuadUV(FVector(A, BottomCm), FVector(B, BottomCm), FVector(B, TopB), FVector(A, TopA), Normal,
+						FVector2D(U0, VBot), FVector2D(U1, VBot), FVector2D(U1, VTopB), FVector2D(U0, VTopA), WallColor);
 				}
 			}
 		}
-		FGeneralPolygon2d Footprint{FPolygon2d(Rings[0])};
-		for (int32 R = 1; R < Rings.Num(); ++R)
+		if (OsmRoof.Shape == ERoofShape::Pyramidal || OsmRoof.Shape == ERoofShape::Dome || OsmRoof.Shape == ERoofShape::Gabled)
 		{
-			Footprint.AddHole(FPolygon2d(Rings[R]), false, false);
-		}
-		FDelaunay2 Delaunay;
-		Delaunay.bAutomaticallyFixEdgesToDuplicateVertices = true;
-		TArray<FIndex3i> Tris;
-		TArray<FVector2d> Verts;
-		if (Delaunay.Triangulate(Footprint, &Tris, &Verts, true))
-		{
-			for (const FIndex3i& T : Tris)
+			const TArray<FVector2D>& Outer = Rings[0];
+			FVector2D Center = FVector2D::ZeroVector;
+			for (const FVector2D& P : Outer) Center += P;
+			Center /= FMath::Max(Outer.Num(), 1);
+			const FVector Apex(Center, TopCm);
+			if (OsmRoof.Shape == ERoofShape::Dome)
 			{
-				const FVector2d& PA = Verts[T.A];
-				const FVector2d& PB = Verts[T.B];
-				const FVector2d& PC = Verts[T.C];
-				Roof.TriangleUV(FVector(PA, TopCm), FVector(PB, TopCm), FVector(PC, TopCm), FVector::UpVector,
-					FVector2D(PA.X / RoofTileCm, PA.Y / RoofTileCm),
-					FVector2D(PB.X / RoofTileCm, PB.Y / RoofTileCm),
-					FVector2D(PC.X / RoofTileCm, PC.Y / RoofTileCm), RoofColor);
+				const double MidZ = FMath::Lerp(EaveTopCm, TopCm, 0.62);
+				for (int32 I = 0; I < Outer.Num(); ++I)
+				{
+					const FVector2D A = Outer[I], B = Outer[(I + 1) % Outer.Num()];
+					const FVector2D Am = FMath::Lerp(Center, A, 0.58), Bm = FMath::Lerp(Center, B, 0.58);
+					const FVector P0(A, EaveTopCm), P1(B, EaveTopCm), P2(Bm, MidZ), P3(Am, MidZ);
+					const FVector N0 = FVector::CrossProduct(P1 - P0, P3 - P0).GetSafeNormal();
+					const FVector N1 = FVector::CrossProduct(P2 - P3, Apex - P3).GetSafeNormal();
+					Roof.QuadUV(P0, P1, P2, P3, N0.Z >= 0 ? N0 : -N0,
+						FVector2D(A.X / RoofTileCm, A.Y / RoofTileCm), FVector2D(B.X / RoofTileCm, B.Y / RoofTileCm),
+						FVector2D(Bm.X / RoofTileCm, Bm.Y / RoofTileCm), FVector2D(Am.X / RoofTileCm, Am.Y / RoofTileCm), RoofColor);
+					Roof.TriangleUV(P3, P2, Apex, N1.Z >= 0 ? N1 : -N1,
+						FVector2D(Am.X / RoofTileCm, Am.Y / RoofTileCm), FVector2D(Bm.X / RoofTileCm, Bm.Y / RoofTileCm),
+						FVector2D(Center.X / RoofTileCm, Center.Y / RoofTileCm), RoofColor * 1.06f);
+				}
+			}
+			else
+			{
+				for (int32 I = 0; I < Outer.Num(); ++I)
+				{
+					const FVector2D A = Outer[I], B = Outer[(I + 1) % Outer.Num()];
+					const FVector P0(A, EaveTopCm), P1(B, EaveTopCm);
+					const FVector N = FVector::CrossProduct(P1 - P0, Apex - P0).GetSafeNormal();
+					Roof.TriangleUV(P0, P1, Apex, N.Z >= 0 ? N : -N,
+						FVector2D(A.X / RoofTileCm, A.Y / RoofTileCm), FVector2D(B.X / RoofTileCm, B.Y / RoofTileCm),
+						FVector2D(Center.X / RoofTileCm, Center.Y / RoofTileCm), RoofColor);
+				}
+			}
+		}
+		else
+		{
+			FGeneralPolygon2d Footprint{FPolygon2d(Rings[0])};
+			for (int32 R = 1; R < Rings.Num(); ++R)
+			{
+				Footprint.AddHole(FPolygon2d(Rings[R]), false, false);
+			}
+			FDelaunay2 Delaunay;
+			Delaunay.bAutomaticallyFixEdgesToDuplicateVertices = true;
+			TArray<FIndex3i> Tris;
+			TArray<FVector2d> Verts;
+			if (Delaunay.Triangulate(Footprint, &Tris, &Verts, true))
+			{
+				for (const FIndex3i& T : Tris)
+				{
+					const FVector2d& PA = Verts[T.A];
+					const FVector2d& PB = Verts[T.B];
+					const FVector2d& PC = Verts[T.C];
+					const FVector VA(PA, RoofZAt(FVector2D(PA.X, PA.Y)));
+					const FVector VB(PB, RoofZAt(FVector2D(PB.X, PB.Y)));
+					const FVector VC(PC, RoofZAt(FVector2D(PC.X, PC.Y)));
+					FVector N = bSkillion ? FVector::CrossProduct(VB - VA, VC - VA).GetSafeNormal() : FVector::UpVector;
+					if (N.Z < 0.0) N = -N;
+					Roof.TriangleUV(VA, VB, VC, N,
+						FVector2D(PA.X / RoofTileCm, PA.Y / RoofTileCm),
+						FVector2D(PB.X / RoofTileCm, PB.Y / RoofTileCm),
+						FVector2D(PC.X / RoofTileCm, PC.Y / RoofTileCm), RoofColor);
+				}
 			}
 		}
 
-		// Rooftop mechanical penthouse (>= 32 m) and stepped crown / mast (>= 130 m).
-		if (bAddCrown && HeightCm >= 3200.0 && Rings[0].Num() >= 3)
+		// Rooftop mechanical penthouse (>= 32 m) and stepped crown / mast (>= 130 m) on flat roofs only.
+		if (bAddCrown && OsmRoof.Shape == ERoofShape::Flat && HeightCm >= 3200.0 && Rings[0].Num() >= 3)
 		{
 			FVector2D Center = FVector2D::ZeroVector;
 			FBox2D Bounds(ForceInit);
@@ -1858,6 +2159,18 @@ ANosimWorld::ANosimWorld()
 	StreetLampHeads->SetMobility(EComponentMobility::Static);
 	StreetLampHeads->SetCullDistances(0, 75000);
 	StreetLampHeads->SetCastShadow(false);
+	TrafficSignals = MakeVehicles(TEXT("TrafficSignals"));
+	TrafficSignals->SetMobility(EComponentMobility::Static);
+	TrafficSignals->SetCullDistances(0, 65000); // 650 m
+	TrafficSignals->SetCastShadow(false);
+	ParkBenches = MakeVehicles(TEXT("ParkBenches"));
+	ParkBenches->SetMobility(EComponentMobility::Static);
+	ParkBenches->SetCullDistances(0, 22000); // 220 m
+	ParkBenches->SetCastShadow(false);
+	Pedestrians = MakeVehicles(TEXT("Pedestrians"));
+	Pedestrians->SetMobility(EComponentMobility::Static);
+	Pedestrians->SetCullDistances(0, 26000); // 260 m
+	Pedestrians->SetCastShadow(false);
 	VehiclesFree = MakeVehicles(TEXT("VehiclesFree"));
 	VehiclesSlow = MakeVehicles(TEXT("VehiclesSlow"));
 	VehiclesJammed = MakeVehicles(TEXT("VehiclesJammed"));
@@ -1971,6 +2284,7 @@ void ANosimWorld::BuildScene()
 	Terrain->ClearAllMeshSections();
 	Models->ClearAllMeshSections();
 	for (UInstancedStaticMeshComponent* Ism : {Trees.Get(), TreeTrunks.Get(), Grass.Get(), StreetLights.Get(), StreetLampHeads.Get(),
+		TrafficSignals.Get(), ParkBenches.Get(), Pedestrians.Get(),
 		VehiclesFree.Get(), VehiclesSlow.Get(), VehiclesJammed.Get(), VehicleCabins.Get()})
 	{
 		Ism->ClearInstances();
@@ -2372,6 +2686,8 @@ void ANosimWorld::BuildScene()
 	TMultiMap<int64, int32> ByOsmId;
 	TArray<FTransform> LampPoles;
 	TArray<FTransform> LampHeads;
+	TArray<FTransform> BenchInstances;
+	TArray<FTransform> PedInstances;
 	FString SplinePath = WorldSplines;
 	if (SplinePath.IsEmpty() && nosim_vfs_resolve(Vfs, NOSIM_CONTENT_KIND_SPLINE_NETWORKS, Anchor.lat_deg, Anchor.lon_deg, Buf, sizeof Buf) > 0)
 	{
@@ -2463,9 +2779,12 @@ void ANosimWorld::BuildScene()
 				constexpr double SidewalkHalfCm = 110.0; // 2.2 m sidewalk on each side
 				Mesh[S_Sidewalk].Ribbon(G.Local, SidewalkHalfCm, G.HalfWidthCm + SidewalkHalfCm, G.ZOffsetCm + 10.0);
 				Mesh[S_Sidewalk].Ribbon(G.Local, SidewalkHalfCm, -(G.HalfWidthCm + SidewalkHalfCm), G.ZOffsetCm + 10.0);
-				// Place cast-iron NYC streetlight poles every 45 m along the near-field curb.
+				// Place cast-iron NYC streetlight poles every 45 m along the near-field curb,
+				// plus subtle sidewalk pedestrians and park-edge benches within 450 m.
 				const double NearRadCm = FMath::Max(NearFieldRadiusM * 100.0, 100000.0);
+				constexpr double LifeRadCm = 45000.0;
 				double AccumCm = 2000.0;
+				double PedAccumCm = 900.0 + (Hash2D(static_cast<int32>(I), 1, 701u) & 1023);
 				for (int32 P = 0; P + 1 < G.Local.Num(); ++P)
 				{
 					const FVector A = G.Local[P], B = G.Local[P + 1];
@@ -2473,19 +2792,45 @@ void ANosimWorld::BuildScene()
 					if (SegCm < 10.0) continue;
 					const FVector Dir = (B - A).GetSafeNormal2D();
 					const FVector Right(-Dir.Y, Dir.X, 0.0);
+					const FRotator Rot = Dir.Rotation();
 					while (AccumCm < SegCm)
 					{
 						const FVector Pos = FMath::Lerp(A, B, AccumCm / SegCm) + Right * (G.HalfWidthCm + 55.0);
 						if (Pos.SizeSquared2D() <= NearRadCm * NearRadCm)
 						{
 							const double PoleH = 7.5; // 7.5 m tall
-							const FRotator Rot = Dir.Rotation();
 							LampPoles.Add(FTransform(Rot, Pos + FVector(0, 0, G.ZOffsetCm + PoleH * 50.0), FVector(0.16, 0.16, PoleH)));
 							LampHeads.Add(FTransform(Rot, Pos - Right * 65.0 + FVector(0, 0, G.ZOffsetCm + PoleH * 100.0), FVector(0.32, 1.4, 0.16)));
 						}
 						AccumCm += 4500.0; // 45 m spacing
 					}
 					AccumCm -= SegCm;
+					while (PedAccumCm < SegCm)
+					{
+						const double T = PedAccumCm / SegCm;
+						const FVector Mid = FMath::Lerp(A, B, T);
+						if (Mid.SizeSquared2D() <= LifeRadCm * LifeRadCm)
+						{
+							const uint32 Ph = Hash2D(static_cast<int32>(I), P * 17 + static_cast<int32>(PedAccumCm / 100.0), 719u);
+							const double Side = (Ph & 1u) ? 1.0 : -1.0;
+							const double Lat = G.HalfWidthCm + 85.0 + ((Ph >> 1) & 63);
+							const FVector PedPos = Mid + Right * (Side * Lat) + FVector(0, 0, G.ZOffsetCm + 92.0);
+							PedInstances.Add(FTransform(Rot, PedPos, FVector(0.34, 0.42, 1.72)));
+							// Park-edge benches where sidewalk borders WorldCover tree/grass cover.
+							if ((Ph & 7u) == 0u && P < G.LonLat.Num() && P + 1 < G.LonLat.Num())
+							{
+								const FVector2D Ll = FMath::Lerp(G.LonLat[P], G.LonLat[P + 1], T);
+								const uint8 Cls = Classes.Byte(Ll.X, Ll.Y);
+								if (Cls == 10 || Cls == 30)
+								{
+									const FVector BenchPos = Mid + Right * (Side * (G.HalfWidthCm + 210.0)) + FVector(0, 0, G.ZOffsetCm + 42.0);
+									BenchInstances.Add(FTransform(Rot, BenchPos, FVector(1.80, 0.62, 0.78)));
+								}
+							}
+						}
+						PedAccumCm += 2400.0 + ((Hash2D(static_cast<int32>(I), P, 733u) & 15) * 100.0);
+					}
+					PedAccumCm -= SegCm;
 				}
 			}
 		}
@@ -2576,13 +2921,17 @@ void ANosimWorld::BuildScene()
 				}
 				char TagBuf[64] = {0};
 				nosim_polygon_table_tag(Polygons, A, TagBuf, sizeof TagBuf);
+				char SubBuf[256] = {0};
+				nosim_polygon_table_subtype(Polygons, A, SubBuf, sizeof SubBuf);
 				const double HeightM = Info.height_m > 0 ? Info.height_m : 8.0;
 				// Quantise seed slightly for building:part so parts of the same skyscraper share a cohesive palette.
 				const double QLat = bIsParts ? FMath::RoundToDouble(SeedLat * 2500.0) / 2500.0 : SeedLat;
 				const double QLon = bIsParts ? FMath::RoundToDouble(SeedLon * 2500.0) / 2500.0 : SeedLon;
 				const uint64 Seed = nosim_spatial_seed(QLat, QLon, 0x6275696c64696e67ull /* "building" */);
 				FLinearColor WallColor, RoofColor;
-				const ESection Style = BuildingStyleAndPalette(UTF8_TO_TCHAR(TagBuf), HeightM, Seed, WallColor, RoofColor);
+				ESection Style = BuildingStyleAndPalette(UTF8_TO_TCHAR(TagBuf), HeightM, Seed, WallColor, RoofColor);
+				FOsmRoof OsmRoof;
+				ApplyOsmAppearance(UTF8_TO_TCHAR(SubBuf), HeightM, Style, WallColor, RoofColor, OsmRoof);
 				const double TopCm = (Base + HeightM) * 100.0;
 				const double BottomCm = (Base + Info.min_height_m) * 100.0 - (Info.min_height_m > 0 ? 0.0 : 100.0);
 				if (TopCm <= BottomCm + 10.0)
@@ -2593,7 +2942,7 @@ void ANosimWorld::BuildScene()
 				{
 					if (Rings.Num() > 0)
 					{
-						Mesh[Style].Extrude(Rings, BottomCm, TopCm, Mesh[S_Roof], WallColor, RoofColor, !bIsParts, Info.min_height_m <= 0.1);
+						Mesh[Style].Extrude(Rings, BottomCm, TopCm, Mesh[S_Roof], WallColor, RoofColor, !bIsParts, Info.min_height_m <= 0.1, OsmRoof);
 					}
 				}
 				++BuildingCount;
@@ -2752,14 +3101,27 @@ void ANosimWorld::BuildScene()
 	}
 	VehicleCabins->SetStaticMesh(Cube);
 	VehicleCabins->SetMaterial(0, VehicleCabinMaterial());
+	UStaticMesh* CylinderMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cylinder.Cylinder"));
 	if (LampPoles.Num() > 0)
 	{
-		StreetLights->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cylinder.Cylinder")));
+		StreetLights->SetStaticMesh(CylinderMesh);
 		StreetLights->SetMaterial(0, IronPoleMaterial());
 		StreetLights->AddInstances(LampPoles, false, false);
 		StreetLampHeads->SetStaticMesh(Cube);
 		StreetLampHeads->SetMaterial(0, IronPoleMaterial());
 		StreetLampHeads->AddInstances(LampHeads, false, false);
+	}
+	if (BenchInstances.Num() > 0)
+	{
+		ParkBenches->SetStaticMesh(Cube);
+		ParkBenches->SetMaterial(0, ParkBenchMaterial());
+		ParkBenches->AddInstances(BenchInstances, false, false);
+	}
+	if (PedInstances.Num() > 0)
+	{
+		Pedestrians->SetStaticMesh(CylinderMesh);
+		Pedestrians->SetMaterial(0, PedestrianMaterial());
+		Pedestrians->AddInstances(PedInstances, false, false);
 	}
 
 	// Trees: nosim's Poisson-disk scatter over the area, thinned by the tree mask.
@@ -2907,6 +3269,8 @@ void ANosimWorld::BuildScene()
 	}
 	NearEdgeCount = static_cast<int32>(nosim_traffic_near_edge_count(Traffic));
 	const size_t NumEdges = nosim_graph_edge_count(Graph);
+	TArray<FTransform> SignalInstances;
+	TSet<FIntPoint> SignalCells;
 	for (size_t E = 0; E < NumEdges; ++E)
 	{
 		NosimGraphEdge Edge;
@@ -3008,12 +3372,36 @@ void ANosimWorld::BuildScene()
 			if (From.in_degree + From.out_degree >= 3)
 			{
 				AddCrosswalk(6.0);
+				FVector Pos, Dir;
+				SampleAlong(V.Points, V.Stations, 5.0, Pos, Dir);
+				if (Pos.SizeSquared2D() <= 60000.0 * 60000.0)
+				{
+					const FIntPoint Cell(FMath::FloorToInt32(Pos.X / 2500.0), FMath::FloorToInt32(Pos.Y / 2500.0));
+					if (!SignalCells.Contains(Cell))
+					{
+						SignalCells.Add(Cell);
+						const FVector Fwd = Dir.GetSafeNormal2D();
+						const FVector Rgt(-Fwd.Y, Fwd.X, 0.0);
+						const FVector Corner = Pos + Rgt * (HalfWidthCm + 50.0) + FVector(0, 0, -75.0);
+						const FRotator Rot = Fwd.Rotation();
+						// NYC cast-iron signal mast + hanging yellow signal housing over the lane.
+						StreetLights->AddInstance(FTransform(Rot, Corner + FVector(0, 0, 310.0), FVector(0.20, 0.20, 6.2)), false);
+						StreetLampHeads->AddInstance(FTransform(Rot, Corner - Rgt * 180.0 + FVector(0, 0, 585.0), FVector(0.18, 3.6, 0.18)), false);
+						SignalInstances.Add(FTransform(Rot, Corner - Rgt * 280.0 + FVector(0, 0, 520.0), FVector(0.36, 0.36, 1.05)));
+					}
+				}
 			}
 			if (To.in_degree + To.out_degree >= 3)
 			{
 				AddCrosswalk(V.Stations.Last() - 6.0);
 			}
 		}
+	}
+	if (SignalInstances.Num() > 0)
+	{
+		TrafficSignals->SetStaticMesh(Cube);
+		TrafficSignals->SetMaterial(0, TrafficSignalMaterial());
+		TrafficSignals->AddInstances(SignalInstances, false, false);
 	}
 	if (Mesh[S_Marking].Triangles.Num() > 0)
 	{
